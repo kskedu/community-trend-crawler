@@ -16,6 +16,14 @@ class FmkoreaScraper(BaseScraper):
     def scrape(self) -> List[Post]:
         posts = []
         try:
+            # 봇 차단 우회: 추가 헤더
+            self.session.headers.update({
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Connection": "keep-alive",
+                "Referer": "https://www.fmkorea.com/",
+                "Upgrade-Insecure-Requests": "1",
+            })
             html = self.fetch(f"{BASE_URL}/best")
             soup = BeautifulSoup(html, "html.parser")
 

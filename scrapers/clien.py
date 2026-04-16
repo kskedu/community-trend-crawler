@@ -16,7 +16,7 @@ class ClienScraper(BaseScraper):
     def scrape(self) -> List[Post]:
         posts = []
         try:
-            html = self.fetch(f"{BASE_URL}/service/board/cm_trend")
+            html = self.fetch(f"{BASE_URL}/service/group/clien_all?&od=T33")
             soup = BeautifulSoup(html, "html.parser")
 
             for item in soup.select(".list_item.symph_row")[:MAX_POSTS_PER_SITE]:

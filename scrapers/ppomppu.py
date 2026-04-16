@@ -16,24 +16,24 @@ class PpomppuScraper(BaseScraper):
     def scrape(self) -> List[Post]:
         posts = []
         try:
-            html = self.fetch(f"{BASE_URL}/zboard/zboard.php?id=freeboard")
+            html = self.fetch(f"{BASE_URL}/hot.php?category=1")
             soup = BeautifulSoup(html, "html.parser")
 
-            for item in soup.select("tr.baseList")[:MAX_POSTS_PER_SITE]:
-                title_el = item.select_one(".baseList-title a")
+            for item in soup.select("tr.baseList, tr.bbs_new")[:MAX_POSTS_PER_SITE]:
+                title_el = item.select_one("a.baseList-title, .baseList-title a, td.baseList-title a")
                 if not title_el:
                     continue
 
                 title = title_el.get_text(strip=True)
                 href = title_el.get("href", "")
-                url = href if href.startswith("http") else BASE_URL + "/zboard/" + href
+                url = href if href.startswith("http") else BASE_URL + href
 
-                img_el = item.select_one("img.thumb")
+                img_el = item.select_one("img")
                 image_url = img_el.get("src") if img_el else None
 
-                upvotes = self._int(item.select_one(".baseList-rec"))
-                comments = self._int(item.select_one(".baseList-c"))
-                views = self._int(item.select_one(".baseList-views"))
+                upvotes = self._int(item.select_one(".baseList-rec, .recomNum"))
+                comments = self._int(item.select_one(".baseList-c, .replyNum"))
+                views = self._int(item.select_one(".baseList-views, .hitNum"))
 
                 posts.append(Post(
                     title=title,
