@@ -16,7 +16,7 @@ class PpomppuScraper(BaseScraper):
     def scrape(self) -> List[Post]:
         posts = []
         try:
-            html = self.fetch(f"{BASE_URL}/hot.php?category=1")
+            html = self.fetch(f"{BASE_URL}/hot.php")
             soup = BeautifulSoup(html, "html.parser")
 
             for item in soup.select("tr.baseList, tr.bbs_new")[:MAX_POSTS_PER_SITE]:
@@ -28,12 +28,26 @@ class PpomppuScraper(BaseScraper):
                 href = title_el.get("href", "")
                 url = href if href.startswith("http") else BASE_URL + href
 
-                img_el = item.select_one("img")
-                image_url = img_el.get("src") if img_el else None
+                # 썸네일 (//img.ppomppu.co.kr/... 형태)
+                thumb = item.select_one("a.baseList-thumb img")
+                image_url = None
+                if thumb:
+                    src = thumb.get("src", "")
+                    image_url = ("https:" + src) if src.startswith("//") else src or None
 
-                upvotes = self._int(item.select_one(".baseList-rec, .recomNum"))
-                comments = self._int(item.select_one(".baseList-c, .replyNum"))
-                views = self._int(item.select_one(".baseList-views, .hitNum"))
+                # 댓글수: span.list_comment2
+                comments = self._int(item.select_one("span.list_comment2"))
+
+                # board_date td들: [날짜, 추천-비추천, 조회수]
+                board_dates = item.select("td.board_date")
+                views = self._int(board_dates[-1]) if board_dates else 0
+                upvotes = 0
+                if len(board_dates) >= 2:
+                    raw_rec = board_dates[-2].get_text(strip=True).split("-")[0].strip()
+                    try:
+                        upvotes = int(raw_rec.replace(",", ""))
+                    except ValueError:
+                        upvotes = 0
 
                 posts.append(Post(
                     title=title,
