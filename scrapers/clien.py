@@ -29,7 +29,7 @@ class ClienScraper(BaseScraper):
                 href = link_el.get("href", "") if link_el else ""
                 url = href if href.startswith("http") else BASE_URL + href
 
-                img_el = item.select_one("img.list_img")
+                img_el = item.select_one("img")
                 image_url = img_el.get("src") if img_el else None
 
                 upvotes = self._int(item.select_one(".list_recommend"))

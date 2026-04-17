@@ -31,6 +31,14 @@ class HumorunivScraper(BaseScraper):
                 href = a.get("href", "")
                 url = href if href.startswith("http") else f"{BASE_URL}/board/humor/{href}"
 
+                # 썸네일 이미지
+                row = a.find_parent("tr") or a.find_parent("li")
+                img_el = row.select_one("img.thumb") if row else None
+                image_url = None
+                if img_el:
+                    src = img_el.get("src", "")
+                    image_url = ("https:" + src) if src.startswith("//") else src or None
+
                 # 추천수 파싱
                 upvotes_match = re.search(r'추천\s*\+(\d+)', a.get_text())
                 upvotes = int(upvotes_match.group(1)) if upvotes_match else 0
@@ -42,7 +50,7 @@ class HumorunivScraper(BaseScraper):
                     title=title,
                     source_url=url,
                     source_site=self.site_id,
-                    image_url=None,
+                    image_url=image_url,
                     upvotes=upvotes,
                     comments=comments,
                     views=0,
