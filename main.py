@@ -18,6 +18,7 @@ from scrapers.fmkorea import FmkoreaScraper
 from scrapers.theqoo import TheqooScraper
 from scrapers.slrclub import SlrclubScraper
 from scrapers.todayhumor import TodayhumorScraper
+from scrapers.etoland import EtolandScraper
 from processor.dedup import dedup
 from processor.filter import filter_notices
 from processor.scorer import score_all
@@ -46,6 +47,7 @@ SCRAPERS = [
     TheqooScraper(),
     SlrclubScraper(),
     TodayhumorScraper(),
+    EtolandScraper(),
 ]
 
 
