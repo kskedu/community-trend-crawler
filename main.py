@@ -19,6 +19,7 @@ from scrapers.theqoo import TheqooScraper
 from scrapers.slrclub import SlrclubScraper
 from scrapers.todayhumor import TodayhumorScraper
 from processor.dedup import dedup
+from processor.filter import filter_notices
 from processor.scorer import score_all
 from db.supabase import upsert_posts
 
@@ -65,6 +66,10 @@ def run():
     # 중복 제거
     all_posts = dedup(all_posts)
     logger.info(f"중복 제거 후: {len(all_posts)}건")
+
+    # 공지/안내 필터
+    all_posts = filter_notices(all_posts)
+    logger.info(f"공지 필터 후: {len(all_posts)}건")
 
     # 점수 계산
     all_posts = score_all(all_posts)
