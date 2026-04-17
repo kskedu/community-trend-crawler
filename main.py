@@ -4,10 +4,16 @@ GitHub Actions에서 주기적으로 실행됨
 """
 import logging
 import sys
-from scrapers.fmkorea import FmkoreaScraper
 from scrapers.clien import ClienScraper
 from scrapers.ruliweb import RuliwebScraper
 from scrapers.ppomppu import PpomppuScraper
+from scrapers.mlbpark import MlbparkScraper
+from scrapers.bobaedream import BobaedreamScraper
+from scrapers.inven import InvenScraper
+from scrapers.dcinside import DcinsideScraper
+from scrapers.humoruniv import HumorunivScraper
+from scrapers.cook82 import Cook82Scraper
+from scrapers.ddanzi import DdanziScraper
 from processor.dedup import dedup
 from processor.scorer import score_all
 from db.supabase import upsert_posts
@@ -21,11 +27,17 @@ logger = logging.getLogger(__name__)
 
 # 활성화된 스크래퍼 목록
 SCRAPERS = [
-    FmkoreaScraper(),
     ClienScraper(),
     RuliwebScraper(),
     PpomppuScraper(),
-    # 추후 추가: MlbparkScraper, BobaedreamScraper, InvenScraper, ...
+    MlbparkScraper(),
+    BobaedreamScraper(),
+    InvenScraper(),
+    DcinsideScraper(),
+    HumorunivScraper(),
+    # Cook82Scraper(),  # 별도 베스트 게시판 없음 - 비활성화
+    DdanziScraper(),
+    # FmkoreaScraper(),  # 봇 차단 (430) - 비활성화
 ]
 
 

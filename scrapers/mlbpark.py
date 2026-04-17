@@ -1,0 +1,62 @@
+import re
+import logging
+from datetime import datetime
+from typing import List
+from bs4 import BeautifulSoup
+from scrapers.base import BaseScraper
+from models import Post
+from config import MAX_POSTS_PER_SITE
+
+logger = logging.getLogger(__name__)
+BASE_URL = "https://mlbpark.donga.com"
+
+
+class MlbparkScraper(BaseScraper):
+    site_id = "mlbpark"
+
+    def scrape(self) -> List[Post]:
+        posts = []
+        seen_titles = set()
+        try:
+            html = self.fetch(f"{BASE_URL}/mp/best.php")
+            soup = BeautifulSoup(html, "html.parser")
+
+            for a in soup.select('a[href*="/mp/b.php?b="][href*="id="]'):
+                title = a.get_text(strip=True)
+                if not title or len(title) < 5 or title in seen_titles:
+                    continue
+                seen_titles.add(title)
+
+                href = a.get("href", "")
+                url = href if href.startswith("http") else BASE_URL + href
+
+                item = a.parent
+                upvotes = self._int(item.select_one(".like, .recom, .likeNum") if item else None)
+                comments = self._int(item.select_one(".replyNum, .reply") if item else None)
+                views = self._int(item.select_one(".hit, .viewNum") if item else None)
+
+                posts.append(Post(
+                    title=title,
+                    source_url=url,
+                    source_site=self.site_id,
+                    image_url=None,
+                    upvotes=upvotes,
+                    comments=comments,
+                    views=views,
+                    created_at=datetime.now(),
+                ))
+                if len(posts) >= MAX_POSTS_PER_SITE:
+                    break
+
+        except Exception as e:
+            logger.error(f"[mlbpark] 스크래핑 실패: {e}")
+
+        return posts
+
+    def _int(self, el) -> int:
+        if not el:
+            return 0
+        try:
+            return int(el.get_text(strip=True).replace(",", ""))
+        except ValueError:
+            return 0
