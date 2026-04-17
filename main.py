@@ -14,6 +14,10 @@ from scrapers.dcinside import DcinsideScraper
 from scrapers.humoruniv import HumorunivScraper
 from scrapers.cook82 import Cook82Scraper
 from scrapers.ddanzi import DdanziScraper
+from scrapers.fmkorea import FmkoreaScraper
+from scrapers.theqoo import TheqooScraper
+from scrapers.slrclub import SlrclubScraper
+from scrapers.todayhumor import TodayhumorScraper
 from processor.dedup import dedup
 from processor.scorer import score_all
 from db.supabase import upsert_posts
@@ -36,8 +40,11 @@ SCRAPERS = [
     DcinsideScraper(),
     HumorunivScraper(),
     # Cook82Scraper(),  # 별도 베스트 게시판 없음 - 비활성화
-    DdanziScraper(),
     # FmkoreaScraper(),  # 봇 차단 (430) - 비활성화
+    DdanziScraper(),
+    TheqooScraper(),
+    SlrclubScraper(),
+    TodayhumorScraper(),
 ]
 
 

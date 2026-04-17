@@ -33,6 +33,8 @@ SITE_COLORS = {
     "humoruniv":  "#F57C00",
     "dcinside":   "#1565C0",
     "ddanzi":     "#333333",
+    "theqoo":     "#FF6B6B",
+    "todayhumor": "#FF8C00",
 }
 
 # 사이트별 표시명
@@ -49,4 +51,6 @@ SITE_NAMES = {
     "humoruniv":  "웃긴대학",
     "dcinside":   "디씨인사이드",
     "ddanzi":     "딴지일보",
+    "theqoo":     "더쿠",
+    "todayhumor": "오늘의유머",
 }
