@@ -2,7 +2,7 @@ name: Community Trend Crawler
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # 30분 간격
+    - cron: "0 * * * *"   # 1시간 간격
   workflow_dispatch:           # 수동 실행
 
 jobs:
