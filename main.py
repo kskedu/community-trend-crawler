@@ -13,12 +13,13 @@ from scrapers.inven import InvenScraper
 from scrapers.dcinside import DcinsideScraper
 from scrapers.humoruniv import HumorunivScraper
 from scrapers.cook82 import Cook82Scraper
-from scrapers.ddanzi import DdanziScraper
 from scrapers.fmkorea import FmkoreaScraper
 from scrapers.theqoo import TheqooScraper
 from scrapers.slrclub import SlrclubScraper
 from scrapers.todayhumor import TodayhumorScraper
 from scrapers.etoland import EtolandScraper
+from scrapers.instiz import InstizScraper
+from scrapers.ygosu import YgosuScraper
 from processor.dedup import dedup
 from processor.filter import filter_notices
 from processor.scorer import score_all
@@ -41,13 +42,15 @@ SCRAPERS = [
     InvenScraper(),
     DcinsideScraper(),
     HumorunivScraper(),
-    # Cook82Scraper(),  # 별도 베스트 게시판 없음 - 비활성화
+    Cook82Scraper(),
     # FmkoreaScraper(),  # 봇 차단 (430) - 비활성화
-    DdanziScraper(),
+    # DdanziScraper(),  # 제거
     TheqooScraper(),
     SlrclubScraper(),
     TodayhumorScraper(),
     EtolandScraper(),
+    InstizScraper(),
+    YgosuScraper(),
 ]
 
 

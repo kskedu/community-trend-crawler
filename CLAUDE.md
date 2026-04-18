@@ -45,12 +45,15 @@ community-trend-crawler/
 | 인벤 | inven | ✅ | |
 | 디씨인사이드 | dcinside | ✅ | |
 | 웃긴대학 | humoruniv | ✅ | |
-| 딴지일보 | ddanzi | ✅ | |
 | 더쿠 | theqoo | ✅ | og:image |
 | SLR클럽 | slrclub | ✅ | EUC-KR, 자체 이미지 |
 | 오늘의유머 | todayhumor | ✅ | EUC-KR |
 | 이토랜드 | etoland | ✅ | EUC-KR, og:image |
+| 82쿡 | 82cook | ✅ | best_article.php |
+| 인스티즈 | instiz | ✅ | |
+| 와고 | ygosu | ✅ | 베스트 daily |
 | 에펨코리아 | fmkorea | ❌ | 봇 차단(430) |
+| 딴지일보 | ddanzi | ❌ | 제거 |
 
 ## 필터링 정책 (processor/filter.py)
 
