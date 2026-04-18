@@ -16,30 +16,31 @@ class Cook82Scraper(BaseScraper):
     def scrape(self) -> List[Post]:
         posts = []
         try:
-            html = self.fetch(f"{BASE_URL}/entiz/best_article.php")
+            html = self.fetch(BASE_URL)
             soup = BeautifulSoup(html, "html.parser")
 
-            for item in soup.select("ul.list_area li, tr.list")[:MAX_POSTS_PER_SITE]:
-                title_el = item.select_one("a.tit_link, .subject a, td.title a")
-                if not title_el:
+            # 메인 페이지 "최근 많이 읽은 글" 섹션
+            best_box = soup.select_one("div.leftbox.Best ul.most")
+            if not best_box:
+                logger.warning("[82cook] best 섹션을 찾지 못했습니다")
+                return posts
+
+            for a in best_box.select("a[href*='read.php']")[:MAX_POSTS_PER_SITE]:
+                title = a.get("title") or a.get_text(strip=True)
+                if not title or len(title) < 3:
                     continue
 
-                title = title_el.get_text(strip=True)
-                href = title_el.get("href", "")
+                href = a.get("href", "")
                 url = href if href.startswith("http") else BASE_URL + href
-
-                upvotes = self._int(item.select_one(".recom, .good"))
-                comments = self._int(item.select_one(".reply"))
-                views = self._int(item.select_one(".hit"))
 
                 posts.append(Post(
                     title=title,
                     source_url=url,
                     source_site=self.site_id,
                     image_url=None,
-                    upvotes=upvotes,
-                    comments=comments,
-                    views=views,
+                    upvotes=0,
+                    comments=0,
+                    views=0,
                     created_at=datetime.now(),
                 ))
 
@@ -47,11 +48,3 @@ class Cook82Scraper(BaseScraper):
             logger.error(f"[82cook] 스크래핑 실패: {e}")
 
         return posts
-
-    def _int(self, el) -> int:
-        if not el:
-            return 0
-        try:
-            return int(el.get_text(strip=True).replace(",", ""))
-        except ValueError:
-            return 0
