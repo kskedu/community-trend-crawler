@@ -55,6 +55,31 @@ community-trend-crawler/
 | 에펨코리아 | fmkorea | ❌ | 봇 차단(430) |
 | 딴지일보 | ddanzi | ❌ | 제거 |
 
+## Supabase DB 스키마
+
+### community_posts
+
+| 컬럼 | 타입 | 설명 |
+|---|---|---|
+| id | uuid | PK |
+| title | text | 게시글 제목 |
+| content | text | 본문 (일부 사이트만) |
+| image_url | text | 썸네일 이미지 URL |
+| source_url | text | 원본 게시글 URL (upsert 기준) |
+| source_site | text | 커뮤니티 ID (`clien`, `ruliweb`, `theqoo`, `ygosu` 등) |
+| upvotes | integer | 추천 수 |
+| comments | integer | 댓글 수 |
+| views | integer | 조회 수 |
+| score | double precision | 계산된 인기 점수 (processor/scorer.py) |
+| img_hash | text | 이미지 해시 (중복 판별용) |
+| created_at | timestamptz | DB insert 시각 |
+| collected_at | timestamptz | 크롤링 수집 시각 |
+| click_count | integer | 프론트 클릭 수 |
+| fav_count | integer | 프론트 즐겨찾기 수 |
+
+- **upsert 키**: `source_url`
+- **프론트 조회**: [StartHub/js/community.js](../StartHub/js/community.js)에서 `source_site` 필터 + `score/comments/views` 정렬
+
 ## 필터링 정책 (processor/filter.py)
 
 ### 제목 길이
