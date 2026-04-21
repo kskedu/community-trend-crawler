@@ -1,5 +1,6 @@
 import logging
-from typing import List
+from datetime import datetime, timezone
+from typing import List, Dict
 from supabase import create_client, Client
 from models import Post
 from config import SUPABASE_URL, SUPABASE_KEY
@@ -48,3 +49,20 @@ def upsert_posts(posts: List[Post]) -> int:
     except Exception as e:
         logger.error(f"upsert 실패: {e}")
         return 0
+
+
+def upsert_keywords(source: str, keywords: List[Dict[str, str]]) -> bool:
+    """keyword_cache 테이블에 upsert."""
+    if not keywords:
+        return False
+    client = get_client()
+    try:
+        client.table("keyword_cache").upsert({
+            "source": source,
+            "keywords": keywords,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }, on_conflict="source").execute()
+        return True
+    except Exception as e:
+        logger.error(f"[{source}] keyword upsert 실패: {e}")
+        return False

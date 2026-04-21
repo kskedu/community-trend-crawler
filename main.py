@@ -20,10 +20,13 @@ from scrapers.todayhumor import TodayhumorScraper
 from scrapers.etoland import EtolandScraper
 from scrapers.instiz import InstizScraper
 from scrapers.ygosu import YgosuScraper
+from keywords.danawa import DanawaKeywordScraper
+from keywords.daum import DaumKeywordScraper
+from keywords.namuwiki import NamuwikiKeywordScraper
 from processor.dedup import dedup
 from processor.filter import filter_notices
 from processor.scorer import score_all
-from db.supabase import upsert_posts
+from db.supabase import upsert_posts, upsert_keywords
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,6 +54,13 @@ SCRAPERS = [
     EtolandScraper(),
     InstizScraper(),
     YgosuScraper(),
+]
+
+# 키워드 스크래퍼 (검색엔진 실시간 키워드 → keyword_cache)
+KEYWORD_SCRAPERS = [
+    DanawaKeywordScraper(),
+    DaumKeywordScraper(),
+    NamuwikiKeywordScraper(),
 ]
 
 
@@ -82,6 +92,18 @@ def run():
     # DB 저장
     saved = upsert_posts(all_posts)
     logger.info(f"저장 완료: {saved}건")
+
+    # 검색엔진 키워드 수집
+    for ks in KEYWORD_SCRAPERS:
+        logger.info(f"[{ks.source}] 키워드 크롤링 시작")
+        try:
+            items = ks.scrape()
+            if upsert_keywords(ks.source, items):
+                logger.info(f"[{ks.source}] 키워드 {len(items)}개 저장")
+            else:
+                logger.warning(f"[{ks.source}] 키워드 저장 실패")
+        except Exception as e:
+            logger.error(f"[{ks.source}] 키워드 실패: {e}")
 
 
 if __name__ == "__main__":
