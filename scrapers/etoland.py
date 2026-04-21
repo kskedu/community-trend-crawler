@@ -24,6 +24,10 @@ class EtolandScraper(BaseScraper):
             candidates = soup.select('a[href*="bo_table="]')
             logger.info(f"[etoland] 응답 {len(content)}B, a[bo_table=] {len(candidates)}개 발견")
 
+            # 상위 5개 샘플 href/title 덤프
+            for i, a in enumerate(candidates[:5]):
+                logger.info(f"[etoland] 샘플{i}: href={a.get('href','')[:120]} / text={a.get_text(strip=True)[:60]}")
+
             og_count = 0
             seen_urls = set()
 
