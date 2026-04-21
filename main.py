@@ -20,6 +20,7 @@ from scrapers.todayhumor import TodayhumorScraper
 from scrapers.etoland import EtolandScraper
 from scrapers.instiz import InstizScraper
 from scrapers.ygosu import YgosuScraper
+from scrapers.natepann import NatepannScraper
 from keywords.danawa import DanawaKeywordScraper
 from keywords.daum import DaumKeywordScraper
 from keywords.namuwiki import NamuwikiKeywordScraper
@@ -54,6 +55,7 @@ SCRAPERS = [
     EtolandScraper(),
     InstizScraper(),
     YgosuScraper(),
+    NatepannScraper(),
 ]
 
 # 키워드 스크래퍼 (검색엔진 실시간 키워드 → keyword_cache)
