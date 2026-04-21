@@ -21,20 +21,14 @@ class EtolandScraper(BaseScraper):
             content = self.fetch_bytes(f"{BASE_URL}/bbs/hit.php")
             soup = BeautifulSoup(content, "html.parser")
 
-            candidates = soup.select('a[href*="bo_table="]')
-            logger.info(f"[etoland] 응답 {len(content)}B, a[bo_table=] {len(candidates)}개 발견")
-
-            # 상위 5개 샘플 href/title 덤프
-            for i, a in enumerate(candidates[:5]):
-                logger.info(f"[etoland] 샘플{i}: href={a.get('href','')[:120]} / text={a.get_text(strip=True)[:60]}")
+            candidates = soup.select('a[href*="wr_id="]')
+            logger.info(f"[etoland] 응답 {len(content)}B, a[wr_id=] {len(candidates)}개 발견")
 
             og_count = 0
             seen_urls = set()
 
             for a in candidates[:MAX_POSTS_PER_SITE * 2]:
                 href = a.get("href", "")
-                if "wr_id=" not in href:
-                    continue
 
                 # 절대 URL 변환
                 if href.startswith("http"):
