@@ -22,9 +22,8 @@ class NatepannScraper(BaseScraper):
         posts = []
         try:
             content = self.fetch_bytes(HOME_URL)
-            # 네이트판은 charset="euc-kr"로 선언하지만 실제로는 CP949 확장 한글
-            # 사용. euc-kr 디코더로 읽으면 상위 영역 한글이 한자로 깨짐.
-            html = content.decode("cp949", errors="replace")
+            # 네이트판 대문은 UTF-8 (Content-Type: text/html; charset=utf-8)
+            html = content.decode("utf-8", errors="replace")
             soup = BeautifulSoup(html, "html.parser")
 
             # talkerChoiceArea0: 1~20위, talkerChoiceArea1: 21~40위
