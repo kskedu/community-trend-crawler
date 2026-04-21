@@ -21,10 +21,13 @@ class EtolandScraper(BaseScraper):
             content = self.fetch_bytes(f"{BASE_URL}/bbs/hit.php")
             soup = BeautifulSoup(content, "html.parser")
 
+            candidates = soup.select('a[href*="bo_table="]')
+            logger.info(f"[etoland] 응답 {len(content)}B, a[bo_table=] {len(candidates)}개 발견")
+
             og_count = 0
             seen_urls = set()
 
-            for a in soup.select('a[href*="bo_table="]')[:MAX_POSTS_PER_SITE * 2]:
+            for a in candidates[:MAX_POSTS_PER_SITE * 2]:
                 href = a.get("href", "")
                 if "wr_id=" not in href:
                     continue
