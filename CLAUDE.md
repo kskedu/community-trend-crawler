@@ -7,30 +7,27 @@ GitHub Actions로 주기적 실행.
 
 ```
 community-trend-crawler/
-├── main.py              # 진입점, 스크래퍼 목록 관리
+├── main.py              # 진입점, 스크래퍼 + 키워드 크롤러 통합 실행
 ├── models.py            # Post 데이터 모델
-├── config.py            # 공통 설정 (헤더, 타임아웃 등)
-├── scrapers/
+├── config.py            # 공통 설정 (Chrome 12종 헤더, 타임아웃 등)
+├── scrapers/            # 커뮤니티 게시글 크롤러
 │   ├── base.py          # BaseScraper (fetch, fetch_bytes, fetch_og_image)
-│   ├── clien.py
-│   ├── ruliweb.py
-│   ├── ppomppu.py
-│   ├── mlbpark.py
-│   ├── bobaedream.py
-│   ├── inven.py
-│   ├── dcinside.py
-│   ├── humoruniv.py
-│   ├── ddanzi.py
-│   ├── theqoo.py
-│   ├── slrclub.py
-│   ├── todayhumor.py
-│   └── etoland.py
+│   ├── clien.py · ruliweb.py · ppomppu.py · mlbpark.py
+│   ├── bobaedream.py · inven.py · dcinside.py · humoruniv.py
+│   ├── theqoo.py · slrclub.py · todayhumor.py · etoland.py
+│   ├── cook82.py · instiz.py · ygosu.py · natepann.py
+│   └── (fmkorea.py, ddanzi.py — 비활성)
+├── keywords/            # 검색엔진 실시간 키워드 크롤러
+│   ├── base.py          # BaseKeywordScraper
+│   ├── danawa.py        # 다나와 인기 키워드 Top 10
+│   ├── daum.py          # 다음 실시간 트렌드 Top 10
+│   └── namuwiki.py      # namu.news SSR 기반 실시간 검색어 Top 10
 ├── processor/
 │   ├── dedup.py         # URL 기반 중복 제거
 │   ├── filter.py        # 광고/공지/노이즈 필터
 │   └── scorer.py        # 점수 계산
 └── db/
-    └── supabase.py      # Supabase upsert
+    └── supabase.py      # upsert_posts, upsert_keywords
 ```
 
 ## 스크래퍼 현황
@@ -52,8 +49,20 @@ community-trend-crawler/
 | 82쿡 | 82cook | ✅ | best_article.php |
 | 인스티즈 | instiz | ✅ | |
 | 와고 | ygosu | ✅ | 베스트 daily |
+| 네이트판 | natepann | ✅ | EUC-KR, 대문 '톡커들의 선택' Top 40 |
 | 에펨코리아 | fmkorea | ❌ | 봇 차단(430) |
 | 딴지일보 | ddanzi | ❌ | 제거 |
+
+## 키워드 스크래퍼 (keywords/)
+
+검색엔진 실시간 키워드 수집 → Supabase `keyword_cache`. StartHub 프론트는
+이 테이블을 직접 조회해 즉시 표시 (Vercel 함수 미경유).
+
+| 소스 | ID | 대상 URL | 비고 |
+|---|---|---|---|
+| 다나와 | danawa | `/dsearch.php?query=best` | `hot_keyword` 섹션 파싱. Vercel은 403 차단되어 GH Actions(한국 친화 IP)로 이관 |
+| 다음 | daum | `/search?w=tot&q=ㄴㄴ` | `list_trend` 내 `data-keyword` 추출 |
+| 나무위키 | namuwiki | `https://namu.news/` | SSR HTML의 `WikiRank` JSON 파싱, 클릭 시 `namu.wiki/Go?q=` |
 
 ## Supabase DB 스키마
 
@@ -78,7 +87,22 @@ community-trend-crawler/
 | fav_count | integer | 프론트 즐겨찾기 수 |
 
 - **upsert 키**: `source_url`
+- **`collected_at` 갱신**: upsert 시 `datetime.now(UTC)`를 매번 명시 주입.
+  과거에 필드 누락으로 상위 고정 인기글(엠팍 등)이 실시간/단기 range에서
+  누락되는 버그 있었음 — [db/supabase.py](db/supabase.py) `upsert_posts` 참조
 - **프론트 조회**: [StartHub/js/community.js](../StartHub/js/community.js)에서 `source_site` 필터 + `score/comments/views` 정렬
+
+### keyword_cache
+검색엔진 실시간 키워드. `keywords/` 크롤러 3종이 30분 주기로 upsert.
+
+| 컬럼 | 타입 | 설명 |
+|---|---|---|
+| source | text (PK) | `danawa` / `daum` / `namuwiki` |
+| keywords | jsonb | `[{keyword, url}, ...]` |
+| updated_at | timestamptz | 마지막 수집 시각 |
+
+- **upsert 키**: `source`
+- **프론트 조회**: [StartHub/js/app.js](../StartHub/js/app.js) `_fetchKeywordCache()`에서 Supabase 직접 조회
 
 ## 필터링 정책 (processor/filter.py)
 
