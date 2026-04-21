@@ -2,6 +2,7 @@ import re
 import logging
 from datetime import datetime
 from typing import List
+from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from scrapers.base import BaseScraper
 from models import Post
@@ -9,6 +10,7 @@ from config import MAX_POSTS_PER_SITE
 
 logger = logging.getLogger(__name__)
 BASE_URL = "https://www.etoland.co.kr"
+HIT_URL = f"{BASE_URL}/bbs/hit.php"
 OG_IMAGE_LIMIT = 10
 
 
@@ -18,7 +20,7 @@ class EtolandScraper(BaseScraper):
     def scrape(self) -> List[Post]:
         posts = []
         try:
-            content = self.fetch_bytes(f"{BASE_URL}/bbs/hit.php")
+            content = self.fetch_bytes(HIT_URL)
             soup = BeautifulSoup(content, "html.parser")
 
             candidates = soup.select('a[href*="wr_id="]')
@@ -29,16 +31,7 @@ class EtolandScraper(BaseScraper):
 
             for a in candidates[:MAX_POSTS_PER_SITE * 2]:
                 href = a.get("href", "")
-
-                # 절대 URL 변환
-                if href.startswith("http"):
-                    url = href
-                elif href.startswith("//"):
-                    url = "https:" + href
-                elif href.startswith("/"):
-                    url = BASE_URL + href
-                else:
-                    url = BASE_URL + "/bbs/" + href.lstrip("../")
+                url = urljoin(HIT_URL, href)
 
                 if url in seen_urls:
                     continue
