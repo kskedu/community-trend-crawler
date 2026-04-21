@@ -29,7 +29,13 @@ class MlbparkScraper(BaseScraper):
             if first_title:
                 logger.info(f"[mlbpark] sample title after utf-8 decode: {first_title.get_text(strip=True)[:40]}")
 
-            for a in soup.select('a[href*="/mp/b.php?b="][href*="id="]'):
+            found = soup.select('a[href*="/mp/b.php?b="][href*="id="]')
+            logger.info(f"[mlbpark] candidate anchors: {len(found)}")
+            for i, a in enumerate(found[:3]):
+                t = a.get_text(strip=True)
+                logger.info(f"[mlbpark] cand{i} title={t[:40]!r} hex={t[:10].encode('utf-8').hex()}")
+
+            for a in found:
                 title = a.get_text(strip=True)
                 if not title or len(title) < 5 or title in seen_titles:
                     continue
