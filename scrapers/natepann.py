@@ -48,6 +48,17 @@ class NatepannScraper(BaseScraper):
                     continue
                 seen_urls.add(url)
 
+                # 추천수 파싱: <li>...<span class="count"><i>348</i></span></li>
+                upvotes = 0
+                li = a.find_parent("li")
+                if li:
+                    i_el = li.select_one("span.count i")
+                    if i_el:
+                        try:
+                            upvotes = int(i_el.get_text(strip=True).replace(",", ""))
+                        except ValueError:
+                            pass
+
                 image_url = None
                 if og_count < OG_IMAGE_LIMIT:
                     og = self.fetch_og_image(url)
@@ -60,7 +71,7 @@ class NatepannScraper(BaseScraper):
                     source_url=url,
                     source_site=self.site_id,
                     image_url=image_url,
-                    upvotes=0,
+                    upvotes=upvotes,
                     comments=0,
                     views=0,
                     created_at=datetime.now(),
