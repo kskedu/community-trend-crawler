@@ -22,6 +22,7 @@ def upsert_posts(posts: List[Post]) -> int:
         return 0
 
     client = get_client()
+    now_iso = datetime.now(timezone.utc).isoformat()
     rows = []
     for p in posts:
         rows.append({
@@ -35,6 +36,7 @@ def upsert_posts(posts: List[Post]) -> int:
             "views": p.views,
             "score": p.score,
             "created_at": p.created_at.isoformat() if p.created_at else None,
+            "collected_at": now_iso,
         })
 
     try:
