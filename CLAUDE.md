@@ -49,7 +49,7 @@ community-trend-crawler/
 | 82쿡 | 82cook | ✅ | best_article.php |
 | 인스티즈 | instiz | ✅ | |
 | 와고 | ygosu | ✅ | 베스트 daily |
-| 네이트판 | natepann | ✅ | EUC-KR, 대문 '톡커들의 선택' Top 40 |
+| 네이트판 | natepann | ✅ | UTF-8, 대문 '톡커들의 선택' Top 40 (talkerChoiceArea0/1) |
 | 에펨코리아 | fmkorea | ❌ | 봇 차단(430) |
 | 딴지일보 | ddanzi | ❌ | 제거 |
 
