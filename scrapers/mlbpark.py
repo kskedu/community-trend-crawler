@@ -18,7 +18,10 @@ class MlbparkScraper(BaseScraper):
         posts = []
         seen_titles = set()
         try:
-            html = self.fetch(f"{BASE_URL}/mp/best.php")
+            # Content-Type: charset=UTF-8이지만 requests의 charset_normalizer가
+            # 오추정해 EUC-KR로 디코딩하는 이슈가 있어 bytes + 명시적 utf-8 처리
+            raw = self.fetch_bytes(f"{BASE_URL}/mp/best.php")
+            html = raw.decode("utf-8", errors="replace")
             soup = BeautifulSoup(html, "html.parser")
 
             for a in soup.select('a[href*="/mp/b.php?b="][href*="id="]'):
