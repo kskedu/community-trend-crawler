@@ -24,6 +24,7 @@ from scrapers.natepann import NatepannScraper
 from keywords.danawa import DanawaKeywordScraper
 from keywords.daum import DaumKeywordScraper
 from keywords.namuwiki import NamuwikiKeywordScraper
+from keywords.daangn import DaangnKeywordScraper
 from processor.dedup import dedup
 from processor.filter import filter_notices
 from processor.scorer import score_all
@@ -62,6 +63,7 @@ SCRAPERS = [
 KEYWORD_SCRAPERS = [
     DanawaKeywordScraper(),
     DaumKeywordScraper(),
+    DaangnKeywordScraper(),
     NamuwikiKeywordScraper(),
 ]
 
