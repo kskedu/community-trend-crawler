@@ -1,0 +1,92 @@
+name: Crawler Healthcheck
+
+on:
+  schedule:
+    # 매시 23분 (정각/30분 회피, 크롤러 17분과 6분 차이로 데이터 반영 시간 확보)
+    - cron: "23 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write   # gh workflow run (크롤러 재실행) 위해 필요
+
+jobs:
+  healthcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check latest community_posts timestamp
+        id: check
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          set -euo pipefail
+          RES=$(curl -s "${SUPABASE_URL}/rest/v1/community_posts?select=created_at&order=created_at.desc&limit=1" \
+            -H "apikey: ${SUPABASE_KEY}" \
+            -H "Authorization: Bearer ${SUPABASE_KEY}")
+          echo "Response: $RES"
+
+          LAST_AT=$(echo "$RES" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data[0]['created_at'] if data else '')")
+          if [ -z "$LAST_AT" ]; then
+            echo "❌ community_posts 비어있음 — fail"
+            exit 1
+          fi
+
+          # 경과 시간(분) 계산
+          ELAPSED_MIN=$(python3 -c "
+          from datetime import datetime, timezone
+          last = datetime.fromisoformat('$LAST_AT'.replace('Z','+00:00'))
+          now = datetime.now(timezone.utc)
+          print(int((now - last).total_seconds() // 60))
+          ")
+          echo "마지막 수집: $LAST_AT (${ELAPSED_MIN}분 전)"
+          echo "elapsed_min=$ELAPSED_MIN" >> $GITHUB_OUTPUT
+          echo "last_at=$LAST_AT" >> $GITHUB_OUTPUT
+
+          # 상태 분류
+          if [ "$ELAPSED_MIN" -lt 120 ]; then
+            echo "status=ok" >> $GITHUB_OUTPUT
+          elif [ "$ELAPSED_MIN" -lt 240 ]; then
+            echo "status=stale" >> $GITHUB_OUTPUT
+          else
+            echo "status=down" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Trigger crawler (stale or down)
+        if: steps.check.outputs.status != 'ok'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "🔄 크롤러 재실행 트리거 (status=${{ steps.check.outputs.status }})"
+          gh workflow run "Community Trend Crawler" --ref main \
+            --repo ${{ github.repository }}
+
+      - name: Send Telegram alert (down only)
+        if: steps.check.outputs.status == 'down'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          ELAPSED=${{ steps.check.outputs.elapsed_min }}
+          HOURS=$((ELAPSED / 60))
+          MINS=$((ELAPSED % 60))
+          LAST_AT_KST=$(python3 -c "
+          from datetime import datetime, timedelta, timezone
+          last = datetime.fromisoformat('${{ steps.check.outputs.last_at }}'.replace('Z','+00:00'))
+          kst = last.astimezone(timezone(timedelta(hours=9)))
+          print(kst.strftime('%Y-%m-%d %H:%M KST'))
+          ")
+          MESSAGE="🚨 [StartHub] 크롤러 이상 감지
+
+          마지막 수집: ${LAST_AT_KST}
+          경과 시간: ${HOURS}시간 ${MINS}분
+          조치: 크롤러 자동 재실행 트리거됨
+
+          GitHub: https://github.com/${{ github.repository }}/actions"
+
+          curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id=${TELEGRAM_CHAT_ID} \
+            -d text="${MESSAGE}" \
+            -d disable_web_page_preview=true
+          echo ""
+          echo "텔레그램 알림 전송 완료"
