@@ -5,6 +5,12 @@ on:
     # 매시 23분 (정각/30분 회피, 크롤러 17분과 6분 차이로 데이터 반영 시간 확보)
     - cron: "23 * * * *"
   workflow_dispatch:
+    inputs:
+      force_alert:
+        description: "텔레그램 알림 동작 강제 테스트"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -62,7 +68,7 @@ jobs:
             --repo ${{ github.repository }}
 
       - name: Send Telegram alert (down only)
-        if: steps.check.outputs.status == 'down'
+        if: steps.check.outputs.status == 'down' || inputs.force_alert == true
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
