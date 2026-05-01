@@ -2,7 +2,8 @@ name: Community Trend Crawler
 
 on:
   schedule:
-    - cron: "0 * * * *"   # 1시간 간격
+    # 매시 17분 (정각/30분 회피 → GitHub Actions 큐 지연 최소화)
+    - cron: "17 * * * *"
   workflow_dispatch:           # 수동 실행
 
 jobs:
