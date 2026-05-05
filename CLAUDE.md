@@ -3,6 +3,19 @@
 커뮤니티 사이트 인기글을 수집해 Supabase에 저장하는 크롤러.
 GitHub Actions로 주기적 실행.
 
+## 트리거 방식 (2026-05-05~)
+
+GitHub Actions 무료 정시 cron 큐 지연 문제(최대 3시간+) 회피를 위해
+**cron-job.org → GitHub `workflow_dispatch` API** 외부 트리거 사용.
+
+- **cron-job.org**: 매시 정각 KST(`Asia/Seoul`) HTTP POST 호출 → 정확도 ±1초
+- **호출 endpoint**: `POST https://api.github.com/repos/kskedu/community-trend-crawler/actions/workflows/crawl.yml/dispatches`
+- **Headers**: `Authorization: Bearer <PAT>` + `Accept: application/vnd.github.v3+json` + `Content-Type: application/json`
+- **Body**: `{"ref":"main"}`
+- **PAT**: classic, scopes: `repo` (private 레포)
+- **백업**: GitHub 자체 cron `17 * * * *` 도 그대로 유지 (cron-job.org 다운 시 안전망)
+- **헬스체크**: `.github/workflows/healthcheck.yml` 텔레그램 알림 유지
+
 ## 구조
 
 ```
