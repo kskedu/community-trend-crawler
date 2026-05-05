@@ -119,30 +119,20 @@ community-trend-crawler/
 
 ## 필터링 정책 (processor/filter.py)
 
+### 관리 방식 (2026-05-05~)
+- **DB 우선**: Supabase `trend_block_keywords` 테이블에서 `enabled=true` 항목 로드
+- **Fallback**: DB 조회 실패 시 filter.py 하드코딩 목록 사용
+- **어드민 관리**: [StartHub/admin/trends.html](../StartHub/admin/trends.html) > `필터 관리` 탭에서 CRUD
+- **이력 기록**: 추가/삭제 시 `trend_block_keyword_logs` 테이블에 자동 기록
+- DB 스키마: [StartHub/docs/supabase-trend-block-keywords-migration.sql](../StartHub/docs/supabase-trend-block-keywords-migration.sql)
+
 ### 제목 길이
-- 5자 이하 제목 전부 제거
+- 5자 이하 제목 전부 제거 (코드 고정, DB 비관리)
 
-### 차단 키워드
-**공지/운영**
-- 공지, 공지사항, 안내, 규칙, 이용규칙, 이용안내
-- 비밀번호, 권장, 필독, 운영, 운영진, 관리자
-- 점검, 서버점검, 서비스점검
-- 이벤트 안내, 당첨, 정책
-- [공지], [안내], [필독], [운영], [이벤트]
-- 투표 참여, 설문
-
-**광고/스팸**
-- [광고], [홍보], [협찬], [PR], [AD]
-- 리딩방, 단톡방
-- 즉시입금, 바로입금, 당일입금, 현금입금
-- 무조건, 선착순
-
-### 차단 패턴 (Regex)
-- `^AD[\[\s#(]` — AD로 시작하는 제목
-- `#\S+.*#\S+` — 해시태그 2개 이상
-- `[▶▼★◆◇■□●○]{2,}` — 특수문자 2개 이상 연속
-- `^\[공지\]`, `^\[안내\]`, `^\[필독\]`, `^\[운영\]`
-- `^공지[\s:]`, `^안내[\s:]`
+### 차단 키워드 / 패턴
+→ Supabase `trend_block_keywords` 테이블에서 관리 (어드민 UI)
+- type `keyword`: 제목에 포함 시 차단
+- type `pattern`: 정규식 매칭 차단
 
 ### 오탐 위험으로 미포함
 - 수익, 재테크, 코인, 이벤트, 판매, 공구, 직구

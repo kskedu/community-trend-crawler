@@ -1,9 +1,15 @@
 import re
+import logging
 from typing import List
 from models import Post
 
-# 제목에 포함 시 제외할 키워드
-BLOCK_KEYWORDS = [
+logger = logging.getLogger(__name__)
+
+# ─── 하드코딩 Fallback ───────────────────────────────────────────────────────
+# DB(trend_block_keywords) 조회 실패 시 사용.
+# 어드민에서 DB 값을 관리하므로 여기는 최소한만 유지.
+
+_FALLBACK_KEYWORDS = [
     # 공지/운영
     "공지", "공지사항", "안내", "규칙", "이용규칙", "이용안내",
     "비밀번호", "권장", "필독", "운영", "운영진", "관리자",
@@ -18,40 +24,81 @@ BLOCK_KEYWORDS = [
     "무조건", "선착순",
 ]
 
-# 정규식 패턴으로 제외
-BLOCK_PATTERNS = [
-    # 공지 앞머리
-    r'^\[공지\]',
-    r'^\[안내\]',
-    r'^\[필독\]',
-    r'^\[운영\]',
-    r'^공지[\s:]',
-    r'^안내[\s:]',
-    # 광고 앞머리 (AD로 시작, 뒤에 영문자/공백 아닌 문자 — AD@, AD갤럭시 등)
+_FALLBACK_PATTERNS = [
+    r'^\[공지\]', r'^\[안내\]', r'^\[필독\]', r'^\[운영\]',
+    r'^공지[\s:]', r'^안내[\s:]',
     r'^AD[^a-zA-Z ]',
-    # 해시태그 2개 이상
     r'#\S+.*#\S+',
-    # 특수문자 2개 이상 연속
     r'[▶▼★◆◇■□●○]{2,}',
 ]
 
-_compiled = [re.compile(p, re.IGNORECASE) for p in BLOCK_PATTERNS]
-
-# 제목 최소 길이
 MIN_TITLE_LENGTH = 6
+
+# ─── 런타임 필터 상태 (크롤러 실행당 1회 로드) ───────────────────────────────
+_block_keywords: List[str] = []
+_compiled_patterns: List[re.Pattern] = []
+_loaded = False
+
+
+def load_filters_from_db() -> bool:
+    """Supabase trend_block_keywords 테이블에서 필터 목록 로드.
+    성공 시 True, 실패 시 False."""
+    global _block_keywords, _compiled_patterns, _loaded
+    try:
+        from db.supabase import get_client
+        client = get_client()
+        res = (
+            client.table("trend_block_keywords")
+            .select("type,value")
+            .eq("enabled", True)
+            .execute()
+        )
+        rows = res.data or []
+        if not rows:
+            return False
+
+        keywords = [r["value"] for r in rows if r["type"] == "keyword"]
+        patterns = [r["value"] for r in rows if r["type"] == "pattern"]
+        compiled = []
+        for p in patterns:
+            try:
+                compiled.append(re.compile(p, re.IGNORECASE))
+            except re.error as e:
+                logger.warning("필터 패턴 컴파일 실패 (무시): %s — %s", p, e)
+
+        _block_keywords = keywords
+        _compiled_patterns = compiled
+        _loaded = True
+        logger.info("필터 DB 로드 완료: 키워드 %d개, 패턴 %d개", len(keywords), len(patterns))
+        return True
+    except Exception as e:
+        logger.warning("필터 DB 로드 실패, fallback 사용: %s", e)
+        return False
+
+
+def _ensure_loaded():
+    global _block_keywords, _compiled_patterns, _loaded
+    if _loaded:
+        return
+    if not load_filters_from_db():
+        # fallback
+        _block_keywords = list(_FALLBACK_KEYWORDS)
+        _compiled_patterns = [re.compile(p, re.IGNORECASE) for p in _FALLBACK_PATTERNS]
+        _loaded = True
+        logger.info("필터 fallback 사용: 키워드 %d개, 패턴 %d개",
+                    len(_block_keywords), len(_compiled_patterns))
 
 
 def is_noise(title: str) -> bool:
+    _ensure_loaded()
     t = title.strip()
 
-    # 제목 길이 필터 (5자 이하)
     if len(t) <= MIN_TITLE_LENGTH - 1:
         return True
-
-    for kw in BLOCK_KEYWORDS:
+    for kw in _block_keywords:
         if kw in t:
             return True
-    for pattern in _compiled:
+    for pattern in _compiled_patterns:
         if pattern.search(t):
             return True
     return False
