@@ -58,7 +58,7 @@ community-trend-crawler/
 | 더쿠 | theqoo | ✅ | og:image |
 | SLR클럽 | slrclub | ✅ | EUC-KR, 자체 이미지 |
 | 오늘의유머 | todayhumor | ✅ | EUC-KR |
-| 이토랜드 | etoland | ✅ | EUC-KR, og:image |
+| 이토랜드 | etoland | ✅ | `/hit/list` (UTF-8). 리스트 썸네일 우선, 부족 시 og:image 폴백 |
 | 82쿡 | 82cook | ✅ | best_article.php |
 | 인스티즈 | instiz | ✅ | |
 | 와고 | ygosu | ✅ | 베스트 daily |
@@ -136,3 +136,20 @@ community-trend-crawler/
 
 ### 오탐 위험으로 미포함
 - 수익, 재테크, 코인, 이벤트, 판매, 공구, 직구
+
+## 트러블슈팅 이력
+
+- **2026-05-08 etoland 0건 수집 이슈**
+  - 증상: DB에 `etoland` 글이 0건 누적 — 단기/일간/주간 모두 비어 있음
+  - 원인: etoland 사이트 개편으로 `/bbs/hit.php?wr_id=` URL 패턴이 사라지고 `/hit/list` + `/hit/{board}/view/{slug}-{id}` 구조로 변경
+  - 해결: [scrapers/etoland.py](scrapers/etoland.py) 리스트 URL 변경 + 새 DOM 셀렉터(`a[href*="/hit/"][href*="/view/"]`, `span.truncate`, `span.comment-s`, `div.caption-m`)에 맞춰 파싱 재작성. 인코딩도 EUC-KR → UTF-8
+
+## range별 데이터 흐름 (참고)
+
+크롤러는 1시간 주기로 모든 사이트의 인기글 페이지만 수집한다. 사이트의 일/주간 카테고리를 별도로 호출하지 않음. 단기/12h/일간/주간은 프론트가 `collected_at` 기준으로 필터.
+- 스크래퍼: 매시 인기글 페이지 1번 수집 → upsert(`source_url` PK, `collected_at` 매번 갱신)
+- 프론트([StartHub/js/community.js](../StartHub/js/community.js)): `collected_at >= now - {3h,12h,24h,7d}` 필터 + `score desc, collected_at desc` 정렬
+
+따라서 일/주간이 비어 보인다면:
+1. 스크래퍼 자체가 실패해 0건 누적 (예: etoland 2026-05 이슈) — 로그/DB count 확인
+2. 사이트 게시글 수가 적어 단순히 점수 정렬에서 다른 사이트에 밀림 — 정상
