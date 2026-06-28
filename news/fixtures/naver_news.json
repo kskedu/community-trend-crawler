@@ -1,0 +1,56 @@
+{
+  "_comment": "키워드별 네이버 뉴스 검색 mock 응답. P0-1 dry-run 전용. 실제 API 응답 형태(items[].title/originallink/link/description/pubDate)를 모사. XSS/악성 URL/빈 케이스 포함.",
+  "월드컵 예선": {
+    "items": [
+      {
+        "title": "한국 <b>월드컵</b> 예선 본선 진출 확정",
+        "originallink": "https://www.yna.co.kr/view/AKR20260616001",
+        "link": "https://n.news.naver.com/article/001/0010000001",
+        "description": "한국 대표팀이 <b>월드컵</b> 예선에서 승리하며 본선行을 확정했다. &quot;값진 승리&quot;",
+        "pubDate": "Tue, 16 Jun 2026 21:10:00 +0900"
+      },
+      {
+        "title": "월드컵 예선 하이라이트 &amp; 분석",
+        "originallink": "https://www.kbs.co.kr/news/view.do?ncd=20260616",
+        "link": "https://n.news.naver.com/article/056/0010000002",
+        "description": "월드컵 예선 경기 하이라이트와 전문가 분석을 정리했다.",
+        "pubDate": "Tue, 16 Jun 2026 22:00:00 +0900"
+      },
+      {
+        "title": "[속보] 월드컵 예선 결과 정리",
+        "originallink": "https://news.sbs.co.kr/news/endPage.do?news_id=N1009",
+        "link": "https://n.news.naver.com/article/055/0010000003",
+        "description": "월드컵 예선 주요 경기 결과를 한눈에 정리했다.",
+        "pubDate": "Tue, 16 Jun 2026 20:30:00 +0900"
+      }
+    ]
+  },
+  "환율 급등": {
+    "items": [
+      {
+        "title": "원달러 환율 급등, 1400원 돌파",
+        "originallink": "javascript:alert('xss')",
+        "link": "https://n.news.naver.com/article/018/0020000001",
+        "description": "원달러 <b>환율</b>이 장중 1400원을 돌파했다. <script>alert('x')</script> 시장 불안.",
+        "pubDate": "Tue, 16 Jun 2026 15:00:00 +0900"
+      },
+      {
+        "title": "환율 급등 배경과 전망",
+        "originallink": "https://www.mk.co.kr/news/economy/20260616",
+        "link": "https://n.news.naver.com/article/009/0020000002",
+        "description": "환율 급등의 배경과 향후 전망을 짚었다.",
+        "pubDate": "not-a-valid-date"
+      },
+      {
+        "title": "악성 링크 테스트 기사",
+        "originallink": "data:text/html,<script>alert(1)</script>",
+        "link": "ftp://malicious.example.com/x",
+        "description": "이 기사는 url이 모두 비정상이라 드롭되어야 한다.",
+        "pubDate": "Tue, 16 Jun 2026 10:00:00 +0900"
+      }
+    ]
+  },
+  "신작 게임 출시": {
+    "items": []
+  }
+}

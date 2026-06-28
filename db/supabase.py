@@ -68,3 +68,24 @@ def upsert_keywords(source: str, keywords: List[Dict[str, str]]) -> bool:
     except Exception as e:
         logger.error(f"[{source}] keyword upsert 실패: {e}")
         return False
+
+
+def upsert_news_issues(issues: Dict, source: str = "news_top") -> bool:
+    """news_issue_cache 테이블에 upsert (실시간 이슈 브리핑).
+
+    ⚠️ P0-1에서는 호출하지 않는다(정의만). 실제 write는 P0-2에서 service_role로 수행.
+    on_conflict='source'(PK)로 단일 행 운영.
+    """
+    if not issues or not issues.get("keywords"):
+        return False
+    client = get_client()
+    try:
+        client.table("news_issue_cache").upsert({
+            "source": source,
+            "issues": issues,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }, on_conflict="source").execute()
+        return True
+    except Exception as e:
+        logger.error(f"[{source}] news issues upsert 실패: {e}")
+        return False
