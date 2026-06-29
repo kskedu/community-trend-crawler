@@ -100,3 +100,66 @@ def seed_from_fixture(fixture: dict, limit: int = SEED_MAX) -> List[str]:
     if not isinstance(fixture, dict):
         return []
     return _extract_keywords(fixture.get("keywords"), limit)
+
+
+# === 통합 랭킹용 (rank 포함) — 기존 함수/시그니처는 건드리지 않음 ===
+
+CANDIDATE_SEED_MAX = 20
+
+
+def _extract_ranked(keywords_field, limit: int) -> List[dict]:
+    """keyword_cache.keywords → [{keyword, rank}] (1-base). 중복 제거, 순서 보존."""
+    result = []
+    seen = set()
+    if not isinstance(keywords_field, list):
+        return result
+    for item in keywords_field:
+        if isinstance(item, dict):
+            kw = item.get("keyword")
+        elif isinstance(item, str):
+            kw = item
+        else:
+            kw = None
+        if kw and isinstance(kw, str):
+            kw = kw.strip()
+            if kw and kw not in seen:
+                seen.add(kw)
+                result.append({"keyword": kw, "rank": len(result) + 1})
+        if len(result) >= limit:
+            break
+    return result
+
+
+def fetch_ranked_seed(source: str, limit: int = CANDIDATE_SEED_MAX) -> Tuple[List[dict], bool]:
+    """keyword_cache(source) 행에서 [{keyword, rank}] 와 freshness 를 read-only 조회.
+
+    candidates 후보 pool용. daum/danawa 공용. 실패 시 ([], False).
+    """
+    try:
+        from db.supabase import get_client
+
+        client = get_client()
+        res = (
+            client.table("keyword_cache")
+            .select("keywords,updated_at")
+            .eq("source", source)
+            .maybe_single()
+            .execute()
+        )
+        data = getattr(res, "data", None)
+        if not data:
+            logger.warning("[news] candidates: keyword_cache(%s) 행 없음", source)
+            return [], False
+        ranked = _extract_ranked(data.get("keywords"), limit)
+        is_fresh = _is_fresh(data.get("updated_at"))
+        return ranked, is_fresh
+    except Exception as e:
+        logger.warning("[news] candidates: keyword_cache(%s) 조회 실패: %s", source, e)
+        return [], False
+
+
+def ranked_seed_from_fixture(fixture: dict, limit: int = CANDIDATE_SEED_MAX) -> List[dict]:
+    """dry-run용: fixture({keywords:[{keyword,url}]}) → [{keyword, rank}]."""
+    if not isinstance(fixture, dict):
+        return []
+    return _extract_ranked(fixture.get("keywords"), limit)

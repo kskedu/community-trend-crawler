@@ -1,5 +1,5 @@
 {
-  "_comment": "키워드별 네이버 뉴스 검색 mock 응답. P0-1 dry-run 전용. 실제 API 응답 형태(items[].title/originallink/link/description/pubDate)를 모사. XSS/악성 URL/빈 케이스 포함.",
+  "_comment": "키워드별 네이버 뉴스 검색 mock 응답. dry-run/test 전용. items[].title/originallink/link/description/pubDate. XSS/악성 URL/빈 케이스 포함. pubDate는 dry-run에서 '최근'으로 재주입될 수 있음(_inject_recent).",
   "월드컵 예선": {
     "items": [
       {
@@ -39,7 +39,21 @@
         "originallink": "https://www.mk.co.kr/news/economy/20260616",
         "link": "https://n.news.naver.com/article/009/0020000002",
         "description": "환율 급등의 배경과 향후 전망을 짚었다.",
-        "pubDate": "not-a-valid-date"
+        "pubDate": "Tue, 16 Jun 2026 14:00:00 +0900"
+      },
+      {
+        "title": "환율 급등에 수입물가 부담 가중",
+        "originallink": "https://www.hankyung.com/article/20260616env",
+        "link": "https://n.news.naver.com/article/015/0020000003",
+        "description": "환율 급등으로 수입물가 부담이 커지고 있다.",
+        "pubDate": "Tue, 16 Jun 2026 13:00:00 +0900"
+      },
+      {
+        "title": "환율 급등 정부 대응 회의 소집",
+        "originallink": "https://www.yna.co.kr/view/AKR20260616env",
+        "link": "https://n.news.naver.com/article/001/0020000004",
+        "description": "정부가 환율 급등 대응을 위해 긴급 회의를 소집했다.",
+        "pubDate": "Tue, 16 Jun 2026 12:00:00 +0900"
       },
       {
         "title": "악성 링크 테스트 기사",
@@ -52,5 +66,27 @@
   },
   "신작 게임 출시": {
     "items": []
+  },
+  "노트북 추천": {
+    "items": [
+      {
+        "title": "여름 노트북 추천 가이드",
+        "originallink": "https://zdnet.co.kr/view/20260616nb",
+        "link": "https://n.news.naver.com/article/092/0030000001",
+        "description": "여름철 노트북 추천 모델을 정리했다.",
+        "pubDate": "Tue, 16 Jun 2026 11:00:00 +0900"
+      }
+    ]
+  },
+  "에어컨 세일": {
+    "items": [
+      {
+        "title": "에어컨 세일 시즌 본격 개막",
+        "originallink": "https://www.etnews.com/20260616ac",
+        "link": "https://n.news.naver.com/article/030/0040000001",
+        "description": "여름 에어컨 세일이 본격 시작됐다.",
+        "pubDate": "Tue, 16 Jun 2026 09:00:00 +0900"
+      }
+    ]
   }
 }

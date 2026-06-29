@@ -29,9 +29,13 @@ from processor.dedup import dedup
 from processor.filter import filter_notices
 from processor.scorer import score_all
 from db.supabase import upsert_posts, upsert_keywords, upsert_news_issues
-from news.seed import fetch_daum_seed
+from news.seed import fetch_ranked_seed
 from news.naver_news import search_news
-from news.builder import build_issues
+from news import candidates as cand
+from news import datalab as datalab_adapter
+from news import google as google_adapter
+from news import ranker
+from news.builder import build_ranked_issues
 
 logging.basicConfig(
     level=logging.INFO,
@@ -116,30 +120,99 @@ def run():
     run_news_briefing()
 
 
-def run_news_briefing():
-    """daum seed + 네이버 뉴스로 news_issue_cache(source='news_top') 갱신.
+# 통합 랭킹 가드 임계 (docs/news-ranking-plan.md §10)
+MIN_RECENT_KEYWORDS = 5  # Top10 중 최근 기사 보유 키워드 최소 수
 
-    - daum seed가 비어있거나 stale(2시간 초과)이면 upsert 자체를 skip(기존 캐시 보존).
-    - 뉴스가 전부 0건(전 키워드 seed_only)이면 upsert를 skip(기존 캐시 보존).
-    - NAVER_CLIENT_ID/SECRET 없으면 search_news가 자동 skip+WARNING, 빈 리스트 반환.
+
+def run_news_briefing():
+    """통합 랭킹으로 news_issue_cache(source='news_top') 갱신.
+
+    흐름: 후보수집(daum/danawa/google/보조후보) → News/DataLab/Google 신호 →
+          ranker score → Top10 → build_ranked_issues → upsert.
+    Daum 순서를 그대로 쓰지 않고 자체 score로 재정렬한다.
+
+    upsert skip 가드(기존 캐시 보존):
+    - News 신호 전무(키 없음/전건 실패) → skip
+    - 다양성 부족(Daum 비단독 후보 < MIN_NON_DAUM_CANDIDATES) → skip
+    - 후보 없음 → skip
+    - Top10 중 최근 기사 보유 키워드 < MIN_RECENT_KEYWORDS → skip
+    실패해도 커뮤니티/키워드 수집 결과엔 영향 없도록 격리.
     """
     try:
-        seed, is_fresh = fetch_daum_seed()
-        if not seed:
-            logger.warning("[news] seed 비어있음 → news_top upsert skip")
-            return
-        if not is_fresh:
-            logger.warning("[news] seed stale → news_top upsert skip (기존 캐시 보존)")
+        # 1) 후보 수집
+        daum_ranked, daum_fresh = fetch_ranked_seed("daum")
+        danawa_ranked, _ = fetch_ranked_seed("danawa")
+        if not daum_fresh:
+            # daum stale → 후보/신호에서 제외 (seed 단독 후보면 다양성 가드에서 걸림)
+            logger.warning("[news] daum seed stale → daum 후보 제외")
+            daum_ranked = []
+        google_cands = google_adapter.fetch_candidates()
+        aux = cand.derive_aux_keywords(daum_ranked, search_news)
+        candidates = cand.collect_candidates(daum_ranked, danawa_ranked, google_cands, aux)
+        if not candidates:
+            logger.warning("[news] 후보 없음 → news_top upsert skip (기존 캐시 보존)")
             return
 
-        issues = build_issues(seed, search_news)
-        has_any_news = any(k["signals"]["news"] for k in issues["keywords"])
-        if not has_any_news:
-            logger.warning("[news] 전체 키워드 뉴스 0건(seed_only) → news_top upsert skip (기존 캐시 보존)")
+        # 다양성 hard guard
+        non_daum = cand.count_non_daum(candidates)
+        if non_daum < cand.MIN_NON_DAUM_CANDIDATES:
+            logger.warning(
+                "[news] 다양성 부족(Daum 비단독 후보 %d < %d) → skip (Daum 복제 방지)",
+                non_daum, cand.MIN_NON_DAUM_CANDIDATES,
+            )
             return
+
+        # 2) 신호 산출
+        news_signals = cand.build_news_signals(candidates, search_news)
+        if not news_signals:
+            logger.warning("[news] News 신호 전무 → news_top upsert skip (기존 캐시 보존)")
+            return
+        kw_list = [c["keyword"] for c in candidates]
+        datalab_signals = datalab_adapter.fetch(kw_list)
+        google_signals = google_adapter.fetch_signals(kw_list)
+        daum_signals = {c["keyword"]: c["sources"].get("daum") for c in candidates}
+
+        signals = {
+            "news": news_signals,
+            "datalab": datalab_signals,
+            "google": google_signals,
+            "daum": daum_signals,
+        }
+
+        # 3) score → Top10
+        ranked = ranker.compute_scores(candidates, signals)
+        top = ranker.select_top(ranked)
+        if not top:
+            logger.warning("[news] 랭킹 결과 없음 → skip")
+            return
+
+        # Top10 최근성 가드
+        recent_kw = sum(
+            1 for t in top if (t.get("news_meta") or {}).get("recent_count", 0) >= 1
+        )
+        if recent_kw < MIN_RECENT_KEYWORDS:
+            logger.warning(
+                "[news] 최근 기사 보유 키워드 부족(%d < %d) → skip (실시간성 부족)",
+                recent_kw, MIN_RECENT_KEYWORDS,
+            )
+            return
+
+        # 4) build + data_sources
+        data_sources = ["naver_news"]
+        if datalab_signals:
+            data_sources.append("datalab")
+        if google_signals:
+            data_sources.append("google")
+        if any(c["sources"].get("daum") is not None for c in candidates):
+            data_sources.append("daum")
+        candidate_map = {c["keyword"]: c for c in candidates}
+        issues = build_ranked_issues(top, candidate_map, data_sources)
 
         if upsert_news_issues(issues, source="news_top"):
-            logger.info("[news] news_top 저장 완료 (%d개 키워드)", len(issues["keywords"]))
+            logger.info(
+                "[news] news_top 저장 완료 (%d개, sources=%s)",
+                len(issues["keywords"]), data_sources,
+            )
         else:
             logger.warning("[news] news_top 저장 실패")
     except Exception as e:

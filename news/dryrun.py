@@ -22,8 +22,11 @@ import logging
 import sys
 from pathlib import Path
 
-from news.builder import build_issues
-from news.seed import fetch_daum_seed, seed_from_fixture
+from news.builder import build_issues, build_ranked_issues
+from news.seed import fetch_daum_seed, seed_from_fixture, ranked_seed_from_fixture
+from news import candidates as cand
+from news import datalab as datalab_adapter
+from news import ranker
 
 logging.basicConfig(
     level=logging.INFO,
@@ -81,12 +84,88 @@ def run(live_seed: bool = False) -> dict:
     return issues
 
 
+def _inject_recent(items):
+    """fixture items의 pubDate를 '지금 기준 1~N시간 전'으로 재주입.
+
+    fixture 시각이 과거여서 최근성 가드(RECENT_HOURS)에 안 걸리는 문제 회피용.
+    유효 URL이 없는 악성 item은 그대로 둔다(드롭 검증 유지).
+    """
+    from datetime import datetime, timezone, timedelta
+    out = []
+    now = datetime.now(timezone.utc)
+    for idx, raw in enumerate(items or []):
+        new = dict(raw)
+        new["pubDate"] = (now - timedelta(hours=idx + 1)).strftime("%a, %d %b %Y %H:%M:%S +0000")
+        out.append(new)
+    return out
+
+
+def run_ranking(verbose: bool = True) -> dict:
+    """통합 랭킹 dry-run (fixture 전용, 실호출/DB write 0).
+
+    multi-source fixture로 후보 수집 → 신호 → ranker → Top10 → issues 조립.
+    Daum 순서와 다른 Top10이 나오는지 확인하는 게 핵심 합격 기준.
+    """
+    seed_fx = _load_fixture("seed.json")
+    danawa_fx = _load_fixture("danawa_seed.json")
+    news_fx = _load_fixture("naver_news.json")
+    datalab_fx = _load_fixture("datalab.json")
+
+    daum_ranked = ranked_seed_from_fixture(seed_fx)
+    danawa_ranked = ranked_seed_from_fixture(danawa_fx)
+
+    def fetch_news(keyword: str):
+        # fixture pubDate를 '지금 기준 최근'으로 재주입(최근성 가드 데모용).
+        entry = news_fx.get(keyword) or {}
+        return _inject_recent(entry.get("items", []))
+
+    # Google stub → 후보/신호 없음
+    aux = cand.derive_aux_keywords(daum_ranked, fetch_news)
+    candidates = cand.collect_candidates(daum_ranked, danawa_ranked, [], aux)
+    news_signals = cand.build_news_signals(candidates, fetch_news)
+    kw_list = [c["keyword"] for c in candidates]
+    datalab_signals = datalab_adapter.fetch_from_fixture(datalab_fx, kw_list)
+    daum_signals = {c["keyword"]: c["sources"].get("daum") for c in candidates}
+
+    signals = {
+        "news": news_signals,
+        "datalab": datalab_signals,
+        "google": {},  # stub
+        "daum": daum_signals,
+    }
+    ranked = ranker.compute_scores(candidates, signals)
+    top = ranker.select_top(ranked)
+    candidate_map = {c["keyword"]: c for c in candidates}
+    data_sources = ["naver_news"]
+    if datalab_signals:
+        data_sources.append("datalab")
+    if any(s is not None for s in daum_signals.values()):
+        data_sources.append("daum")
+    issues = build_ranked_issues(top, candidate_map, data_sources)
+
+    if verbose:
+        print("===== DRY-RUN ranked issues (NO DB WRITE) =====")
+        print(json.dumps(issues, ensure_ascii=False, indent=2))
+        print("===== END =====")
+        daum_order = [i["keyword"] for i in daum_ranked]
+        ranked_order = [k["keyword"] for k in issues["keywords"]]
+        logger.info("daum 순서: %s", daum_order)
+        logger.info("ranked 순서: %s", ranked_order)
+        logger.info("Daum 순서와 동일? %s", daum_order[:len(ranked_order)] == ranked_order)
+    return issues
+
+
 def main():
     parser = argparse.ArgumentParser(description="실시간 이슈 브리핑 dry-run (DB write 없음)")
     parser.add_argument("--live-seed", action="store_true",
                         help="seed만 실 keyword_cache(daum) read 시도 (write 없음)")
+    parser.add_argument("--ranking", action="store_true",
+                        help="통합 랭킹 dry-run (fixture 기반, 실호출/DB write 없음)")
     args = parser.parse_args()
-    run(live_seed=args.live_seed)
+    if args.ranking:
+        run_ranking()
+    else:
+        run(live_seed=args.live_seed)
 
 
 if __name__ == "__main__":
