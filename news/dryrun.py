@@ -43,7 +43,8 @@ def run(live_seed: bool = False) -> dict:
     # 1) seed 키워드
     if live_seed:
         logger.info("seed: 실 keyword_cache(daum) read-only 조회 시도")
-        seed = fetch_daum_seed()
+        seed, is_fresh = fetch_daum_seed()
+        logger.info("seed freshness(참고용, dry-run은 upsert 안 함): %s", is_fresh)
     else:
         seed = seed_from_fixture(_load_fixture("seed.json"))
     logger.info("seed 키워드 %d개: %s", len(seed), seed)

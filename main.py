@@ -28,7 +28,10 @@ from keywords.daangn import DaangnKeywordScraper
 from processor.dedup import dedup
 from processor.filter import filter_notices
 from processor.scorer import score_all
-from db.supabase import upsert_posts, upsert_keywords
+from db.supabase import upsert_posts, upsert_keywords, upsert_news_issues
+from news.seed import fetch_daum_seed
+from news.naver_news import search_news
+from news.builder import build_issues
 
 logging.basicConfig(
     level=logging.INFO,
@@ -108,6 +111,39 @@ def run():
                 logger.warning(f"[{ks.source}] 키워드 저장 실패")
         except Exception as e:
             logger.error(f"[{ks.source}] 키워드 실패: {e}")
+
+    # 실시간 이슈 브리핑 (P0-2) — 실패해도 위 커뮤니티/키워드 수집 결과에 영향 없도록 격리
+    run_news_briefing()
+
+
+def run_news_briefing():
+    """daum seed + 네이버 뉴스로 news_issue_cache(source='news_top') 갱신.
+
+    - daum seed가 비어있거나 stale(2시간 초과)이면 upsert 자체를 skip(기존 캐시 보존).
+    - 뉴스가 전부 0건(전 키워드 seed_only)이면 upsert를 skip(기존 캐시 보존).
+    - NAVER_CLIENT_ID/SECRET 없으면 search_news가 자동 skip+WARNING, 빈 리스트 반환.
+    """
+    try:
+        seed, is_fresh = fetch_daum_seed()
+        if not seed:
+            logger.warning("[news] seed 비어있음 → news_top upsert skip")
+            return
+        if not is_fresh:
+            logger.warning("[news] seed stale → news_top upsert skip (기존 캐시 보존)")
+            return
+
+        issues = build_issues(seed, search_news)
+        has_any_news = any(k["signals"]["news"] for k in issues["keywords"])
+        if not has_any_news:
+            logger.warning("[news] 전체 키워드 뉴스 0건(seed_only) → news_top upsert skip (기존 캐시 보존)")
+            return
+
+        if upsert_news_issues(issues, source="news_top"):
+            logger.info("[news] news_top 저장 완료 (%d개 키워드)", len(issues["keywords"]))
+        else:
+            logger.warning("[news] news_top 저장 실패")
+    except Exception as e:
+        logger.error(f"[news] 실시간 이슈 브리핑 실패(커뮤니티/키워드 수집에는 영향 없음): {e}")
 
 
 if __name__ == "__main__":
