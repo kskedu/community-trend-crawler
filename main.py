@@ -30,6 +30,7 @@ from processor.filter import filter_notices
 from processor.scorer import score_all
 from db.supabase import upsert_posts, upsert_keywords, upsert_news_issues, fetch_news_issues
 from news.movement import apply_movement
+from news.thumbnail import enrich_issue_thumbnails
 from news.seed import fetch_ranked_seed
 from news.naver_news import search_news
 from news import candidates as cand
@@ -213,6 +214,14 @@ def run_news_briefing():
         #    기존 row 없으면 movement 필드 생략(최초 화면 NEW 도배 방지).
         previous = fetch_news_issues(source="news_top")
         issues = apply_movement(previous, issues)
+
+        # 6) 썸네일 enrich — 같은 previous(추가 DB 조회 없음)로 이전 thumbnail 재사용 +
+        #    캐시 미스 URL 만 신규 og:image 수집. movement 와 분리된 thumbnail 전용 후처리.
+        #    실패해도 issues/ upsert 에 영향 없음(내부에서 조용히 생략).
+        try:
+            issues = enrich_issue_thumbnails(issues, previous)
+        except Exception as te:
+            logger.warning("[news] 썸네일 enrich 실패(무시하고 진행): %s", te)
 
         if upsert_news_issues(issues, source="news_top"):
             logger.info(
