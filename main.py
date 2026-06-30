@@ -28,7 +28,8 @@ from keywords.daangn import DaangnKeywordScraper
 from processor.dedup import dedup
 from processor.filter import filter_notices
 from processor.scorer import score_all
-from db.supabase import upsert_posts, upsert_keywords, upsert_news_issues
+from db.supabase import upsert_posts, upsert_keywords, upsert_news_issues, fetch_news_issues
+from news.movement import apply_movement
 from news.seed import fetch_ranked_seed
 from news.naver_news import search_news
 from news import candidates as cand
@@ -207,6 +208,11 @@ def run_news_briefing():
             data_sources.append("daum")
         candidate_map = {c["keyword"]: c for c in candidates}
         issues = build_ranked_issues(top, candidate_map, data_sources)
+
+        # 5) movement 주입 — upsert 직전 기존 news_top 을 read-only 비교(공식 순위변화).
+        #    기존 row 없으면 movement 필드 생략(최초 화면 NEW 도배 방지).
+        previous = fetch_news_issues(source="news_top")
+        issues = apply_movement(previous, issues)
 
         if upsert_news_issues(issues, source="news_top"):
             logger.info(

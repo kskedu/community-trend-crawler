@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from news import ranker, candidates as cand, datalab, google
 from news.builder import build_ranked_issues, build_ranked_entry
+from news.movement import apply_movement
 
 
 def _news(recent_count, age, diversity, relevance, articles=None):
@@ -282,6 +283,78 @@ class TestDaumDecoupling(unittest.TestCase):
         order = [r["keyword"] for r in ranked]
         self.assertNotEqual(order, ["A", "B", "C"])  # daum 순서와 다름
         self.assertEqual(order[0], "C")  # News 최강이 1위
+
+
+class TestMovement(unittest.TestCase):
+    def _issues(self, pairs, with_streak=None):
+        # pairs: [(keyword, rank), ...]  with_streak: {kw: streak}
+        ks = []
+        for kw, rank in pairs:
+            e = {"keyword": kw, "rank": rank}
+            if with_streak and kw in with_streak:
+                e["presence_streak"] = with_streak[kw]
+            ks.append(e)
+        return {"keywords": ks}
+
+    def test_no_previous_omits_fields(self):
+        new = self._issues([("A", 1), ("B", 2)])
+        out = apply_movement(None, new)
+        for k in out["keywords"]:
+            self.assertNotIn("movement", k)
+            self.assertNotIn("presence_streak", k)
+
+    def test_empty_previous_is_all_new(self):
+        # row 는 있으나 이전 Top10(keywords)이 빈 배열 → 비교 대상 없음 → 전부 new (P1)
+        out = apply_movement({"keywords": []}, self._issues([("A", 1)]))
+        self.assertEqual(out["keywords"][0]["movement"], "new")
+        self.assertEqual(out["keywords"][0]["presence_streak"], 1)
+        self.assertIsNone(out["keywords"][0]["previous_rank"])
+
+    def test_up_down_same_new(self):
+        prev = self._issues([("A", 1), ("B", 2), ("C", 3)], with_streak={"A": 2, "B": 1, "C": 5})
+        new = self._issues([("B", 1), ("A", 2), ("D", 3)])  # B↑, A↓, C drop, D new
+        out = apply_movement(prev, new)
+        m = {k["keyword"]: k for k in out["keywords"]}
+        self.assertEqual(m["B"]["movement"], "up")
+        self.assertEqual(m["B"]["rank_delta"], 1)
+        self.assertEqual(m["B"]["previous_rank"], 2)
+        self.assertEqual(m["A"]["movement"], "down")
+        self.assertEqual(m["A"]["rank_delta"], 1)
+        self.assertEqual(m["D"]["movement"], "new")
+        self.assertEqual(m["D"]["presence_streak"], 1)
+        self.assertIsNone(m["D"]["previous_rank"])
+
+    def test_same_rank(self):
+        prev = self._issues([("A", 1)], with_streak={"A": 3})
+        out = apply_movement(prev, self._issues([("A", 1)]))
+        a = out["keywords"][0]
+        self.assertEqual(a["movement"], "same")
+        self.assertEqual(a["rank_delta"], 0)
+
+    def test_presence_streak_increment(self):
+        prev = self._issues([("A", 1)], with_streak={"A": 4})
+        out = apply_movement(prev, self._issues([("A", 2)]))
+        self.assertEqual(out["keywords"][0]["presence_streak"], 5)
+
+    def test_reentry_is_new(self):
+        # 이전 Top10에 없던 키워드(드롭 후 재진입도 동일) → new, streak=1
+        prev = self._issues([("X", 1)], with_streak={"X": 2})
+        out = apply_movement(prev, self._issues([("A", 1)]))
+        self.assertEqual(out["keywords"][0]["movement"], "new")
+        self.assertEqual(out["keywords"][0]["presence_streak"], 1)
+
+    def test_duplicate_keyword_dedupe(self):
+        prev = self._issues([("A", 1)], with_streak={"A": 1})
+        # 새 Top10에 A 중복 → 첫 항목만 movement 부여
+        new = {"keywords": [{"keyword": "A", "rank": 1}, {"keyword": "A", "rank": 2}]}
+        out = apply_movement(prev, new)
+        self.assertIn("movement", out["keywords"][0])
+        self.assertNotIn("movement", out["keywords"][1])
+
+    def test_malformed_previous_defensive(self):
+        # 이전 issues 가 비정상 구조여도 예외 없이 필드 생략
+        out = apply_movement({"keywords": "broken"}, self._issues([("A", 1)]))
+        self.assertNotIn("movement", out["keywords"][0])
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 import logging
 from datetime import datetime, timezone
-from typing import List, Dict
+from typing import List, Dict, Optional
 from supabase import create_client, Client
 from models import Post
 from config import SUPABASE_URL, SUPABASE_KEY
@@ -68,6 +68,32 @@ def upsert_keywords(source: str, keywords: List[Dict[str, str]]) -> bool:
     except Exception as e:
         logger.error(f"[{source}] keyword upsert 실패: {e}")
         return False
+
+
+def fetch_news_issues(source: str = "news_top") -> Optional[Dict]:
+    """news_issue_cache 의 기존 issues 를 read-only 로 조회(movement 비교용).
+
+    최신 1건(order updated_at desc limit 1)만 가져온다(단일 row 보장이라도 방어적).
+    row 없음/이상/조회 실패 → None (상위에서 '기존 없음'으로 처리).
+    """
+    try:
+        client = get_client()
+        res = (
+            client.table("news_issue_cache")
+            .select("issues,updated_at")
+            .eq("source", source)
+            .order("updated_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        data = getattr(res, "data", None)
+        if not data:
+            return None
+        row = data[0] if isinstance(data, list) else data
+        return row.get("issues") if isinstance(row, dict) else None
+    except Exception as e:
+        logger.warning(f"[{source}] news issues read 실패(movement 비교 생략): {e}")
+        return None
 
 
 def upsert_news_issues(issues: Dict, source: str = "news_top") -> bool:
