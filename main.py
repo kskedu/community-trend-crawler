@@ -226,4 +226,15 @@ def run_news_briefing():
 
 
 if __name__ == "__main__":
-    run()
+    # 실행 모드 분기 (cron 분리용):
+    #   full           : 커뮤니티 + 검색엔진 키워드 + news_top (매시 17분)
+    #   news_top_only  : 실시간 이슈 news_top 만 (매시 47분, 커뮤니티/키워드 미실행)
+    # 기본값 full. 알 수 없는 모드는 fallback 없이 즉시 실패.
+    mode = sys.argv[1] if len(sys.argv) > 1 else "full"
+    if mode == "full":
+        run()
+    elif mode == "news_top_only":
+        logger.info("[mode] news_top_only — 커뮤니티/키워드 수집 생략, news_top 만 갱신")
+        run_news_briefing()
+    else:
+        raise SystemExit(f"Unknown mode: {mode!r} (allowed: full, news_top_only)")

@@ -2,9 +2,19 @@ name: Community Trend Crawler
 
 on:
   schedule:
-    # 매시 17분 (정각/30분 회피 → GitHub Actions 큐 지연 최소화)
+    # 매시 17분: 전체 실행(full) — 정각/30분 회피로 Actions 큐 지연 최소화
     - cron: "17 * * * *"
+    # 매시 47분: 실시간 이슈 news_top 만(news_top_only) — full 사이 30분 갱신
+    - cron: "47 * * * *"
   workflow_dispatch:           # 수동 실행
+    inputs:
+      mode:
+        description: "실행 모드"
+        type: choice
+        options:
+          - full
+          - news_top_only
+        default: full
 
 permissions:
   contents: read
@@ -24,10 +34,23 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # 실행 모드 결정: 47분 schedule → news_top_only / 그 외 schedule → full /
+      # 수동 실행 → 선택한 input(기본 full). 가독성 위해 step 분리해 RUN_MODE 로 노출.
+      - name: Determine run mode
+        id: mode
+        run: |
+          if [ "${{ github.event.schedule }}" = "47 * * * *" ]; then
+            echo "RUN_MODE=news_top_only" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "RUN_MODE=${{ github.event.inputs.mode }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "RUN_MODE=full" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Run crawler
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
           NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
-        run: python main.py
+        run: python main.py "${{ steps.mode.outputs.RUN_MODE }}"
