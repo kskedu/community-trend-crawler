@@ -181,8 +181,11 @@ def run_news_briefing():
             "daum": daum_signals,
         }
 
-        # 3) score → Top10
+        # 3) score → dedupe/same-issue merge → Top10
+        #    (dedupe/merge는 score 계산 후, Top10 확정 전에 적용 — 유사 키워드/같은 이슈가
+        #    각각 별도 순위를 차지하지 않도록. docs/news-ranking-quality-plan.md §7)
         ranked = ranker.compute_scores(candidates, signals)
+        ranked = ranker.dedupe_and_merge(ranked)
         top = ranker.select_top(ranked)
         if not top:
             logger.warning("[news] 랭킹 결과 없음 → skip")
