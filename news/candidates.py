@@ -32,12 +32,25 @@ MIN_NON_DAUM_CANDIDATES = 4
 # "제공"/"지급"처럼 일반 기사에도 흔한 단어는 keyword 근접(proximity) 조건과
 # 함께일 때만 incidental로 본다(Codex diff 리뷰 P2: 전체 텍스트 any-match는
 # "자료 제공"/"지원금 지급" 같은 정상 기사까지 오탐시킴).
-_INCIDENTAL_MARKERS_STRONG = ("증정", "사은품", "판촉물", "경품", "당첨")
+# "선물"은 단독 어간으로 넣지 않는다(Codex review-only P1: keyword="닌텐도 스위치 2" +
+# title="닌텐도 스위치 2 어린이날 선물 추천" 같은 진짜 주제 기사까지 오탐시킴). 대신
+# 증정/지급이 명시적으로 붙은 구(phrase) 단위로만 마커에 등록한다.
+# "페스티벌"/"문화축제"/"참가신청"/"참가 접수"는 행사 기사 자체의 주제어로도 흔히 쓰여
+# marker로 넣지 않는다(예: keyword="문화축제", title="부산 문화축제 참가신청 시작"가
+# 오탐될 위험 — 요구사항에 명시된 패턴이라도 marker 리스트에는 넣지 않고, 경품/증정
+# 계열과 결합된 구 단위 마커로만 흡수한다).
+_INCIDENTAL_MARKERS_STRONG = (
+    "증정", "사은품", "판촉물", "경품", "당첨", "상품 제공",
+    "선물로 제공", "선물로 지급", "선물 증정",
+)
 _INCIDENTAL_MARKERS_PROXIMITY_ONLY = ("이벤트", "제공", "지급")
 _INCIDENTAL_PROXIMITY_CHARS = 15  # marker가 keyword 앞뒤 이 범위 안에 있어야 근접으로 인정
 
 # clustering 시 token overlap 임계값(Jaccard). 이 이상이면 같은 클러스터.
 CLUSTER_JACCARD_THRESHOLD = 0.3
+
+# 상세 articles 노출 최소 relevance_score 기준 — 미만이면 기본 제외(filter_articles_for_display).
+LOW_RELEVANCE_ARTICLE_THRESHOLD = 0.3
 
 
 def _jaccard(a: set, b: set) -> float:
@@ -215,6 +228,32 @@ def score_articles_relevance(keyword: str, articles: List[Dict]) -> List[Dict]:
         scored.append(merged)
     scored.sort(key=lambda a: a["relevance_score"], reverse=True)
     return scored
+
+
+def filter_articles_for_display(articles: List[Dict], min_count: int = 5) -> List[Dict]:
+    """상세 노출용 articles 필터링 — incidental/저관련 기사를 기본 제외한다.
+
+    - 기본: is_incidental=True 이거나 relevance_score < LOW_RELEVANCE_ARTICLE_THRESHOLD인 기사는 제외.
+    - 예외(ARTICLES_MIN 하한 보호): 제외 후 남은 기사 수가 min_count 미만이면, 제외했던 기사 중
+      relevance_score 높은 순으로 부족분만큼 보충한다. 보충 순서는 비incidental 기사를 먼저,
+      incidental 기사는 마지막 우선순위로 둔다(그래도 relevance_score/relevance_reason/
+      is_incidental 필드는 그대로 유지 — 프론트/후속 로직이 여전히 판별 가능).
+    - 입력은 이미 relevance_score 내림차순 정렬된 상태를 가정(score_articles_relevance 결과).
+    """
+    def _is_kept(a: Dict) -> bool:
+        return not a.get("is_incidental") and a.get("relevance_score", 0.0) >= LOW_RELEVANCE_ARTICLE_THRESHOLD
+
+    kept = [a for a in articles if _is_kept(a)]
+    if len(kept) >= min_count:
+        return kept
+
+    excluded = [a for a in articles if not _is_kept(a)]
+    excluded_sorted = sorted(
+        excluded,
+        key=lambda a: (bool(a.get("is_incidental")), -a.get("relevance_score", 0.0)),
+    )
+    need = min_count - len(kept)
+    return kept + excluded_sorted[:need]
 
 
 def cluster_articles(articles: List[Dict]) -> List[List[Dict]]:

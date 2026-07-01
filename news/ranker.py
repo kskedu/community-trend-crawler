@@ -40,6 +40,11 @@ DEDUPE_TOKEN_JACCARD_THRESHOLD = 0.6
 
 # ── same-issue merge 설정 ──
 MERGE_ARTICLE_OVERLAP_THRESHOLD = 0.5
+# article 그룹 간 공유 사건 토큰(문서빈도>=2 근사) 기반 보조 merge 신호.
+# article overlap(개별 기사 pairwise Jaccard)이 표현 차이로 낮게 나오는 same-issue 케이스를
+# 보완한다. "겹치는 사건 토큰 최소 개수" + "keyword anchor 교차 등장" 조건을 모두 만족해야
+# merge 근거로 인정한다(일반 서술어 1~2개 겹침으로 오탐 병합되는 것을 막기 위함).
+REPRESENTATIVE_OVERLAP_MIN_SHARED_TOKENS = 2
 DISPLAY_KEYWORD_MAX_LEN = 18
 
 # 가중치 (사용자 승인값 2026-06-29)
@@ -355,6 +360,172 @@ def _article_overlap(articles_a: List[Dict], articles_b: List[Dict]) -> float:
     return best
 
 
+def _is_same_issue_evidence_article(article: Dict) -> bool:
+    """same-issue merge 판정 근거로 쓸 수 있는 기사인지.
+
+    is_incidental=True는 "경품 나열 부수 언급"과 "keyword가 title에 없고 snippet에만
+    있어 그 keyword의 핵심 주제로는 약함"이라는 서로 다른 두 의미를 한 플래그로
+    섞고 있다(candidates.compute_article_relevance의 relevance_reason 참조). 전자
+    (incidental_giveaway_mention)는 같은 사건 판별 근거로도 부적합하지만(4차 리뷰 P2:
+    "선풍기 증정" 부수 언급 기사가 merge 근거가 되면 안 됨), 후자
+    (snippet_only_incidental_mention)는 "이 keyword의 대표 이슈로는 약하다"는 뜻일 뿐
+    사건 자체와 무관한 기사라는 뜻은 아니므로 사건 토큰 근거에서 제외할 이유가 없다
+    (Codex review-only 조언: relevance_reason별 세분화, keyword_not_found도 근거 배제).
+    """
+    reason = article.get("relevance_reason")
+    if reason in ("incidental_giveaway_mention", "keyword_not_found"):
+        return False
+    # relevance_reason이 없는 경우(구버전 데이터/방어적 기본값)는 is_incidental 플래그만으로
+    # 판단 — 세분화된 사유를 알 수 없으면 보수적으로 근거에서 제외한다.
+    if reason is None and article.get("is_incidental"):
+        return False
+    return True
+
+
+# 사건 토큰 overlap 판정에서 흔한 서술어를 제외하는 명시적 소수 블랙리스트. 전역
+# STOPWORDS 확장(1차 시도)은 "발표"/"내용" 같은 단어가 끝없이 늘어나는 유지보수
+# 문제가 있었다(Codex review-only 지적). 이 블랙리스트는 same-issue 최종 게이트
+# (_is_same_issue)에서만 좁게 쓰여 다른 로직(요약/dedupe)에는 영향을 주지 않는다.
+_GENERIC_EVENT_PREDICATE_WORDS = {"발표", "오늘", "내용", "관련", "예정", "공개", "진행"}
+
+
+def _count_same_issue_evidence_articles(articles: List[Dict]) -> int:
+    return len([a for a in (articles or []) if _is_same_issue_evidence_article(a)])
+
+
+def _group_df_tokens(articles: List[Dict], min_df: int = 2) -> set:
+    """same-issue merge 근거로 유효한 article 그룹 전체에서 문서빈도(DF) >= min_df인
+    토큰 집합. 유효 기사가 1건뿐이면(singleton) 그 기사의 전체 토큰을 후보로 반환한다.
+
+    "고유명사/사건성 토큰"을 형태소 분석 없이 근사하는 신호(Codex review-only 조언 반영,
+    옵션 B). 대표 문구 한두 줄만 비교하면(1차 시도) 정보량이 적어 재현율이 낮고,
+    단순 불용어 제외(1차 시도의 _significant_tokens)만으로는 "발표"/"내용"처럼 흔한
+    서술어가 두 그룹 모두에서 반복될 때 오탐을 막지 못했다. 같은 keyword 그룹 안에서
+    "여러 기사에 걸쳐 반복 등장"하는 토큰만 후보로 삼으면 흔한 서술어라도 그 그룹의
+    실제 사건 어휘(예: "배재고", "출전정지", "6개월")일 가능성이 높아진다.
+
+    singleton 그룹은 "반복 등장"을 관측할 수 없어 전체 토큰이 후보가 되므로 오탐 위험이
+    있다(예: "정부 오늘 새 정책 발표" 단일 기사끼리 "발표"만 겹침) — 이 위험은 호출부
+    (_is_same_issue)의 "양쪽 다 singleton이면 신호 비활성화" + "겹치는 토큰 중 흔한
+    서술어(_GENERIC_EVENT_PREDICATE_WORDS)가 아닌 것이 최소 1개 포함" 게이트로 방어한다
+    (Codex review-only 조언: 한쪽 singleton + 반대쪽 DF>=2 + non-generic shared token
+    조합으로 제한).
+    """
+    relevant = [a for a in (articles or []) if _is_same_issue_evidence_article(a)]
+    if not relevant:
+        return set()
+    if len(relevant) < min_df:
+        toks = set()
+        for a in relevant:
+            toks |= set(_tokens_of(a))
+        return toks
+
+    from news.summarizer import _tokens
+
+    df: Dict[str, int] = {}
+    for a in relevant:
+        text = f"{a.get('title', '')} {a.get('snippet', '')}"
+        for tok in set(_tokens(text)):
+            df[tok] = df.get(tok, 0) + 1
+    return {t for t, c in df.items() if c >= min_df}
+
+
+def _tokens_of(article: Dict) -> List[str]:
+    from news.summarizer import _tokens
+
+    return _tokens(f"{article.get('title', '')} {article.get('snippet', '')}")
+
+
+def _keyword_anchor_tokens(item: Dict) -> set:
+    """item의 keyword 자체를 토큰화한 집합(2자 이상). same-issue merge의 precision
+    게이트로 쓴다 — "정부 오늘 새 정책 발표" vs "기업 오늘 실적 발표"처럼 사건 자체가
+    다른데 흔한 서술어만 겹치는 경우, 상대 keyword가 서로의 기사/키워드에 전혀
+    등장하지 않으므로 이 게이트에서 막힌다.
+    """
+    from news.summarizer import _tokens
+
+    return {t for t in _tokens(item.get("keyword", "")) if len(t) >= 2}
+
+
+def _has_cross_keyword_anchor(item_a: Dict, item_b: Dict, shared_tokens: set) -> bool:
+    """겹치는 사건 토큰(shared_tokens) 중, 두 keyword 중 하나의 anchor 토큰이 포함되거나
+    한쪽 keyword의 anchor 토큰이 상대 article 그룹에 등장하는지 확인.
+
+    "배재고 출전정지" ↔ "권오영 감독" 케이스: "배재고"가 양쪽 article 그룹에 반복
+    등장하므로 anchor 조건을 만족한다(권오영 감독 그룹의 기사에도 "배재고"가 실제로
+    반복 등장). 반대로 "정부 오늘 새 정책 발표" ↔ "기업 오늘 실적 발표"는 keyword
+    anchor("정부"/"기업")가 서로의 그룹에 등장하지 않아 걸러진다.
+    """
+    anchors_a = _keyword_anchor_tokens(item_a)
+    anchors_b = _keyword_anchor_tokens(item_b)
+    if shared_tokens & (anchors_a | anchors_b):
+        return True
+
+    articles_a = (item_a.get("news_meta") or {}).get("articles") or []
+    articles_b = (item_b.get("news_meta") or {}).get("articles") or []
+    tokens_in_a = set()
+    for a in articles_a:
+        if _is_same_issue_evidence_article(a):
+            tokens_in_a |= set(_tokens_of(a))
+    tokens_in_b = set()
+    for b in articles_b:
+        if _is_same_issue_evidence_article(b):
+            tokens_in_b |= set(_tokens_of(b))
+    if anchors_a & tokens_in_b or anchors_b & tokens_in_a:
+        return True
+    return False
+
+
+def _representative_overlap(item_a: Dict, item_b: Dict) -> set:
+    """두 ranked item의 article 그룹 간 공유 사건 토큰 집합(DF>=2 근사, 옵션 B).
+
+    반환은 비율이 아니라 "겹치는 사건 토큰 집합" 자체 — 호출부가 개수/anchor 조건을
+    함께 판단해야 하므로 스칼라 점수보다 집합이 더 유용하다.
+    """
+    articles_a = (item_a.get("news_meta") or {}).get("articles") or []
+    articles_b = (item_b.get("news_meta") or {}).get("articles") or []
+    df_a = _group_df_tokens(articles_a)
+    df_b = _group_df_tokens(articles_b)
+    return df_a & df_b
+
+
+def _is_same_issue(item_a: Dict, item_b: Dict) -> bool:
+    """same-issue merge 판정: article overlap(기존) OR 사건 토큰 overlap(신규, 옵션 B+C).
+
+    신규 신호는 아래 조건을 모두 만족해야 인정한다(Codex review-only 조언: B를 recall
+    신호로, C를 precision 게이트로 결합):
+    1. 두 keyword 그룹 다 유효 근거 기사가 0건이 아니고, 양쪽 다 singleton(1건)은
+       아니어야 한다 — 양쪽 다 근거가 1건뿐이면 "반복 등장"을 전혀 관측할 수 없어
+       흔한 서술어만 겹쳐도 신호가 발생하는 오탐 위험이 가장 크다(Codex review-only
+       재지적: "정부 오늘 새 정책 발표" vs "기업 오늘 실적 발표" 단일 기사끼리).
+    2. 두 keyword의 article 그룹에서 문서빈도 2 이상(또는 singleton fallback)인 토큰이
+       최소 REPRESENTATIVE_OVERLAP_MIN_SHARED_TOKENS개 이상 겹친다.
+    3. 겹치는 토큰 중 하나가 두 keyword 중 하나의 anchor 토큰이거나, 한쪽 keyword의
+       anchor 토큰이 상대 article 그룹에 실제로 등장한다(정부/기업처럼 서로 무관한
+       주체의 흔한 서술어만 겹치는 오탐을 차단).
+    4. 겹치는 토큰 중 흔한 서술어(_GENERIC_EVENT_PREDICATE_WORDS)가 아닌 것이 최소
+       1개 포함돼야 한다(anchor 게이트를 우회하는 일반 서술어만의 조합 방지).
+    """
+    articles_a = (item_a.get("news_meta") or {}).get("articles") or []
+    articles_b = (item_b.get("news_meta") or {}).get("articles") or []
+    if _article_overlap(articles_a, articles_b) >= MERGE_ARTICLE_OVERLAP_THRESHOLD:
+        return True
+
+    evidence_count_a = _count_same_issue_evidence_articles(articles_a)
+    evidence_count_b = _count_same_issue_evidence_articles(articles_b)
+    if evidence_count_a == 0 or evidence_count_b == 0:
+        return False
+    if evidence_count_a == 1 and evidence_count_b == 1:
+        return False
+
+    shared = _representative_overlap(item_a, item_b)
+    if len(shared) < REPRESENTATIVE_OVERLAP_MIN_SHARED_TOKENS:
+        return False
+    if not (shared - _GENERIC_EVENT_PREDICATE_WORDS):
+        return False
+    return _has_cross_keyword_anchor(item_a, item_b, shared)
+
+
 def _build_display_keyword(members: List[Dict]) -> str:
     """same-issue merge된 후보들에서 display_keyword 생성.
 
@@ -379,12 +550,19 @@ def _build_display_keyword(members: List[Dict]) -> str:
     if covers_others and len(pool_sorted) > 1:
         return best[:DISPLAY_KEYWORD_MAX_LEN]
 
-    # 단편적 키워드들 → 서로 다른 상위 두 키워드를 조합(중복 없이)
+    # 단편적 키워드들 → 서로 다른 상위 두 키워드를 조합(중복 없이). best(가장 길고 이미
+    # 사건 맥락을 담고 있을 가능성이 높은 키워드)를 앞에, 보조 키워드를 뒤에 붙인다
+    # (Codex review-only 조언: same-issue merge 확장으로 "배재고 출전정지"+"권오영 감독"처럼
+    # 서로 무관한 문자 집합을 가진 키워드가 merge될 때, 기존 "{k} {combined}" 순서는
+    # 인명을 사건 키워드 앞에 붙여 "권오영 감독 배재고 출전정지"처럼 부자연스러워졌다.
+    # "{combined} {k}"로 순서를 반전하면 이미 완결된 사건 표현이 앞에 오고 보조 정보가
+    # 뒤에 붙어 "배재고 출전정지 권오영 감독"이 되고, 기존 "압수수색 영장"+"김영환" 같은
+    # 케이스도 "압수수색 영장 김영환"으로 정보 손실 없이 조합된다).
     combined = best
     for k in pool_sorted[1:]:
         if k in combined:
             continue
-        candidate = f"{k} {combined}"
+        candidate = f"{combined} {k}"
         if len(candidate) <= DISPLAY_KEYWORD_MAX_LEN:
             combined = candidate
         break
@@ -449,12 +627,7 @@ def dedupe_and_merge(ranked: List[Dict]) -> List[Dict]:
                 okw = other["keyword"]
                 if okw in consumed:
                     continue
-                other_articles = (other.get("news_meta") or {}).get("articles") or []
-                matched = any(
-                    _article_overlap((m.get("news_meta") or {}).get("articles") or [], other_articles)
-                    >= MERGE_ARTICLE_OVERLAP_THRESHOLD
-                    for m in group
-                )
+                matched = any(_is_same_issue(m, other) for m in group)
                 if matched:
                     group.append(other)
                     consumed.add(okw)

@@ -769,6 +769,136 @@ class TestSameIssueMerge(unittest.TestCase):
         merged = ranker.dedupe_and_merge(ranked)
         self.assertEqual(merged[0]["merge_reason"], "same_article_cluster")
 
+    def test_baejaego_gwonoyoung_merge_via_shared_event_tokens(self):
+        # 실측 재현: article overlap만으로는 0.267(threshold 0.5 미달)이라 놓치는 케이스.
+        # "권오영 감독" 그룹 기사는 title에 "권오영"/"감독" 토큰이 없어 실제 파이프라인
+        # (compute_article_relevance)에서 snippet_only_incidental_mention으로 판정된다 —
+        # 단위 테스트도 raw _article()이 아니라 실제 relevance 판정을 거친 articles로
+        # 구성해야 한다(Codex review-only 지적: raw article은 is_incidental 필드가 없어
+        # _group_df_tokens 필터를 그냥 통과해버려 실패 조건을 재현하지 못함).
+        a_raw = [
+            _article("'출전정지 6개월' 배재고 감독 \"무조건 최송합니다\"", "https://x.com/n1",
+                     "앞서 배재고 감독은 침통한 표정으로 광주일고 측에 무조건 최송하다고 말했습니다."),
+            _article("배재고 야구단에 전국대회 6개월 출전 정지 중징계", "https://x.com/n2",
+                     "외쳤던 선수들, 협회가 6개월 간 전국대회 출전 정지라는 중징계를 내렸습니다."),
+        ]
+        b_raw = [
+            _article("'지역 비하 구호' 배재고 야구부, 6개월 출전 정지 중징계", "https://x.com/n3",
+                     "여러 차례 사과했던 배재고 감독은 다시 고개를 숙였다."),
+            _article("무거운 조롱의 대가...배재고 야구부 6개월 출전 정지", "https://x.com/n4",
+                     "배재고는 당장 내일 예정된 청룡기 2회전부터 나갈 수 없고"),
+        ]
+        a_articles = cand.score_articles_relevance("배재고 출전정지", a_raw)
+        b_articles = cand.score_articles_relevance("권오영 감독", b_raw)
+        # 사전 확인: b_articles는 실제로 snippet_only_incidental_mention(is_incidental=True)로
+        # 판정됨 — "감독"만 snippet에 있고 title에는 "권오영"/"감독" 토큰이 없음.
+        self.assertTrue(all(a.get("is_incidental") for a in b_articles))
+        # 사전 확인: article overlap 자체는 threshold 미달(실측치 재현)
+        self.assertLess(ranker._article_overlap(a_articles, b_articles), ranker.MERGE_ARTICLE_OVERLAP_THRESHOLD)
+
+        ranked = [
+            self._ranked_with_articles("배재고 출전정지", 0.9, a_articles),
+            self._ranked_with_articles("권오영 감독", 0.7, b_articles),
+        ]
+        merged = ranker.dedupe_and_merge(ranked)
+        self.assertEqual(len(merged), 1)
+        # related_keywords에 원 키워드 보존
+        self.assertIn("권오영 감독", merged[0]["related_keywords"])
+        # 대표 display_keyword는 이미 사건 맥락이 담긴 "배재고 출전정지"가 앞에 오고
+        # 보조 키워드("권오영 감독")가 뒤에 붙는다 — 단독 인명이 사건 키워드 앞에
+        # 오지 않는다(요구사항: 단독 인명보다 사건성이 드러나는 키워드 우선).
+        display = merged[0]["display_keyword"]
+        self.assertTrue(display.startswith("배재고 출전정지"))
+        self.assertNotEqual(display, "권오영 감독")
+
+    def test_generic_shared_predicate_without_keyword_anchor_not_merged(self):
+        # 두 그룹 모두 "오늘"/"발표"처럼 흔한 서술어가 반복되지만, keyword("정부"/"기업")가
+        # 서로의 article 그룹에 전혀 등장하지 않으면 anchor 게이트에서 막혀 merge 금지.
+        # (fixture는 article overlap 자체도 threshold 미만이 되도록 문장 구조를 다르게 구성 —
+        # article overlap이 이미 높으면 이 테스트가 신규 anchor 게이트가 아니라 기존 신호로
+        # merge된 것이라 신규 로직 검증이 아니게 된다.)
+        a_articles = [
+            _article("정부, 오늘 새 정책 발표", "https://x.com/rep-a1", "오늘 발표된 새 정책 내용이다"),
+            _article("교육부 학사 일정 조정안 공개", "https://x.com/rep-a2", "새 학기 시작일이 늦춰진다"),
+        ]
+        b_articles = [
+            _article("기업, 오늘 실적 발표", "https://x.com/rep-b1", "오늘 발표된 실적 내용이다"),
+            _article("반도체 수출 통계 집계 결과", "https://x.com/rep-b2", "역대 최대 실적을 기록했다"),
+        ]
+        self.assertLess(ranker._article_overlap(a_articles, b_articles), ranker.MERGE_ARTICLE_OVERLAP_THRESHOLD)
+
+        ranked = [
+            self._ranked_with_articles("정부", 0.9, a_articles),
+            self._ranked_with_articles("기업", 0.7, b_articles),
+        ]
+        merged = ranker.dedupe_and_merge(ranked)
+        self.assertEqual(len(merged), 2)  # anchor 없이 서술어만 겹침 → merge 안 됨
+
+
+class TestArticleDisplayFilter(unittest.TestCase):
+    """개선 2: incidental/저관련 기사를 상세 articles에서 기본 제외."""
+
+    def _nintendo_bnk_article(self):
+        return _article(
+            "BNK경남은행, BNK경남은행 가족 문화 페스티벌(경가페) 개최...오는 7일",
+            "https://x.com/bnk-1",
+            "닌텐도스위치2·삼성 갤럭시워치8·삼성 써클레이터·NC다이노스 유니폼 등 푸짐한 "
+            "선물을 주는 경품 추첨을 진행한다.",
+        )
+
+    def test_nintendo_keyword_bnk_article_is_incidental(self):
+        art = self._nintendo_bnk_article()
+        rel = cand.compute_article_relevance("닌텐도 스위치 2", art)
+        self.assertTrue(rel["is_incidental"])
+
+    def test_bnk_keyword_same_article_not_incidental(self):
+        # 같은 기사라도 keyword=BNK경남은행이면 기사 주체이므로 incidental 아님(과소평가 방지)
+        art = self._nintendo_bnk_article()
+        rel = cand.compute_article_relevance("BNK경남은행", art)
+        self.assertFalse(rel["is_incidental"])
+
+    def test_low_relevance_article_excluded_from_display_when_enough_remain(self):
+        good = [
+            dict(_article(f"닌텐도 스위치 2 관련 기사 {i}", f"https://x.com/good{i}"),
+                 relevance_score=0.9, relevance_reason="keyword_main_topic", is_incidental=False)
+            for i in range(5)
+        ]
+        incidental = dict(
+            self._nintendo_bnk_article(), relevance_score=0.2,
+            relevance_reason="snippet_only_incidental_mention", is_incidental=True,
+        )
+        filtered = cand.filter_articles_for_display(good + [incidental], min_count=5)
+        urls = [a["url"] for a in filtered]
+        self.assertNotIn("https://x.com/bnk-1", urls)  # 관련기사 충분하면 incidental 제외
+
+    def test_incidental_backfilled_only_when_below_min_count(self):
+        good = [
+            dict(_article("닌텐도 스위치 2 발매 기사", "https://x.com/good1"),
+                 relevance_score=0.9, relevance_reason="keyword_main_topic", is_incidental=False)
+        ]
+        incidental = dict(
+            self._nintendo_bnk_article(), relevance_score=0.2,
+            relevance_reason="snippet_only_incidental_mention", is_incidental=True,
+        )
+        filtered = cand.filter_articles_for_display(good + [incidental], min_count=2)
+        # ARTICLES_MIN 하한 보호를 위해 incidental이라도 보충됨
+        self.assertEqual(len(filtered), 2)
+        urls = [a["url"] for a in filtered]
+        self.assertIn("https://x.com/bnk-1", urls)
+        # 보충된 기사도 relevance_score/relevance_reason/is_incidental 필드 유지
+        backfilled = next(a for a in filtered if a["url"] == "https://x.com/bnk-1")
+        self.assertIn("relevance_score", backfilled)
+        self.assertTrue(backfilled["is_incidental"])
+
+    def test_representative_selection_excludes_incidental_regardless_of_filter(self):
+        # representative 후보 제외는 filter_articles_for_display와 무관하게 기존 로직으로 계속 보장
+        articles = [self._nintendo_bnk_article()]
+        scored = cand.score_articles_relevance("닌텐도 스위치 2", articles)
+        clusters = cand.cluster_articles(scored)
+        primary = cand.select_primary_cluster(clusters)
+        rep = cand.select_representative(primary)
+        self.assertIsNone(rep)  # incidental만 있으면 대표 없음
+
 
 class TestBuilderRepresentativeFields(unittest.TestCase):
     """builder가 representative_*/sources/display_keyword 등을 entry에 실어 나르는지."""
@@ -809,6 +939,27 @@ class TestBuilderRepresentativeFields(unittest.TestCase):
         self.assertIsNone(entry["representative_title"])
         self.assertIsNone(entry["representative_summary"])
         self.assertEqual(entry["display_keyword"], "A")  # keyword로 fallback
+
+    def test_low_relevance_articles_not_at_top_of_detail_list(self):
+        # 관련기사가 충분하면 incidental/저관련 기사는 최종 articles에서 아예 제외돼야 한다.
+        good = [
+            dict(_article(f"닌텐도 스위치 2 관련 기사 {i}", f"https://x.com/g{i}"),
+                 relevance_score=0.9, relevance_reason="keyword_main_topic", is_incidental=False)
+            for i in range(5)
+        ]
+        incidental = dict(
+            _article("BNK경남은행, 가족 문화 페스티벌 개최", "https://x.com/bnk-detail",
+                     "닌텐도스위치2 등 경품 추첨을 진행한다."),
+            relevance_score=0.2, relevance_reason="snippet_only_incidental_mention", is_incidental=True,
+        )
+        ranked_item = {
+            "keyword": "닌텐도 스위치 2", "score": 0.5, "source_breakdown": {"news": 0.5},
+            "rank_reason": "", "news_meta": {"articles": good + [incidental]},
+            "used_signals": ["news"],
+        }
+        entry = build_ranked_entry(1, ranked_item)
+        urls = [a["url"] for a in entry["articles"]]
+        self.assertNotIn("https://x.com/bnk-detail", urls)
 
 
 class TestMovementAfterMerge(unittest.TestCase):

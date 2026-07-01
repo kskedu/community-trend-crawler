@@ -8,6 +8,7 @@ P0: trend는 null 고정(데이터랩은 P1). thumbnail은 null(normalizer에서
 from datetime import datetime, timezone
 from typing import Callable, List, Optional
 
+from news.candidates import filter_articles_for_display
 from news.dedup import dedup_articles
 from news.normalizer import normalize_article
 from news.summarizer import summarize
@@ -78,7 +79,8 @@ def build_ranked_entry(
                   (dedupe/merge 후) related_keywords, aliases, display_keyword, merge_reason}
     news_meta.articles 는 candidates에서 relevance_score 내림차순으로 정렬된 normalize 결과.
     dedup_articles()는 URL 기준 제거만 하고 입력 순서를 보존하므로, 여기서 재정렬 없이도
-    relevance/primary cluster 우선 순서가 유지된다.
+    relevance/primary cluster 우선 순서가 유지된다. filter_articles_for_display()가 incidental/
+    저관련 기사를 기본 제외(부족하면 ARTICLES_MIN 하한 보호를 위해 relevance 높은 순 보충)한다.
 
     candidate lookup 실패 방어(docs/news-ranking-quality-plan.md §7-3): dedupe/merge로
     keyword가 canonical 값으로 유지되더라도, ranked_item에 sources가 직접 실려 있으면
@@ -87,7 +89,8 @@ def build_ranked_entry(
     keyword = ranked_item["keyword"]
     news_meta = ranked_item.get("news_meta") or {}
     raw_articles = news_meta.get("articles") or []
-    articles = dedup_articles(raw_articles)[:max_articles]
+    deduped = dedup_articles(raw_articles)
+    articles = filter_articles_for_display(deduped, min_count=ARTICLES_MIN)[:max_articles]
     summary, summary_type = summarize(keyword, articles)
     # representative_summary → representative_title → summarize() 결과(article title fallback) 순.
     representative_summary = news_meta.get("representative_summary")
