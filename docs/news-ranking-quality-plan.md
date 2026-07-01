@@ -1,7 +1,17 @@
 # 실시간 이슈 랭킹 품질 개선 계획
 
-상태: 초안(계획 리뷰 전)
-관련 원 설계: `docs/news-ranking-plan.md`(있다면), `news/ranker.py`, `news/movement.py`, `news/builder.py`
+상태: **완료 (운영 반영 완료, 2026-07-01)**
+관련 원 설계: `docs/news-ranking-plan.md`, `news/ranker.py`, `news/movement.py`, `news/builder.py`
+
+## 0. 최종 결과 요약 (완료 처리, 2026-07-01)
+
+- 커밋: community-trend-crawler `bd9ba3b`, StartHub `f8bfc01` (둘 다 push 완료)
+- Codex review-only 검증: 계획 리뷰 2회 + diff 리뷰 9회, 매 회차 P0/P1 즉시 반영, 최종 P0/P1 없음
+- 단위 테스트 73개 전체 통과 (`tests/test_news_ranking.py`)
+- GitHub Actions `crawl.yml` workflow_dispatch 1회 실행(run id `28511090419`, success, 3m28s) → `news_issue_cache` upsert 성공(10개, `sources=['naver_news','datalab','daum']`)
+- 운영/로컬 3001 실데이터로 유사 키워드 dedupe("배재고" ← "배재고 출전정지")와 same-issue merge("모스 탄 명예훼손" ← 관련기사 overlap 기반 5개 키워드 흡수, "비빔밥" ← "단합") 실사례 확인
+- 남은 리스크(P2, 실무 투입 지장 없음): incidental mention 판정이 문자열 거리 휴리스틱 기반이라, 구두점 없는 "주체+판촉 이벤트" title 패턴(예: "쿠팡 선풍기 증정 이벤트 진행" — 콤마 없이)은 완벽히 구분되지 않을 수 있음. 무거운 NLP(개체명 인식) 없이는 구조적 한계. 운영 모니터링 대상.
+- 후속 개선은 이번 작업과 분리해 별도 계획/리뷰/승인 흐름으로 진행한다(이 문서의 범위는 여기서 종료).
 
 ## 1. 배경
 
@@ -148,11 +158,16 @@
 - `summarizer._tokens`(private, `_` prefix)를 `candidates.py`가 이미 재사용 중이고, 이번에 representative/clustering까지 얹으면 private 함수 의존이 더 늘어난다.
 - 신규 파일을 늘리지 않는 범위에서는 `summarizer.py`에 `_tokens`를 공개 함수(`tokenize` 등)로 승격하거나, 현재처럼 `_tokens`를 계속 재사용하되 이번 작업 안에서 새로 만드는 clustering/relevance 함수는 모두 `candidates.py`에 모아 책임 소재를 한 파일로 좁힌다. **별도 `news/text.py` 신설은 이번 스코프에서는 보류**(범위 확장 방지 원칙과 상충 — 필요성이 명확해지면 별도 승인 후 진행).
 
-## 8. 다음 단계
+## 8. 다음 단계 (완료됨)
 
-1. ~~이 계획서를 Codex review-only로 계획 리뷰~~ — 1차 완료, P0 없음 / P1 4건 반영 완료(§7-1~7-3), P2 반영(§7-4)
-2. 필요 시 Codex 재리뷰(수정된 §7 기준, 최대 5회 중 2회차)
-3. P0/P1 없으면 구현 승인 요청
+1. ~~계획 리뷰(1차/2차)~~ — 완료, P0 없음 / P1 5건 전부 반영(§7-1~7-3, §9, §10)
+2. ~~구현(candidates.py/ranker.py/builder.py/main.py/news-brief.js)~~ — 완료
+3. ~~diff 리뷰 9회(구현 후)~~ — 완료. 매 회차 P1/P2 즉시 수정, 최종 P0/P1 없음(§11 참조)
+4. ~~단위 테스트 73개 통과 + StartHub npm run check 통과~~ — 완료
+5. ~~커밋 (crawler bd9ba3b / StartHub f8bfc01)~~ — 완료
+6. ~~운영 반영: push → Vercel 배포 확인 → workflow_dispatch 1회 → DB upsert 확인 → 운영 화면 확인~~ — 완료(§0 참조)
+
+후속 개선(§0의 남은 P2 등)은 이 계획서 범위 밖 — 필요 시 별도 계획서로 새로 시작한다.
 
 ## 9. Codex 1차 리뷰 결과 요약
 
@@ -182,3 +197,21 @@
 - 기준 8(프론트 fallback 안전성): 문제 없음
 
 P0/P1 잔존 없음(1건 즉시 반영) → 구현 착수 가능 상태.
+
+## 11. 구현 후 diff 리뷰 이력 (1~9차, 전부 review-only)
+
+계획 리뷰 통과 후 구현 착수. 구현 완료마다 Codex review-only로 diff를 검증하고, 나온 P1/P2를 즉시 반영해 재검증하는 과정을 반복했다. 최종(9차)에서 P0/P1 없음 확인 후 커밋·운영 반영을 진행했다.
+
+| 회차 | 주요 findings | 처리 |
+|---|---|---|
+| 1차 | P1: same-issue merge가 대표 1건 기사만 비교해 transitive overlap(A-B dedupe 후 B-C만 overlap)을 놓칠 수 있음 | `dedupe_and_merge`를 그룹 전체 기준 fixed-point 루프로 재작성 |
+| 2차 | P1: `_article_overlap`의 `[:5]` 슬라이스가 그룹이 커질 때 뒤쪽 기사를 놓칠 수 있음 | 슬라이스 제거 |
+| 3차 | P2: 기사 전체를 하나의 token union으로 합쳐 비교하면 무관 기사가 섞였을 때 실제 overlap이 희석됨 | article-level pairwise 최댓값 방식으로 변경 |
+| 4차 | P2: incidental mention 기사(증정/판촉)까지 same-issue 판정 근거로 사용해 관련 없는 후보가 merge될 수 있음 | overlap 비교 전 `is_incidental=True` 기사 필터링 |
+| 5차 | P2(사용자 승인 하 추가 수정): "선풍기 증정" 같은 부수 언급 기사 때문에 진짜 주체(예: "한국투자증권")까지 incidental로 낮아질 수 있음 | keyword-relative marker 판정 도입(1차 시도: title 주체 절 개념) |
+| 6차 | P2: "주체 절이면 marker 무시" 규칙이 "다이슨 선풍기 증정 이벤트"(구두점 없음) 같은 케이스에서 새 false negative 발생 | marker-keyword 순수 interval distance로 재작성 시도 |
+| 7차 | P2: 순수 거리 판정은 "쿠팡, 선풍기 증정 이벤트"의 "쿠팡"(짧은 주체명)을 오탐시킴 | "keyword가 title 첫 절 전체와 완전히 일치할 때만 주체로 인정"하는 조건으로 최종 확정 |
+| 8차 | P2: 구두점 없는 "주체+판촉 이벤트" 패턴은 여전히 완벽히 구분 안 됨(휴리스틱 근본 한계, 인정하고 진행) | 추가 수정 없음 — 실무 투입 가능 판정, 운영 모니터링으로 전환 |
+| 9차(최종) | No P0/P1. 커밋 가능 여부 재확인(Yes) | 커밋 진행 |
+
+가장 오래 반복된 지점(4~8차, incidental mention 판정)은 "키워드가 기사의 진짜 주체인지 부속물인지"를 무거운 NLP 없이 문자열 규칙만으로 구분하려는 시도의 근본적 한계를 보여준다. 완벽한 해는 개체명 인식(NER) 수준이 필요하지만 계획서의 "무거운 NLP 의존성 추가 금지" 원칙과 상충해 도입하지 않았고, 현재 규칙(첫 절 완전 일치 조건)은 알려진 핵심 반례를 모두 닫은 상태에서 실무 투입을 승인했다.
