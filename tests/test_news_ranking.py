@@ -1533,6 +1533,60 @@ class TestDisplayKeywordRepresentative(unittest.TestCase):
         merged = ranker.dedupe_and_merge(ranked)
         self.assertNotIn("보스니아", merged[0]["display_keyword"])
 
+    def test_generic_appointment_word_not_selected_as_display(self):
+        # 운영 회귀 hotfix(2026-07-03): canonical="홍석기 치안감"인데 기사엔 "홍석기
+        # 국가수사본부장"으로 등장(치안감 토큰 없어 canonical coverage=0), "신임"이
+        # 그룹 기사 전반에 등장. display가 "신임" 같은 일반 서술어 단독이 되면 안 되고,
+        # canonical 또는 사건성 있는 표현이어야 한다.
+        arts = [
+            self._rel("경찰청, 홍석기 신임 국가수사본부장 임명", "https://n.com/1"),
+            self._rel("홍석기 신임 국가수사본부장 임명 발표", "https://n.com/2"),
+            self._rel("신임 국가수사본부장에 홍석기", "https://n.com/3"),
+        ]
+        ranked = [
+            self._rk("홍석기 치안감", 0.9, arts, {"daum": 3}),
+            self._rk("신임", 0.6, arts, {"aux": True}),
+            self._rk("국가수사본부장 임명", 0.7, arts, {"aux": True}),
+        ]
+        merged = ranker.dedupe_and_merge(ranked)
+        display = merged[0]["display_keyword"]
+        self.assertNotEqual(display, "신임")
+        self.assertFalse(ranker._is_generic_only_display(display))
+        # canonical은 movement 안정성 위해 그대로 유지.
+        self.assertEqual(merged[0]["keyword"], "홍석기 치안감")
+
+    def test_generic_only_keywords_rejected_from_display(self):
+        # 신임/임명/승진/취임/내정/발탁/선임 같은 일반 인사어 단독/조합은 display에서 제외.
+        for w in ["신임", "임명", "승진", "취임", "내정", "발탁", "선임", "신임 발표"]:
+            self.assertTrue(ranker._is_generic_only_display(w), f"{w} should be generic-only")
+        # 고유명사가 섞이면 generic-only 아님.
+        for w in ["홍석기 치안감", "국가수사본부장 임명", "손흥민 발탁"]:
+            self.assertFalse(ranker._is_generic_only_display(w), f"{w} should NOT be generic-only")
+
+    def test_singleton_candidate_display_equals_keyword(self):
+        # merge되지 않은 단독 후보는 display_keyword가 canonical keyword와 동일해야 한다
+        # (Codex diff 리뷰 P3: singleton 경로도 _build_display_keyword로 통일했으나
+        # 기존 동작(display=kw)이 유지돼야 함).
+        arts = [self._rel("롯데 오픈 골프대회 개막", "https://s.com/1")]
+        ranked = [self._rk("롯데 오픈 골프대회", 0.9, arts, {"daum": 1})]
+        merged = ranker.dedupe_and_merge(ranked)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["display_keyword"], "롯데 오픈 골프대회")
+
+    def test_canonical_used_when_no_meaningful_display_candidate(self):
+        # 대표성 후보가 전부 generic이면 canonical을 display로 쓴다(단독 일반어 방지).
+        arts = [
+            self._rel("김철수 신임 대표 임명", "https://o.com/1"),
+            self._rel("신임 대표 임명 발표", "https://o.com/2"),
+        ]
+        ranked = [
+            self._rk("김철수 대표", 0.9, arts, {"daum": 3}),
+            self._rk("신임", 0.6, arts, {"aux": True}),
+            self._rk("임명", 0.5, arts, {"aux": True}),
+        ]
+        merged = ranker.dedupe_and_merge(ranked)
+        self.assertFalse(ranker._is_generic_only_display(merged[0]["display_keyword"]))
+
     def test_toonyeong_dedupe_still_works(self):
         # 통영시장(aux) / 통영 시장(daum)은 similar_keyword dedupe로 기존처럼 정상 병합.
         arts = [self._rel("통영 시장 관련 기사", "https://f.com/1")]

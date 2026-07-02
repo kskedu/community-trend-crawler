@@ -629,11 +629,25 @@ def _token_article_coverage(articles: List[Dict]) -> Dict[str, float]:
 # display 공통토큰으로 인정할 최소 기사 분포율(그룹 기사 절반 이상에 등장).
 DISPLAY_TOKEN_MIN_COVERAGE = 0.5
 
+# display_keyword 전용 일반 서술어 블랙리스트 — 사용자에게 의미 없는 수식어가 대표
+# 표시명이 되는 것을 막는다(운영 회귀 hotfix 2026-07-03: "홍석기 치안감" 그룹에서
+# "신임"이 대표로 노출됨). _GENERIC_EVENT_PREDICATE_WORDS와 분리하는 이유: 후자는
+# same-issue merge 판정에도 쓰여 여기에 인사 서술어를 넣으면 merge 로직에 side effect가
+# 생긴다. 이 집합은 display 대표/조합 선택에서만 참조한다(merge 판정 불변).
+_DISPLAY_GENERIC_WORDS = {
+    "신임", "임명", "승진", "취임", "내정", "발탁", "선임", "인사", "전보",
+}
+
+
+def _all_display_generic() -> set:
+    """display 판정에서 제외할 일반어 = 기존 event predicate + 인사 서술어."""
+    return _GENERIC_EVENT_PREDICATE_WORDS | _DISPLAY_GENERIC_WORDS
+
 
 def _display_common_event_tokens(members: List[Dict]) -> set:
     """display_keyword 대표성 판정 전용 — merge group 전체 기사에서 분포율이
     DISPLAY_TOKEN_MIN_COVERAGE 이상인 "사건 핵심 토큰" 집합. 일반 서술어
-    (_GENERIC_EVENT_PREDICATE_WORDS)는 제외한다.
+    (_GENERIC_EVENT_PREDICATE_WORDS + _DISPLAY_GENERIC_WORDS)는 제외한다.
 
     문서빈도(개수)가 아니라 분포율(coverage)로 판정한다(사용자 확정 2026-07-02):
     개수 기준이면 "보스니아"/"헤르체고비나"가 상대국 기사 몇 건에 반복 등장하는 것만으로
@@ -648,9 +662,10 @@ def _display_common_event_tokens(members: List[Dict]) -> set:
     if len(articles) < 2:
         return set()
     coverage = _token_article_coverage(articles)
+    generic = _all_display_generic()
     return {
         t for t, cov in coverage.items()
-        if cov >= DISPLAY_TOKEN_MIN_COVERAGE and t not in _GENERIC_EVENT_PREDICATE_WORDS
+        if cov >= DISPLAY_TOKEN_MIN_COVERAGE and t not in generic
     }
 
 
@@ -705,27 +720,30 @@ def _representative_score(member: Dict, common_tokens: set, group_articles: List
     사용자 확정 기준(2026-07-02): "그룹 공통 사건토큰 포함도"가 주 기준이되, raw 개수가
     아니라 "기사 분포율(coverage)"을 함께 본다. seed 여부는 보조/tie-breaker. 반환 튜플
     (내림차순 비교) 순서:
-    1. keyword coverage 감점(1차 관문) — keyword 자체가 그룹 기사 절반 미만에만
-       등장하면(지엽 엔티티) -1. "보스니아 헤르체고비나"처럼 일부 기사에만 나오는
-       다어절 엔티티를 하드코딩 없이 데이터로 감점하고, 이 감점을 공통토큰 수보다
-       앞에 둔다(Codex diff 리뷰 P2: 뒤에 두면 "월드컵 16강 보스니아 헤르체고비나"처럼
-       공통토큰을 많이 담지만 coverage 낮은 후보가 다시 대표로 올라옴). coverage
-       충분하면 0.
-    2. 공통 사건토큰 포함 수 — coverage가 대등한 후보들 사이에서, 그룹 기사 절반
+    1. generic-only 페널티(최상위 관문, 운영 hotfix 2026-07-03) — keyword가 일반
+       서술어(신임/임명/발표 등) 토큰만으로 구성되면 -1. "홍석기 치안감" 그룹에서
+       "신임"이 대표로 뽑히던 회귀를 막는다. 어떤 coverage/common_hits보다 앞서
+       무조건 최하위로 민다.
+    2. keyword coverage 감점 — keyword 자체가 그룹 기사 절반 미만에만 등장하면(지엽
+       엔티티) -1. "보스니아 헤르체고비나"처럼 일부 기사에만 나오는 다어절 엔티티를
+       하드코딩 없이 데이터로 감점(Codex diff 리뷰 P2: 공통토큰 수보다 앞).
+    3. 공통 사건토큰 포함 수 — coverage가 대등한 후보들 사이에서, 그룹 기사 절반
        이상에 걸쳐 등장하는 핵심어(common_tokens)를 많이 담을수록 대표성↑.
-    3. broad 단독어 페널티(-1) — _TOO_BROAD_SINGLE_WORDS 단독 후보 감점.
-    4. seed priority(daum>danawa>aux) — 대표성 동률일 때 원 seed 우선(tie-breaker).
-    5. 구체성(keyword 토큰 수) — 그래도 동률이면 더 구체적인 표현 우선.
-    6. 원 score — 최종 tie-breaker(신호 강도).
+    4. broad 단독어 페널티(-1) — _TOO_BROAD_SINGLE_WORDS 단독 후보 감점.
+    5. seed priority(daum>danawa>aux) — 대표성 동률일 때 원 seed 우선(tie-breaker).
+    6. 구체성(keyword 토큰 수) — 그래도 동률이면 더 구체적인 표현 우선.
+    7. 원 score — 최종 tie-breaker(신호 강도).
     """
     from news.summarizer import _tokens
 
     kw = member["keyword"]
     kw_toks = set(_tokens(kw))
     common_hits = len(kw_toks & common_tokens)
+    generic_penalty = -1 if _is_generic_only_display(kw) else 0
     coverage_penalty = -1 if _keyword_coverage(member, group_articles) < DISPLAY_TOKEN_MIN_COVERAGE else 0
     broad_penalty = -1 if kw.strip() in _TOO_BROAD_SINGLE_WORDS else 0
     return (
+        generic_penalty,
         coverage_penalty,
         common_hits,
         broad_penalty,
@@ -735,6 +753,19 @@ def _representative_score(member: Dict, common_tokens: set, group_articles: List
     )
 
 
+def _is_generic_only_display(keyword: str) -> bool:
+    """keyword가 display 일반 서술어(_all_display_generic) 토큰만으로 구성됐는지.
+    "신임"/"임명"/"발표" 단독, "신임 발표"처럼 일반어 조합도 True. 고유명사/사건어가
+    하나라도 섞이면 False(예: "홍석기 치안감"·"국가수사본부장 임명").
+    """
+    from news.summarizer import _tokens
+
+    toks = set(_tokens(keyword or ""))
+    if not toks:
+        return False
+    return toks <= _all_display_generic()
+
+
 def _build_display_keyword(members: List[Dict]) -> str:
     """same-issue merge된 후보들에서 display_keyword 생성.
 
@@ -742,6 +773,13 @@ def _build_display_keyword(members: List[Dict]) -> str:
     가장 많이 포함한" 후보를 대표(best)로 삼는다(score 1위나 글자 수가 아님 — 이전
     구현은 len 내림차순이라 "보스니아 헤르체고비나"가 "월드컵"을 이기는 문제가 있었다).
     seed 출처/구체성/score는 tie-breaker로만 쓴다(_representative_score).
+
+    canonical 보호(운영 hotfix 2026-07-03): members[0]은 group의 canonical(score 1위,
+    movement 비교 기준). display 대표성 점수 1위가 generic-only(신임/임명 등)이면 사용자
+    에게 의미가 없으므로, best로 채택하지 않고 canonical을 대신 쓴다. 최종 결과가 그래도
+    generic-only가 되면 canonical로 강제 대체한다("홍석기 치안감" 그룹에서 "신임"이
+    노출되던 회귀 방지). canonical의 coverage가 낮아도(기사가 canonical과 다른 표기를
+    써서) "그룹 원 대표"라는 지위를 존중해 display fallback으로 항상 유지한다.
 
     조합형 처리:
     1. best가 이미 다른 후보 토큰을 포함하는 조합형이면(예: "김영환 압수수색") 그대로 사용.
@@ -753,6 +791,7 @@ def _build_display_keyword(members: List[Dict]) -> str:
     from news.summarizer import _tokens
 
     keywords = [m["keyword"] for m in members]
+    canonical = members[0]["keyword"]
     group_articles = _display_group_articles(members)
     common_tokens = _display_common_event_tokens(members)
 
@@ -761,6 +800,9 @@ def _build_display_keyword(members: List[Dict]) -> str:
         members, key=lambda m: _representative_score(m, common_tokens, group_articles), reverse=True
     )
     best = members_sorted[0]["keyword"]
+    # best가 generic-only(신임/임명 등)면 대표로 쓰지 않고 canonical로 교체.
+    if _is_generic_only_display(best):
+        best = canonical
     best_toks = set(best)
 
     # best가 다른 후보들의 (문자) 토큰을 이미 포함하는 조합형 표현인지 확인
@@ -781,6 +823,9 @@ def _build_display_keyword(members: List[Dict]) -> str:
     def _second_allowed(m: Dict) -> bool:
         k = m["keyword"]
         if k in best or best in k:
+            return False
+        # generic-only 후보(신임/임명 등)는 보완 표기로도 붙이지 않는다(hotfix 2026-07-03).
+        if _is_generic_only_display(k):
             return False
         if not low_coverage_group and _keyword_coverage(m, group_articles) < DISPLAY_TOKEN_MIN_COVERAGE:
             return False
@@ -808,12 +853,22 @@ def _build_display_keyword(members: List[Dict]) -> str:
             second = m["keyword"]
             break
     if second is None:
-        return best[:DISPLAY_KEYWORD_MAX_LEN]
+        return _display_or_canonical(best, canonical)
 
     candidate = f"{best} {second}"
     if len(candidate) <= DISPLAY_KEYWORD_MAX_LEN:
-        return candidate
-    return best[:DISPLAY_KEYWORD_MAX_LEN]
+        return _display_or_canonical(candidate, canonical)
+    return _display_or_canonical(best, canonical)
+
+
+def _display_or_canonical(display: str, canonical: str) -> str:
+    """최종 display 후보가 generic-only(신임/임명 등)면 canonical로 대체한다.
+    canonical 자체가 generic-only인 극단 케이스에는 그대로 canonical을 쓴다(그 이상
+    나은 선택지가 없음). DISPLAY_KEYWORD_MAX_LEN 상한 적용.
+    """
+    if _is_generic_only_display(display):
+        return canonical[:DISPLAY_KEYWORD_MAX_LEN]
+    return display[:DISPLAY_KEYWORD_MAX_LEN]
 
 
 def dedupe_and_merge(ranked: List[Dict]) -> List[Dict]:
@@ -885,6 +940,12 @@ def dedupe_and_merge(ranked: List[Dict]) -> List[Dict]:
             merged = dict(item)
             merged.setdefault("related_keywords", [])
             merged.setdefault("aliases", [])
+            # 단독 후보는 display_keyword = kw(기존 동작 유지 — 길이 절단하지 않음,
+            # Codex diff 재리뷰 P3: _build_display_keyword를 태우면 18자 초과 정상
+            # 단독 키워드가 잘리는 동작 변경이 생김). 단, generic-only("신임" 등) 단독은
+            # 그대로 노출하지 않는 게 맞지만 단독이라 대체 후보가 없으므로 kw를 유지한다
+            # (merge group 내부의 generic 대표 회귀는 _build_display_keyword에서 이미
+            # 방어됨 — 단독 generic이 상위로 오는 경우는 관찰 항목).
             merged["display_keyword"] = kw
             result.append(merged)
             continue
