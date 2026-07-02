@@ -161,7 +161,13 @@ def compute_scores(candidates: List[Dict], signals: Dict[str, Dict]) -> List[Dic
     def _passes_keyword_quality_gate(news_meta: Dict) -> bool:
         hrc = news_meta.get("high_relevance_count", 0)
         qcs = news_meta.get("quality_cluster_size", 0)
-        return hrc >= 2 or qcs >= 2
+        if not (hrc >= 2 or qcs >= 2):
+            return False
+        # fresh relevance gate: 관련 기사가 있어도 전부 오래됐으면(제품 리뷰/도입기 등)
+        # Top10 자격에서 제외한다(candidates.FRESH_RELEVANCE_HOURS 이내 고관련 기사가
+        # 최소 1건 필요). Codex review-only 검토: latest_relevant_age_hours 조건은
+        # fresh_high_relevance_count>=1과 동치라 별도 OR 분기로 추가하지 않는다.
+        return news_meta.get("fresh_high_relevance_count", 0) >= 1
 
     candidates = [
         c for c in candidates

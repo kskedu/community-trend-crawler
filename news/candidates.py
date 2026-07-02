@@ -62,6 +62,12 @@ LOW_RELEVANCE_ARTICLE_THRESHOLD = 0.3
 # keyword-level quality gate: 이 값 이상인 기사만 "고관련"으로 집계(compute_news_signal).
 HIGH_RELEVANCE_THRESHOLD = 0.7
 
+# fresh relevance gate: 고관련 기사 중 이 시간 이내인 것만 "신선한 고관련"으로 집계.
+# 관련성은 높지만 전부 오래된 기사(제품 리뷰/도입기 등)만 있는 키워드가 Top10에
+# backfill되는 것을 막기 위한 hard gate 전용 기준(ranker._passes_keyword_quality_gate).
+# 기존 RECENT_HOURS(12h, News 서브스코어 freshness용)와는 목적이 달라 별도 상수로 둔다.
+FRESH_RELEVANCE_HOURS = 72
+
 # select_representative()가 대표로 인정하는 최소 relevance_score.
 REPRESENTATIVE_MIN_RELEVANCE = 0.5
 
@@ -531,6 +537,24 @@ def compute_news_signal(keyword: str, raw_items: List[dict]) -> Optional[dict]:
     quality_primary = select_primary_cluster(quality_clusters)
     quality_cluster_size = len(quality_primary)
 
+    # fresh relevance gate 집계: 고관련 기사 중 published_at 파싱이 되고 FRESH_RELEVANCE_HOURS
+    # 이내인 것만 "신선한 고관련"으로 좁힌다. published_at이 없거나 파싱 실패한 기사는
+    # 최근성을 증명할 수 없으므로 보수적으로 fresh 판정에서 제외한다.
+    fresh_high_relevance_articles = [
+        a for a in high_relevance_articles
+        if _age_hours(a.get("published_at")) is not None
+        and _age_hours(a.get("published_at")) <= FRESH_RELEVANCE_HOURS
+    ]
+    fresh_high_relevance_count = len(fresh_high_relevance_articles)
+    fresh_quality_clusters = cluster_articles(fresh_high_relevance_articles)
+    fresh_quality_primary = select_primary_cluster(fresh_quality_clusters)
+    fresh_quality_cluster_size = len(fresh_quality_primary)
+    high_relevance_ages = [
+        _age_hours(a.get("published_at")) for a in high_relevance_articles
+        if _age_hours(a.get("published_at")) is not None
+    ]
+    latest_relevant_age_hours = min(high_relevance_ages) if high_relevance_ages else None
+
     return {
         "recent_count": recent_count,
         "latest_age_hours": min(ages) if ages else None,
@@ -544,6 +568,9 @@ def compute_news_signal(keyword: str, raw_items: List[dict]) -> Optional[dict]:
         "topic_coherence": topic_coherence,
         "high_relevance_count": high_relevance_count,
         "quality_cluster_size": quality_cluster_size,
+        "fresh_high_relevance_count": fresh_high_relevance_count,
+        "fresh_quality_cluster_size": fresh_quality_cluster_size,
+        "latest_relevant_age_hours": latest_relevant_age_hours,
     }
 
 

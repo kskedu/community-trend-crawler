@@ -23,11 +23,13 @@ from news.movement import apply_movement
 
 
 def _news(recent_count, age, diversity, relevance, articles=None,
-          high_relevance_count=2, quality_cluster_size=2):
-    # high_relevance_count/quality_cluster_size 기본값은 keyword-level quality gate
-    # (ranker._passes_keyword_quality_gate)를 통과하도록 채운다 — 이 헬퍼를 쓰는 기존
-    # 테스트들은 quality gate 자체가 아니라 score/penalty/정규화 로직을 검증 대상으로
-    # 하므로, 신규 gate 때문에 무관하게 회귀하지 않아야 한다.
+          high_relevance_count=2, quality_cluster_size=2,
+          fresh_high_relevance_count=1, fresh_quality_cluster_size=1,
+          latest_relevant_age_hours=1.0):
+    # high_relevance_count/quality_cluster_size/fresh_* 기본값은 keyword-level quality
+    # gate(ranker._passes_keyword_quality_gate, fresh relevance gate 포함)를 통과하도록
+    # 채운다 — 이 헬퍼를 쓰는 기존 테스트들은 quality gate 자체가 아니라 score/penalty/
+    # 정규화 로직을 검증 대상으로 하므로, 신규 gate 때문에 무관하게 회귀하지 않아야 한다.
     return {
         "recent_count": recent_count,
         "latest_age_hours": age,
@@ -37,6 +39,9 @@ def _news(recent_count, age, diversity, relevance, articles=None,
                                   "press": "x", "published_at": None, "thumbnail": None}],
         "high_relevance_count": high_relevance_count,
         "quality_cluster_size": quality_cluster_size,
+        "fresh_high_relevance_count": fresh_high_relevance_count,
+        "fresh_quality_cluster_size": fresh_quality_cluster_size,
+        "latest_relevant_age_hours": latest_relevant_age_hours,
     }
 
 
@@ -368,6 +373,20 @@ class TestMovement(unittest.TestCase):
 
 
 # ===== 실시간 이슈 랭킹 품질 개선 테스트 (docs/news-ranking-quality-plan.md) =====
+
+def _recent_iso(hours_ago: float = 1.0) -> str:
+    """fresh relevance gate 테스트용: 현재 시각 기준 hours_ago 이전 ISO 문자열."""
+    from datetime import datetime, timedelta, timezone
+    dt = datetime.now(timezone.utc) - timedelta(hours=hours_ago)
+    return dt.isoformat().replace("+00:00", "Z")
+
+
+def _stale_iso(days_ago: float = 120.0) -> str:
+    """fresh relevance gate 테스트용: FRESH_RELEVANCE_HOURS를 훌쩍 넘는 과거 ISO 문자열."""
+    from datetime import datetime, timedelta, timezone
+    dt = datetime.now(timezone.utc) - timedelta(days=days_ago)
+    return dt.isoformat().replace("+00:00", "Z")
+
 
 def _article(title, url, snippet="", published_at=None):
     return {"title": title, "url": url, "press": "x", "snippet": snippet,
@@ -946,11 +965,14 @@ class TestKeywordQualityGate(unittest.TestCase):
 
     def test_high_relevance_keyword_passes_gate(self):
         good_articles = [
-            _article("AI 노트북 시장 성장", "https://x.com/good1", "노트북 수요가 늘고 있다."),
-            _article("신형 노트북 출시", "https://x.com/good2", "새로운 노트북 라인업이 공개됐다."),
+            _article("AI 노트북 시장 성장", "https://x.com/good1", "노트북 수요가 늘고 있다.",
+                     published_at=_recent_iso()),
+            _article("신형 노트북 출시", "https://x.com/good2", "새로운 노트북 라인업이 공개됐다.",
+                     published_at=_recent_iso()),
         ]
         sig = cand.compute_news_signal("노트북", good_articles)
         self.assertGreaterEqual(sig["high_relevance_count"], 2)
+        self.assertGreaterEqual(sig["fresh_high_relevance_count"], 1)
 
         candidates = [{"keyword": "노트북", "sources": {"daum": 1}}]
         signals = {"news": {"노트북": sig}, "datalab": {}, "google": {}, "daum": {"노트북": 1}}
@@ -961,8 +983,8 @@ class TestKeywordQualityGate(unittest.TestCase):
         # quality gate와 무관하게, 애초에 news 신호가 없는 후보는 기존 규칙대로 제외돼야 한다
         # (quality gate 도입으로 이 기존 동작이 깨지지 않는지 확인).
         good_articles = [
-            _article("AI 노트북 시장 성장", "https://x.com/n1"),
-            _article("신형 노트북 출시", "https://x.com/n2"),
+            _article("AI 노트북 시장 성장", "https://x.com/n1", published_at=_recent_iso()),
+            _article("신형 노트북 출시", "https://x.com/n2", published_at=_recent_iso()),
         ]
         sig = cand.compute_news_signal("노트북", good_articles)
         candidates = [{"keyword": "노트북", "sources": {"daum": 1}}, {"keyword": "무관", "sources": {"daum": 2}}]
@@ -975,6 +997,145 @@ class TestKeywordQualityGate(unittest.TestCase):
         kws = [r["keyword"] for r in ranked]
         self.assertIn("노트북", kws)
         self.assertNotIn("무관", kws)
+
+
+class TestFreshRelevanceGate(unittest.TestCase):
+    """운영 반영(4c38b0e) 후속: 관련성은 높지만 전부 오래된 기사(제품 리뷰/도입기 등)만
+    있는 키워드가 Top10에 남는 문제 — "로지텍 지슈스" 실측 재현."""
+
+    def test_stale_product_keyword_excluded_from_top10(self):
+        # 실측 재현: "로지텍 지슈스" — 관련 기사는 있으나 전부 2~5개월 전 제품
+        # 도입/히트상품 기사. published_at 전부 FRESH_RELEVANCE_HOURS(72h) 밖.
+        articles = [
+            _article("아이러브PC방, 2026 1분기 PC방 히트상품 발표...로지텍 지슈스 마우스 등",
+                     "https://x.com/logi1", "로지텍 지슈스 마우스 등 총 12종의 PC방 히트상품을 선정·발표했다.",
+                     published_at=_stale_iso(days_ago=55)),
+            _article("'레드포스PC방' 방배역점 오픈...로지텍 '지슈스' 일부 좌석 도입",
+                     "https://x.com/logi2", "로지텍 PRO X2 SUPERSTRIKE(지슈스)를 일부 좌석에 도입했다.",
+                     published_at=_stale_iso(days_ago=75)),
+            _article("[언박싱]로지텍 'PRO X2 SUPERSTRIKE(지슈스)', 클릭의 새로운 패러다임을...",
+                     "https://x.com/logi3", "로지텍의 지슈스는 스티디셀러인 지슈라 시리즈의 특유의 감성을 계승했다.",
+                     published_at=_stale_iso(days_ago=125)),
+        ]
+        sig = cand.compute_news_signal("로지텍 지슈스", articles)
+        self.assertGreaterEqual(sig["high_relevance_count"], 2)  # 관련성 자체는 높음
+        self.assertEqual(sig["fresh_high_relevance_count"], 0)  # 전부 stale
+
+        candidates = [{"keyword": "로지텍 지슈스", "sources": {"daum": 1}}]
+        signals = {"news": {"로지텍 지슈스": sig}, "datalab": {}, "google": {}, "daum": {"로지텍 지슈스": 1}}
+        ranked = ranker.compute_scores(candidates, signals)
+        self.assertEqual(ranked, [])  # fresh gate 미달 → Top10 후보에서 완전히 제외
+
+    def test_recent_product_issue_keyword_kept(self):
+        # RTX 5090: 최근 가격/재고 이슈 기사가 있으면 제품 키워드라도 유지돼야 한다
+        # (요구사항: "제품 기사라서 제외"가 아니라 "오래된 제품 기사만 있어서 제외").
+        articles = [
+            _article("RTX 5090 가격 또 올랐다...품귀 현상 심화", "https://x.com/rtx1",
+                     "RTX 5090 재고 부족으로 가격이 급등하고 있다.", published_at=_recent_iso(hours_ago=3)),
+            _article("RTX 5090 벤치마크 유출...성능 논란", "https://x.com/rtx2",
+                     "RTX 5090의 실성능이 예상보다 낮다는 벤치마크가 유출됐다.", published_at=_recent_iso(hours_ago=10)),
+        ]
+        sig = cand.compute_news_signal("RTX 5090", articles)
+        self.assertGreaterEqual(sig["fresh_high_relevance_count"], 1)
+
+        candidates = [{"keyword": "RTX 5090", "sources": {"daum": 1}}]
+        signals = {"news": {"RTX 5090": sig}, "datalab": {}, "google": {}, "daum": {"RTX 5090": 1}}
+        ranked = ranker.compute_scores(candidates, signals)
+        self.assertEqual(len(ranked), 1)
+
+    def test_high_relevance_but_all_stale_fails_gate(self):
+        # relevance_score는 높아도 latest_relevant_age_hours가 기준(72h) 초과면 gate 실패.
+        articles = [
+            _article("노트북 신제품 리뷰", "https://x.com/old1", "노트북 신제품을 상세히 리뷰했다.",
+                     published_at=_stale_iso(days_ago=10)),
+            _article("노트북 스펙 비교", "https://x.com/old2", "인기 노트북 스펙을 비교 정리했다.",
+                     published_at=_stale_iso(days_ago=15)),
+        ]
+        sig = cand.compute_news_signal("노트북", articles)
+        self.assertGreaterEqual(sig["high_relevance_count"], 2)
+        self.assertIsNotNone(sig["latest_relevant_age_hours"])
+        self.assertGreater(sig["latest_relevant_age_hours"], cand.FRESH_RELEVANCE_HOURS)
+        self.assertEqual(sig["fresh_high_relevance_count"], 0)
+
+        candidates = [{"keyword": "노트북", "sources": {"daum": 1}}]
+        signals = {"news": {"노트북": sig}, "datalab": {}, "google": {}, "daum": {"노트북": 1}}
+        ranked = ranker.compute_scores(candidates, signals)
+        self.assertEqual(ranked, [])
+
+    def test_backfill_skips_stale_candidate_for_next(self):
+        # 앞 후보가 fresh gate로 제거된 뒤, 다음 후보가 stale이면 건너뛰고 그 다음이
+        # 승격돼야 한다(억지로 Top10을 채우기 위해 stale 후보를 넣지 않음).
+        stale_articles = [
+            _article("노트북 신제품 리뷰", "https://x.com/b-old1", published_at=_stale_iso(days_ago=20)),
+            _article("노트북 스펙 정리", "https://x.com/b-old2", published_at=_stale_iso(days_ago=25)),
+        ]
+        fresh_articles = [
+            _article("모니터 신제품 출시 화제", "https://x.com/b-new1",
+                     published_at=_recent_iso(hours_ago=2)),
+            _article("모니터 할인 행사 시작", "https://x.com/b-new2",
+                     published_at=_recent_iso(hours_ago=5)),
+        ]
+        sig_stale = cand.compute_news_signal("노트북", stale_articles)
+        sig_fresh = cand.compute_news_signal("모니터", fresh_articles)
+
+        candidates = [
+            {"keyword": "노트북", "sources": {"daum": 1}},
+            {"keyword": "모니터", "sources": {"daum": 2}},
+        ]
+        signals = {
+            "news": {"노트북": sig_stale, "모니터": sig_fresh},
+            "datalab": {}, "google": {},
+            "daum": {"노트북": 1, "모니터": 2},
+        }
+        ranked = ranker.compute_scores(candidates, signals)
+        kws = [r["keyword"] for r in ranked]
+        self.assertNotIn("노트북", kws)  # stale → 건너뜀
+        self.assertIn("모니터", kws)     # 다음 순번이 자연 승격
+
+    def test_unknown_published_at_treated_as_stale_not_exempted(self):
+        # published_at이 없거나(None) 파싱 실패(빈 문자열 등)한 기사만 있으면, high
+        # relevance는 인정되더라도 "최근성 증명 불가"이므로 fresh gate는 예외 없이
+        # 실패해야 한다(Codex review-only P2 반영: age unknown을 fresh로 우회시키지 않음).
+        unknown_date_articles = [
+            _article("AI 노트북 시장 성장", "https://x.com/unk1", "노트북 수요가 늘고 있다.",
+                     published_at=None),
+            _article("신형 노트북 출시", "https://x.com/unk2", "새로운 노트북 라인업이 공개됐다.",
+                     published_at="not-a-valid-date"),
+        ]
+        sig = cand.compute_news_signal("노트북", unknown_date_articles)
+        self.assertGreaterEqual(sig["high_relevance_count"], 2)  # 관련성 자체는 인정
+        self.assertEqual(sig["fresh_high_relevance_count"], 0)  # 그러나 fresh는 0건
+        self.assertIsNone(sig["latest_relevant_age_hours"])  # age 전부 unknown
+
+        candidates = [{"keyword": "노트북", "sources": {"daum": 1}}]
+        signals = {"news": {"노트북": sig}, "datalab": {}, "google": {}, "daum": {"노트북": 1}}
+        ranked = ranker.compute_scores(candidates, signals)
+        self.assertEqual(ranked, [])  # 예외 통과 없이 gate 실패
+
+    def test_no_regression_for_incidental_and_side_mention_fixtures(self):
+        # 기존 선풍기(전부 incidental) / 노트북 object_side_mention 케이스는 fresh gate
+        # 추가와 무관하게 이전과 동일하게 처리돼야 한다(회귀 없음).
+        fan_articles = [
+            _article("폭염 속 독특한 패션쇼?…\"대박\" 시선 집중", "https://x.com/reg-fan1",
+                     "마치 입는 선풍기, 입는 에어컨을 연상시키는 모습으로 관객들의 시선을 사로잡았습니다.",
+                     published_at=_recent_iso()),
+            _article("[컨슈머리뷰] 손품 팔던 쇼핑은 끝났다", "https://x.com/reg-fan2",
+                     "\"3만 원대 선풍기 중에 분홍색이나 파란색 제품 있어?\" AI 쇼핑 에이전트에게 물었다.",
+                     published_at=_recent_iso()),
+        ]
+        sig_fan = cand.compute_news_signal("선풍기", fan_articles)
+        self.assertEqual(sig_fan["high_relevance_count"], 0)
+        self.assertEqual(sig_fan["fresh_high_relevance_count"], 0)
+
+        side_articles = [
+            _article("美 하원 \"韓 정부, 쿠팡 차별적 규정…노트북 회수까지 지시\"",
+                     "https://x.com/reg-side1",
+                     "보고서엔 국정원이 중국 상하이강에 버려진 노트북을 회수하도록 지시하는 등...",
+                     published_at=_recent_iso()),
+        ]
+        sig_side = cand.compute_news_signal("노트북", side_articles)
+        self.assertEqual(sig_side["high_relevance_count"], 0)
+        self.assertEqual(sig_side["fresh_high_relevance_count"], 0)
 
 
 class TestObjectSideMention(unittest.TestCase):
