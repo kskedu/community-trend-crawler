@@ -589,47 +589,231 @@ def _is_same_issue(item_a: Dict, item_b: Dict) -> bool:
     return _has_cross_keyword_anchor(item_a, item_b, shared)
 
 
+def _display_group_articles(members: List[Dict]) -> List[Dict]:
+    """merge group 전체의 유효(same-issue evidence) 기사 목록(중복 URL 제거)."""
+    seen_urls = set()
+    articles = []
+    for m in members:
+        for a in (m.get("news_meta") or {}).get("articles") or []:
+            if not _is_same_issue_evidence_article(a):
+                continue
+            url = a.get("url")
+            if url and url in seen_urls:
+                continue
+            if url:
+                seen_urls.add(url)
+            articles.append(a)
+    return articles
+
+
+def _token_article_coverage(articles: List[Dict]) -> Dict[str, float]:
+    """그룹 기사 집합에서 각 토큰의 기사 분포율(= 그 토큰이 등장한 기사 수 / 전체 기사 수).
+
+    사용자 확정 기준(2026-07-02): 대표성은 "공통토큰 개수"가 아니라 "그룹 전체 기사에
+    얼마나 넓게 걸쳐 반복 등장하는가"로 본다. 일부 기사에만 나오는 상대국/지역/기업명은
+    coverage가 낮아 자연히 감점된다(하드코딩 국가/기업명 리스트 없이 데이터로 처리).
+    """
+    from news.summarizer import _tokens
+
+    n = len(articles)
+    if n == 0:
+        return {}
+    hits: Dict[str, int] = {}
+    for a in articles:
+        text = f"{a.get('title', '')} {a.get('snippet', '')}"
+        for tok in set(_tokens(text)):
+            hits[tok] = hits.get(tok, 0) + 1
+    return {t: c / n for t, c in hits.items()}
+
+
+# display 공통토큰으로 인정할 최소 기사 분포율(그룹 기사 절반 이상에 등장).
+DISPLAY_TOKEN_MIN_COVERAGE = 0.5
+
+
+def _display_common_event_tokens(members: List[Dict]) -> set:
+    """display_keyword 대표성 판정 전용 — merge group 전체 기사에서 분포율이
+    DISPLAY_TOKEN_MIN_COVERAGE 이상인 "사건 핵심 토큰" 집합. 일반 서술어
+    (_GENERIC_EVENT_PREDICATE_WORDS)는 제외한다.
+
+    문서빈도(개수)가 아니라 분포율(coverage)로 판정한다(사용자 확정 2026-07-02):
+    개수 기준이면 "보스니아"/"헤르체고비나"가 상대국 기사 몇 건에 반복 등장하는 것만으로
+    "월드컵"(1개 토큰)을 이겨버린다. 그룹 기사 절반 이상에 걸쳐 등장하는 토큰만
+    핵심어로 인정하면, 대부분 기사에 나오는 "월드컵"/"16강"은 남고 일부 기사에만
+    나오는 상대국명은 자연히 걸러진다.
+
+    유효 기사가 2건 미만이면(반복 관측 불가) 빈 set(zero-confidence)을 반환해
+    seed/구체성 tie-breaker 경로로 넘긴다.
+    """
+    articles = _display_group_articles(members)
+    if len(articles) < 2:
+        return set()
+    coverage = _token_article_coverage(articles)
+    return {
+        t for t, cov in coverage.items()
+        if cov >= DISPLAY_TOKEN_MIN_COVERAGE and t not in _GENERIC_EVENT_PREDICATE_WORDS
+    }
+
+
+def _seed_priority(member: Dict) -> int:
+    """seed 출처 우선순위 점수(클수록 우선). daum > danawa > aux/기타. tie-breaker 전용."""
+    sources = member.get("sources") or {}
+    if "daum" in sources:
+        return 3
+    if "danawa" in sources:
+        return 2
+    return 1  # aux/google 등 파생
+
+
+def _keyword_coverage(member: Dict, group_articles: List[Dict]) -> float:
+    """keyword의 (문자열 부분일치 기준) 기사 분포율 — keyword가 그룹 전체 기사 중
+    몇 개에 실제로 등장하는가. 다어절 지역/상대국/기업명이 일부 기사에만 나오면
+    낮게 나와 representative_score에서 감점된다(사용자 확정 2026-07-02).
+
+    "keyword의 모든 토큰이 그 기사에 등장하는가"로 본다. 통짜 문자열 부분일치(kw in
+    text)는 "보스니아 헤르체고비나" 같은 다어절 엔티티는 정확하지만, "메타" in
+    "메타버스"/"AI" in "OpenAI"처럼 짧은 keyword가 다른 단어의 부분으로 오탐 카운트되는
+    문제가 있다(Codex diff 리뷰 P3). keyword 토큰이 전부 기사 토큰에 있으면 등장으로
+    보면, 다어절 엔티티 통짜 측정("보스니아"·"헤르체고비나" 둘 다 있는 기사만 카운트)과
+    부분일치 오탐 방지를 동시에 만족한다.
+
+    한계(Codex diff 재리뷰 P3, 의도적 보수 처리): 형태소 분석이 없어 조사/접미가
+    붙은 표기("김영환이", "손흥민은")는 별도 토큰이라 exact subset이 어긋나 coverage가
+    과소계산될 수 있다. 다만 coverage는 임계(DISPLAY_TOKEN_MIN_COVERAGE) 이진 감점에만
+    쓰이고, 과소계산은 "대표성을 낮게 보는" 안전한 방향이라 지엽 엔티티를 과대평가하는
+    오탐(더 위험)보다 낫다. 핵심어가 조사 때문에 부당 감점되더라도 그 후보가 canonical
+    keyword(movement 비교용)로는 그대로 유지되므로 데이터 안정성에는 영향이 없다.
+    형태소 기반 정밀화는 별도 과제로 남긴다.
+    """
+    from news.summarizer import _tokens
+
+    if not group_articles:
+        return 0.0
+    kw_toks = set(_tokens(member["keyword"] or ""))
+    if not kw_toks:
+        return 0.0
+    hits = 0
+    for a in group_articles:
+        art_toks = set(_tokens(f"{a.get('title', '')} {a.get('snippet', '')}"))
+        if kw_toks <= art_toks:
+            hits += 1
+    return hits / len(group_articles)
+
+
+def _representative_score(member: Dict, common_tokens: set, group_articles: List[Dict]) -> tuple:
+    """display 대표 후보 선택용 복합 점수(튜플, 사전식 비교로 tie-break 다단계).
+
+    사용자 확정 기준(2026-07-02): "그룹 공통 사건토큰 포함도"가 주 기준이되, raw 개수가
+    아니라 "기사 분포율(coverage)"을 함께 본다. seed 여부는 보조/tie-breaker. 반환 튜플
+    (내림차순 비교) 순서:
+    1. keyword coverage 감점(1차 관문) — keyword 자체가 그룹 기사 절반 미만에만
+       등장하면(지엽 엔티티) -1. "보스니아 헤르체고비나"처럼 일부 기사에만 나오는
+       다어절 엔티티를 하드코딩 없이 데이터로 감점하고, 이 감점을 공통토큰 수보다
+       앞에 둔다(Codex diff 리뷰 P2: 뒤에 두면 "월드컵 16강 보스니아 헤르체고비나"처럼
+       공통토큰을 많이 담지만 coverage 낮은 후보가 다시 대표로 올라옴). coverage
+       충분하면 0.
+    2. 공통 사건토큰 포함 수 — coverage가 대등한 후보들 사이에서, 그룹 기사 절반
+       이상에 걸쳐 등장하는 핵심어(common_tokens)를 많이 담을수록 대표성↑.
+    3. broad 단독어 페널티(-1) — _TOO_BROAD_SINGLE_WORDS 단독 후보 감점.
+    4. seed priority(daum>danawa>aux) — 대표성 동률일 때 원 seed 우선(tie-breaker).
+    5. 구체성(keyword 토큰 수) — 그래도 동률이면 더 구체적인 표현 우선.
+    6. 원 score — 최종 tie-breaker(신호 강도).
+    """
+    from news.summarizer import _tokens
+
+    kw = member["keyword"]
+    kw_toks = set(_tokens(kw))
+    common_hits = len(kw_toks & common_tokens)
+    coverage_penalty = -1 if _keyword_coverage(member, group_articles) < DISPLAY_TOKEN_MIN_COVERAGE else 0
+    broad_penalty = -1 if kw.strip() in _TOO_BROAD_SINGLE_WORDS else 0
+    return (
+        coverage_penalty,
+        common_hits,
+        broad_penalty,
+        _seed_priority(member),
+        len(kw_toks),
+        member.get("score", 0.0),
+    )
+
+
 def _build_display_keyword(members: List[Dict]) -> str:
     """same-issue merge된 후보들에서 display_keyword 생성.
 
-    우선순위(요구사항 대표 키워드 선택 기준):
-    1. 너무 일반적인 단독 단어(_TOO_BROAD_SINGLE_WORDS)는 단독 대표로 쓰지 않는다.
-    2. 기존 후보 중 하나가 이미 다른 후보의 토큰을 포함하는 조합형 키워드면
-       (예: "김영환 압수수색"이 "압수수색"/"김영환"을 모두 포함) 그걸 그대로 쓴다.
-    3. 그렇지 않으면(다들 단편적 단일 개념) 서로 다른 두 키워드를 조합해
-       사건 맥락을 드러낸다(12~18자 제한).
-    """
-    keywords = [m["keyword"] for m in members]
-    specific = [k for k in keywords if k not in _TOO_BROAD_SINGLE_WORDS]
-    pool = specific or keywords
-    pool_sorted = sorted(pool, key=len, reverse=True)
+    대표 선택 기준(사용자 확정 2026-07-02): merge group 안에서 "그룹 공통 사건토큰을
+    가장 많이 포함한" 후보를 대표(best)로 삼는다(score 1위나 글자 수가 아님 — 이전
+    구현은 len 내림차순이라 "보스니아 헤르체고비나"가 "월드컵"을 이기는 문제가 있었다).
+    seed 출처/구체성/score는 tie-breaker로만 쓴다(_representative_score).
 
-    best = pool_sorted[0]
-    best_toks = set(best)
-    # best가 다른 후보들의 토큰을 이미 포함하는 조합형 표현인지 확인
-    covers_others = all(
-        (not set(k) - best_toks) or k == best for k in pool_sorted[1:]
+    조합형 처리:
+    1. best가 이미 다른 후보 토큰을 포함하는 조합형이면(예: "김영환 압수수색") 그대로 사용.
+    2. 그렇지 않으면 best에 없는 공통 사건토큰을 보완하는 second 후보를 붙여 조합
+       (예: "월드컵" + "16강" → "월드컵 16강"). best 단독으로 공통토큰을 충분히
+       담고 있으면(second가 새 공통토큰을 못 더하면) 단독 유지.
+    3. 12~18자(DISPLAY_KEYWORD_MAX_LEN) 상한.
+    """
+    from news.summarizer import _tokens
+
+    keywords = [m["keyword"] for m in members]
+    group_articles = _display_group_articles(members)
+    common_tokens = _display_common_event_tokens(members)
+
+    # 대표성 점수 내림차순으로 후보 정렬(동률은 원래 순서=score 내림차순 유지).
+    members_sorted = sorted(
+        members, key=lambda m: _representative_score(m, common_tokens, group_articles), reverse=True
     )
-    if covers_others and len(pool_sorted) > 1:
+    best = members_sorted[0]["keyword"]
+    best_toks = set(best)
+
+    # best가 다른 후보들의 (문자) 토큰을 이미 포함하는 조합형 표현인지 확인
+    covers_others = all(
+        (not set(k) - best_toks) or k == best for k in keywords if k != best
+    )
+    if covers_others and len(members_sorted) > 1:
         return best[:DISPLAY_KEYWORD_MAX_LEN]
 
-    # 단편적 키워드들 → 서로 다른 상위 두 키워드를 조합(중복 없이). best(가장 길고 이미
-    # 사건 맥락을 담고 있을 가능성이 높은 키워드)를 앞에, 보조 키워드를 뒤에 붙인다
-    # (Codex review-only 조언: same-issue merge 확장으로 "배재고 출전정지"+"권오영 감독"처럼
-    # 서로 무관한 문자 집합을 가진 키워드가 merge될 때, 기존 "{k} {combined}" 순서는
-    # 인명을 사건 키워드 앞에 붙여 "권오영 감독 배재고 출전정지"처럼 부자연스러워졌다.
-    # "{combined} {k}"로 순서를 반전하면 이미 완결된 사건 표현이 앞에 오고 보조 정보가
-    # 뒤에 붙어 "배재고 출전정지 권오영 감독"이 되고, 기존 "압수수색 영장"+"김영환" 같은
-    # 케이스도 "압수수색 영장 김영환"으로 정보 손실 없이 조합된다).
-    combined = best
-    for k in pool_sorted[1:]:
-        if k in combined:
-            continue
-        candidate = f"{combined} {k}"
-        if len(candidate) <= DISPLAY_KEYWORD_MAX_LEN:
-            combined = candidate
-        break
-    return combined[:DISPLAY_KEYWORD_MAX_LEN]
+    # 조합 대상 second 후보 선택. 두 경로 모두 coverage 낮은 지엽 엔티티(상대국/기업명
+    # 등)는 second로 붙이지 않는다(Codex diff 재리뷰 P2: 공통토큰 보완 경로에도 동일
+    # 방어 필요 — best="월드컵" + 남은 공통토큰 "16강"을 "16강 보스니아"가 담더라도,
+    # 그 후보가 일부 기사에만 등장하면 "월드컵 16강 보스니아"가 되어선 안 됨). 유효
+    # 기사가 2건 미만이라 coverage 신호가 없는 그룹(같은 기사 1건 공유 merge)에서는
+    # coverage 감점이 신뢰할 수 없으므로 방어를 끄고 기존처럼 맥락 후보를 붙인다.
+    low_coverage_group = len(group_articles) < 2
+
+    def _second_allowed(m: Dict) -> bool:
+        k = m["keyword"]
+        if k in best or best in k:
+            return False
+        if not low_coverage_group and _keyword_coverage(m, group_articles) < DISPLAY_TOKEN_MIN_COVERAGE:
+            return False
+        return True
+
+    best_word_toks = set(_tokens(best))
+    remaining_common = common_tokens - best_word_toks
+    second = None
+    #  (a) best가 담지 못한 공통 사건토큰을 가장 많이 보완하는 후보 우선.
+    if remaining_common:
+        best_gain = 0
+        for m in members_sorted[1:]:
+            if not _second_allowed(m):
+                continue
+            gain = len(set(_tokens(m["keyword"])) & remaining_common)
+            if gain > best_gain:
+                best_gain = gain
+                second = m["keyword"]
+    #  (b) 공통토큰 보완 후보가 없으면(zero-confidence 등) 대표성 순 다음 허용 후보를
+    #      붙인다 — 단독 일반어("압수수색")가 아니라 맥락(인명 등)을 함께 드러내기 위함.
+    if second is None:
+        for m in members_sorted[1:]:
+            if not _second_allowed(m):
+                continue
+            second = m["keyword"]
+            break
+    if second is None:
+        return best[:DISPLAY_KEYWORD_MAX_LEN]
+
+    candidate = f"{best} {second}"
+    if len(candidate) <= DISPLAY_KEYWORD_MAX_LEN:
+        return candidate
+    return best[:DISPLAY_KEYWORD_MAX_LEN]
 
 
 def dedupe_and_merge(ranked: List[Dict]) -> List[Dict]:

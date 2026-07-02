@@ -1391,5 +1391,232 @@ class TestMovementAfterMerge(unittest.TestCase):
         self.assertEqual(out["keywords"][0]["previous_rank"], 3)
 
 
+class TestDisplayKeywordRepresentative(unittest.TestCase):
+    """merge group의 display_keyword가 score/글자수 1위가 아니라 "그룹 기사 분포율
+    기반 대표성"으로 선택되는지 검증(2026-07-02 live diagnostic 후속).
+
+    canonical keyword(movement 비교용)는 절대 바뀌지 않고 display_keyword만
+    자연스러워져야 한다.
+    """
+
+    def _rk(self, kw, score, articles, sources=None):
+        return {
+            "keyword": kw, "score": score,
+            "source_breakdown": {"news": score}, "rank_reason": "",
+            "news_meta": {"articles": articles}, "used_signals": ["news"],
+            "sources": sources if sources is not None else {"daum": 1},
+        }
+
+    def _rel(self, title, url, snippet=""):
+        # 실제 파이프라인 기사처럼 relevance_reason을 부여(same-issue evidence로 인정되게).
+        a = _article(title, url, snippet)
+        a["relevance_reason"] = "keyword_main_topic"
+        return a
+
+    def test_worldcup_group_not_represented_by_opponent_country(self):
+        # 월드컵/16강은 그룹 기사 대부분에, 보스니아 헤르체고비나는 1건에만 등장.
+        # display_keyword가 지엽적 상대국 단독으로 뽑히면 안 되고, coverage 높은
+        # 사건 핵심어(월드컵/16강)가 대표가 돼야 한다.
+        arts = [
+            self._rel("한국 월드컵 16강 진출 확정", "https://a.com/1"),
+            self._rel("월드컵 16강 상대는 보스니아 헤르체고비나", "https://a.com/2"),
+            self._rel("월드컵 16강 대진표 발표", "https://a.com/3"),
+            self._rel("월드컵 16강 경기 일정 공개", "https://a.com/4"),
+        ]
+        ranked = [
+            self._rk("보스니아 헤르체고비나", 0.9, arts, {"daum": 3}),
+            self._rk("월드컵", 0.7, arts, {"aux": True}),
+            self._rk("16강", 0.6, arts, {"aux": True}),
+        ]
+        merged = ranker.dedupe_and_merge(ranked)
+        self.assertEqual(len(merged), 1)
+        display = merged[0]["display_keyword"]
+        self.assertNotEqual(display, "보스니아 헤르체고비나")
+        self.assertNotIn("보스니아", display)
+        # 월드컵/16강 핵심어가 대표에 포함돼야 한다.
+        self.assertTrue("월드컵" in display or "16강" in display)
+        # canonical keyword는 score 1위(보스니아)로 유지 — movement 안정성.
+        self.assertEqual(merged[0]["keyword"], "보스니아 헤르체고비나")
+
+    def test_semiconductor_group_not_represented_by_mentioned_company(self):
+        # 반도체가 그룹 기사 대부분에, 메타는 일부 기사에만 언급 → 대표는 반도체 계열.
+        arts = [
+            self._rel("반도체 투자 확대 전망", "https://b.com/1"),
+            self._rel("메타 AI 반도체 대규모 투자 발표", "https://b.com/2"),
+            self._rel("반도체 업황 회복 신호", "https://b.com/3"),
+        ]
+        ranked = [
+            self._rk("메타", 0.9, arts, {"daum": 3}),
+            self._rk("반도체", 0.7, arts, {"aux": True}),
+        ]
+        merged = ranker.dedupe_and_merge(ranked)
+        self.assertEqual(len(merged), 1)
+        self.assertIn("반도체", merged[0]["display_keyword"])
+        self.assertEqual(merged[0]["keyword"], "메타")  # canonical 불변
+
+    def test_ador_group_representative_is_stable(self):
+        # 어도어가 그룹 전 기사에 공통 등장 → 대표성 최고. 뉴진스/민희진은 보조.
+        arts = [
+            self._rel("어도어 뉴진스 전속계약 분쟁", "https://c.com/1"),
+            self._rel("어도어 민희진 대표 복귀", "https://c.com/2"),
+            self._rel("어도어 뉴진스 민희진 갈등 지속", "https://c.com/3"),
+        ]
+        ranked = [
+            self._rk("어도어", 0.9, arts, {"daum": 3}),
+            self._rk("뉴진스", 0.7, arts, {"aux": True}),
+            self._rk("민희진", 0.6, arts, {"aux": True}),
+        ]
+        merged = ranker.dedupe_and_merge(ranked)
+        self.assertEqual(len(merged), 1)
+        self.assertIn("어도어", merged[0]["display_keyword"])
+
+    def test_short_proper_noun_not_penalized_when_high_coverage(self):
+        # 손흥민처럼 짧은 고유명사라도 그룹 기사 전반에 등장하면(coverage 높음) 감점되지
+        # 않아야 한다(길이/숫자 휴리스틱을 대표 기준으로 쓰지 않는다는 요구 반영).
+        arts = [
+            self._rel("손흥민 북중미 월드컵 대표팀 합류", "https://d.com/1"),
+            self._rel("손흥민 월드컵 일정 확정", "https://d.com/2"),
+            self._rel("손흥민 대표팀 훈련 참가", "https://d.com/3"),
+        ]
+        ga = ranker._display_group_articles([self._rk("손흥민", 0.7, arts)])
+        self.assertGreaterEqual(ranker._keyword_coverage(self._rk("손흥민", 0.7, arts), ga), 0.5)
+
+    def test_local_multiword_entity_low_coverage_penalized(self):
+        # 다어절 상대국명이 일부 기사에만 등장하면 coverage 감점(하드코딩 리스트 없이).
+        arts = [
+            self._rel("월드컵 16강 진출", "https://e.com/1"),
+            self._rel("월드컵 16강 상대 보스니아 헤르체고비나 확정", "https://e.com/2"),
+            self._rel("월드컵 16강 훈련 시작", "https://e.com/3"),
+        ]
+        ga = ranker._display_group_articles([self._rk("x", 0.5, arts)])
+        cov = ranker._keyword_coverage(self._rk("보스니아 헤르체고비나", 0.9, arts), ga)
+        self.assertLess(cov, 0.5)
+
+    def test_high_common_hits_but_low_coverage_does_not_win(self):
+        # coverage_penalty가 common_hits보다 우선하므로, 공통토큰을 많이 담아도
+        # coverage가 낮은 후보(월드컵 16강 + 지엽 상대국 조합)는 대표가 되면 안 된다
+        # (Codex diff 리뷰 P2 회귀 방지).
+        arts = [
+            self._rel("월드컵 16강 진출", "https://p.com/1"),
+            self._rel("월드컵 16강 상대 보스니아 헤르체고비나전", "https://p.com/2"),
+            self._rel("월드컵 16강 훈련 시작", "https://p.com/3"),
+            self._rel("월드컵 16강 일정 발표", "https://p.com/4"),
+        ]
+        ranked = [
+            # 공통토큰(월드컵/16강)을 2개나 담지만 통짜로는 1건에만 등장(coverage 낮음)
+            self._rk("월드컵 16강 보스니아", 0.9, arts, {"daum": 3}),
+            self._rk("월드컵", 0.7, arts, {"aux": True}),
+        ]
+        group = ranked  # 단일 그룹 가정
+        common = ranker._display_common_event_tokens(group)
+        ga = ranker._display_group_articles(group)
+        s_local = ranker._representative_score(ranked[0], common, ga)
+        s_worldcup = ranker._representative_score(ranked[1], common, ga)
+        # 월드컵(coverage 높음)이 지엽 조합 후보보다 대표성 점수가 높아야 한다.
+        self.assertGreater(s_worldcup, s_local)
+
+    def test_common_token_completing_but_low_coverage_second_excluded(self):
+        # best가 담지 못한 공통토큰을 보완하더라도, 그 second 후보가 그룹 기사 절반
+        # 미만에만 등장하면(지엽 조합) display에 붙으면 안 된다(Codex diff 재리뷰 P2:
+        # remaining_common 경로에도 coverage 방어 필요).
+        arts = [
+            self._rel("월드컵 16강 진출 확정", "https://q.com/1"),
+            self._rel("월드컵 16강 상대 보스니아", "https://q.com/2"),
+            self._rel("월드컵 16강 대진 발표", "https://q.com/3"),
+            self._rel("월드컵 16강 훈련", "https://q.com/4"),
+        ]
+        ranked = [
+            self._rk("월드컵", 0.9, arts, {"aux": True}),
+            # "16강"(공통토큰)을 담지만 "보스니아"가 붙어 통짜로는 1건에만 등장 → 지엽.
+            self._rk("16강 보스니아", 0.7, arts, {"daum": 3}),
+        ]
+        merged = ranker.dedupe_and_merge(ranked)
+        self.assertNotIn("보스니아", merged[0]["display_keyword"])
+
+    def test_toonyeong_dedupe_still_works(self):
+        # 통영시장(aux) / 통영 시장(daum)은 similar_keyword dedupe로 기존처럼 정상 병합.
+        arts = [self._rel("통영 시장 관련 기사", "https://f.com/1")]
+        ranked = [
+            self._rk("통영 시장", 0.9, arts, {"daum": 3}),
+            self._rk("통영시장", 0.7, arts, {"aux": True}),
+        ]
+        merged = ranker.dedupe_and_merge(ranked)
+        self.assertEqual(len(merged), 1)
+        self.assertIn("통영시장", merged[0]["related_keywords"])
+
+    def test_existing_normal_merge_display_regression(self):
+        # 기존 정상 merge(김영환/압수수색): display가 단독 일반어("압수수색")가 아니라
+        # 맥락 포함이어야 한다(회귀 방지).
+        shared = self._rel("공수처, 김영환 지사 사무실 압수수색", "https://g.com/1")
+        ranked = [
+            self._rk("압수수색", 0.9, [shared]),
+            self._rk("김영환", 0.85, [shared]),
+        ]
+        merged = ranker.dedupe_and_merge(ranked)
+        self.assertEqual(len(merged), 1)
+        self.assertNotEqual(merged[0]["display_keyword"], "압수수색")
+
+    def test_generic_only_common_tokens_falls_back_gracefully(self):
+        # 공통토큰이 전부 generic(발표/공개 등)이면 common_tokens가 비어 tie-breaker로
+        # 넘어가며, 예외 없이 display_keyword가 생성돼야 한다.
+        arts_a = [self._rel("정부 오늘 새 정책 발표 공개", "https://h.com/1")]
+        arts_b = [self._rel("정부 오늘 새 정책 발표 공개", "https://h.com/2")]
+        ranked = [
+            self._rk("정책발표", 0.9, arts_a, {"daum": 3}),
+            self._rk("정부", 0.7, arts_b, {"aux": True}),
+        ]
+        merged = ranker.dedupe_and_merge(ranked)
+        # 병합 여부와 무관하게 display_keyword가 항상 존재하고 문자열이어야 한다.
+        for m in merged:
+            self.assertIsInstance(m["display_keyword"], str)
+            self.assertTrue(len(m["display_keyword"]) > 0)
+
+    def test_single_article_group_no_common_token_confidence(self):
+        # 유효 기사 1건뿐인 그룹은 공통토큰 zero-confidence(빈 set) → 지엽 엔티티가
+        # 대표성 토큰으로 오인되지 않아야 한다.
+        arts = [self._rel("보스니아 헤르체고비나 단독 기사", "https://i.com/1")]
+        self.assertEqual(ranker._display_common_event_tokens([self._rk("x", 0.5, arts)]), set())
+
+    def test_display_keyword_respects_max_len(self):
+        # 조합형 display_keyword가 DISPLAY_KEYWORD_MAX_LEN(18자)을 넘지 않아야 한다.
+        arts = [
+            self._rel("아주긴사건이름 관련 핵심 보도 확산", "https://j.com/1"),
+            self._rel("아주긴사건이름 후속 조치 보도 확산", "https://j.com/2"),
+        ]
+        ranked = [
+            self._rk("아주긴사건이름핵심보도", 0.9, arts, {"daum": 3}),
+            self._rk("후속조치확산보도", 0.7, arts, {"aux": True}),
+        ]
+        merged = ranker.dedupe_and_merge(ranked)
+        for m in merged:
+            self.assertLessEqual(len(m["display_keyword"]), ranker.DISPLAY_KEYWORD_MAX_LEN)
+
+    def test_end_to_end_canonical_display_movement_consistency(self):
+        # build_ranked_issues까지 거친 뒤: keyword=canonical, display_keyword=개선값,
+        # movement는 canonical keyword 기준으로 안정 유지.
+        arts = [
+            self._rel("월드컵 16강 진출 확정", "https://k.com/1"),
+            self._rel("월드컵 16강 상대 보스니아 헤르체고비나", "https://k.com/2"),
+            self._rel("월드컵 16강 대진 발표", "https://k.com/3"),
+        ]
+        ranked = [
+            self._rk("보스니아 헤르체고비나", 0.9, arts, {"daum": 3}),
+            self._rk("월드컵", 0.7, arts, {"aux": True}),
+        ]
+        merged = ranker.dedupe_and_merge(ranked)
+        top = ranker.select_top(merged)
+        issues = build_ranked_issues(top, {}, ["naver_news"])
+        entry = issues["keywords"][0]
+        self.assertEqual(entry["keyword"], "보스니아 헤르체고비나")  # canonical
+        # 개선 display: 지엽 상대국은 빠지고 핵심 사건어가 들어가야 한다(느슨한 !=만이 아님).
+        self.assertNotIn("보스니아", entry["display_keyword"])
+        self.assertIn("월드컵", entry["display_keyword"])
+
+        # 이전 실행에서도 canonical이 동일했다면 movement는 안정(new 아님).
+        prev = {"keywords": [{"keyword": "보스니아 헤르체고비나", "rank": 2}]}
+        out = apply_movement(prev, {"keywords": [dict(entry, rank=1)]})
+        self.assertEqual(out["keywords"][0]["movement"], "up")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
