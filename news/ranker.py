@@ -636,6 +636,10 @@ DISPLAY_TOKEN_MIN_COVERAGE = 0.5
 # 생긴다. 이 집합은 display 대표/조합 선택에서만 참조한다(merge 판정 불변).
 _DISPLAY_GENERIC_WORDS = {
     "신임", "임명", "승진", "취임", "내정", "발탁", "선임", "인사", "전보",
+    # "조사"는 "수사"류 일반 행위어지만 _GENERIC_EVENT_PREDICATE_WORDS에 넣으면
+    # same-issue merge 판정에 side effect가 생기므로 display/singleton 전용인
+    # 이 집합에 둔다(2026-07-03 운영 관찰: generic singleton 방어 확장).
+    "조사",
 }
 
 
@@ -963,6 +967,31 @@ def dedupe_and_merge(ranked: List[Dict]) -> List[Dict]:
         result.append(merged)
 
     return result
+
+
+def exclude_generic_singletons(merged: List[Dict]) -> tuple:
+    """merge group을 이루지 못한 singleton 후보 중 keyword가 generic-only(수사/조사/
+    신임 등 일반 행위·인사 서술어만으로 구성)인 항목을 최종 후보에서 제외한다.
+
+    운영 관찰(2026-07-03): canonical=display="수사" singleton이 그대로 news_top에
+    노출됨 — merge group의 generic 대표는 _build_display_keyword가 방어하지만
+    singleton 경로(display=keyword)는 방어를 타지 않았다. singleton generic은 이슈
+    식별이 불가능한 표기이므로 filler로도 쓰지 않는다(제외로 개수가 줄면 줄어든
+    채로 보고). "태풍"처럼 generic 집합에 없는 명확한 이슈 단독어는 통과한다.
+    merge group에 흡수된 generic keyword는 related_keywords로 유지되므로 무관.
+
+    dedupe_and_merge() 이후, select_top() 이전에 적용한다.
+    반환: (kept, excluded_keywords)
+    """
+    kept: List[Dict] = []
+    excluded: List[str] = []
+    for item in merged:
+        group_size = 1 + len(item.get("related_keywords") or [])
+        if group_size == 1 and _is_generic_only_display(item.get("keyword", "")):
+            excluded.append(item.get("keyword", ""))
+            continue
+        kept.append(item)
+    return kept, excluded
 
 
 def select_top(ranked: List[Dict], top_n: int = TOP_N) -> List[Dict]:

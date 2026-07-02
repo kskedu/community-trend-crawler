@@ -149,12 +149,118 @@ def run():
 MIN_RECENT_KEYWORDS = 5  # Top10 중 최근 기사 보유 키워드 최소 수
 
 
+def _count_recent_keywords(top):
+    """Top 항목 중 최근(12h) 기사 보유 키워드 수(MIN_RECENT_KEYWORDS 가드용)."""
+    return sum(1 for t in top if (t.get("news_meta") or {}).get("recent_count", 0) >= 1)
+
+
+def _rank_and_select(candidates, signals, pass_name):
+    """score → dedupe/merge → generic singleton 제외 → Top10 + pass별 단계 카운트 로그.
+
+    final이 TOP_N 미만일 때 부족 사유(어느 단계에서 몇 개가 줄었는지)를 재구성할 수
+    있도록 단계별 수를 항상 남긴다(품질 기준 완화 없이 개수만 관찰).
+    """
+    ranked = ranker.compute_scores(candidates, signals)
+    merged = ranker.dedupe_and_merge(ranked)
+    kept, generic_excluded = ranker.exclude_generic_singletons(merged)
+    if generic_excluded:
+        logger.warning("[news] %s: generic singleton 제외 %s", pass_name, generic_excluded)
+    top = ranker.select_top(kept)
+    logger.info(
+        "[news] %s: candidates=%d gate통과=%d merge후=%d generic제외=%d final=%d",
+        pass_name, len(candidates), len(ranked), len(merged), len(generic_excluded), len(top),
+    )
+    return top
+
+
+def _backfill_pass(
+    pass1_top, pass1_aux, daum_ranked, danawa_ranked, google_cands,
+    cached_search_news, news_signals, datalab_signals, google_signals,
+):
+    """pass2(backfill): 후보 발굴 확장 후 동일 gate/merge로 전체 재계산.
+
+    - 신규 후보 2경로: aux 확장(daum 전체 Top10 기반, 상한 12) + 뉴스 title 기반
+      phrase 후보(derive_phrase_candidates — pass1에서 이미 fetch한 기사만 사용).
+    - 신규 후보만 뉴스 실호출(cached_search_news 메모이즈), datalab/google 신호는
+      pass1 것을 재사용(추가 API 호출 없음 — 신규 후보는 news 신호만으로 평가,
+      가용 신호 재정규화 구조상 문제 없음).
+    - 증분 방식은 min-max 집합 정규화와 충돌하므로 전체 재계산을 채택한다.
+    - 안전장치: 재계산 결과가 pass1보다 못하면(신규 후보가 기존 그룹을 브리지해
+      병합 개수가 줄어드는 등) 채택하지 않고 pass1 결과를 유지한다.
+
+    반환: (top2, candidates2). 채택하지 않으면 (None, None).
+    """
+    try:
+        aux_expanded = cand.derive_aux_keywords(
+            daum_ranked, cached_search_news,
+            top=cand.AUX_SEED_TOP_BACKFILL, aux_max=cand.AUX_MAX_BACKFILL,
+        )
+        # pass1 aux는 top=5 기준으로 뽑힌 결과라 top=10 확장 결과(aux_expanded)의
+        # subset이 보장되지 않는다(Codex diff 리뷰 P1: aux_max 상한이 다르면 pass1
+        # 생존 이슈의 aux가 재추출에서 잘려나갈 수 있음). union으로 합쳐 pass1 후보를
+        # 보존한다.
+        aux2 = list(dict.fromkeys((pass1_aux or []) + aux_expanded))
+        # pass1 생존 이슈(canonical + 흡수된 alias)와 유사한 phrase는 재발굴하지 않는다
+        # (어차피 same-issue merge로 흡수 — gate 탈락 seed의 phrase 확장형만이 새 기회).
+        survived = []
+        for t in pass1_top:
+            survived.append(t["keyword"])
+            survived.extend(t.get("related_keywords") or [])
+        phrases = cand.derive_phrase_candidates(news_signals, survived)
+        if not aux_expanded and not phrases:
+            logger.info("[news] pass2: 신규 후보 없음 → pass1 결과 유지")
+            return None, None
+
+        candidates2 = cand.collect_candidates(
+            daum_ranked, danawa_ranked, google_cands, aux2,
+            limit=cand.BACKFILL_CANDIDATE_MAX, phrase_keywords=phrases,
+        )
+        # 다양성 hard guard 재적용(phrase/aux는 Daum 파생으로 계산돼 우회 불가)
+        non_daum = cand.count_non_daum(candidates2)
+        if non_daum < cand.MIN_NON_DAUM_CANDIDATES:
+            logger.warning("[news] pass2: 다양성 부족(%d) → pass1 결과 유지", non_daum)
+            return None, None
+
+        news_signals2 = cand.build_news_signals(candidates2, cached_search_news)
+        if not news_signals2:
+            return None, None
+        signals2 = {
+            "news": news_signals2,
+            "datalab": datalab_signals,
+            "google": google_signals,
+            "daum": {c["keyword"]: c["sources"].get("daum") for c in candidates2},
+        }
+        top2 = _rank_and_select(candidates2, signals2, "pass2(backfill)")
+        improved = len(top2) > len(pass1_top) or (
+            len(top2) == len(pass1_top)
+            and _count_recent_keywords(top2) > _count_recent_keywords(pass1_top)
+        )
+        if not improved:
+            logger.info(
+                "[news] pass2: 개선 없음(final %d→%d) → pass1 결과 유지",
+                len(pass1_top), len(top2),
+            )
+            return None, None
+        return top2, candidates2
+    except Exception as e:
+        logger.warning("[news] pass2 backfill 실패(무시하고 pass1 결과 유지): %s", e)
+        return None, None
+
+
 def run_news_briefing():
     """통합 랭킹으로 news_issue_cache(source='news_top') 갱신.
 
     흐름: 후보수집(daum/danawa/google/보조후보) → News/DataLab/Google 신호 →
           ranker score → Top10 → build_ranked_issues → upsert.
     Daum 순서를 그대로 쓰지 않고 자체 score로 재정렬한다.
+
+    2-pass backfill(품질 기준 유지형 최소 10개 확보):
+    - pass1(strict): 기존 후보 pool 그대로.
+    - pass1 final이 TOP_N 미만이거나 최근성 가드에 미달하면 pass2(backfill):
+      aux 확장 + 뉴스 title 기반 phrase 후보를 더해 동일 gate/merge로 전체 재계산.
+      뉴스 fetch는 키워드 단위 메모이즈로 pass1 결과를 재사용(신규 후보만 실호출),
+      datalab/google 신호도 pass1 것을 재사용(추가 API 호출 없음).
+    - 그래도 부족하면 품질 기준을 낮추지 않고 부족 사유를 로그로 남긴 채 진행.
 
     upsert skip 가드(기존 캐시 보존):
     - News 신호 전무(키 없음/전건 실패) → skip
@@ -172,7 +278,16 @@ def run_news_briefing():
             logger.warning("[news] daum seed stale → daum 후보 제외")
             daum_ranked = []
         google_cands = google_adapter.fetch_candidates()
-        aux = cand.derive_aux_keywords(daum_ranked, search_news)
+
+        # 뉴스 fetch 메모이즈 — pass2 backfill에서 같은 키워드 재호출 방지(쿼터 보호).
+        news_fetch_cache = {}
+
+        def cached_search_news(keyword):
+            if keyword not in news_fetch_cache:
+                news_fetch_cache[keyword] = search_news(keyword)
+            return news_fetch_cache[keyword]
+
+        aux = cand.derive_aux_keywords(daum_ranked, cached_search_news)
         candidates = cand.collect_candidates(daum_ranked, danawa_ranked, google_cands, aux)
         if not candidates:
             logger.warning("[news] 후보 없음 → news_top upsert skip (기존 캐시 보존)")
@@ -188,7 +303,7 @@ def run_news_briefing():
             return
 
         # 2) 신호 산출
-        news_signals = cand.build_news_signals(candidates, search_news)
+        news_signals = cand.build_news_signals(candidates, cached_search_news)
         if not news_signals:
             logger.warning("[news] News 신호 전무 → news_top upsert skip (기존 캐시 보존)")
             return
@@ -204,26 +319,37 @@ def run_news_briefing():
             "daum": daum_signals,
         }
 
-        # 3) score → dedupe/same-issue merge → Top10
+        # 3) pass1(strict): score → dedupe/same-issue merge → generic singleton 제외 → Top10
         #    (dedupe/merge는 score 계산 후, Top10 확정 전에 적용 — 유사 키워드/같은 이슈가
         #    각각 별도 순위를 차지하지 않도록. docs/news-ranking-quality-plan.md §7)
-        ranked = ranker.compute_scores(candidates, signals)
-        ranked = ranker.dedupe_and_merge(ranked)
-        top = ranker.select_top(ranked)
+        top = _rank_and_select(candidates, signals, "pass1(strict)")
         if not top:
             logger.warning("[news] 랭킹 결과 없음 → skip")
             return
 
+        # 3-1) pass2(backfill): final 부족 또는 최근성 가드 미달이면 후보 발굴 확장.
+        #      gate/merge 기준은 pass1과 완전히 동일(품질 기준 완화 없음) — 후보만 늘린다.
+        if len(top) < ranker.TOP_N or _count_recent_keywords(top) < MIN_RECENT_KEYWORDS:
+            top2, candidates2 = _backfill_pass(
+                top, aux, daum_ranked, danawa_ranked, google_cands,
+                cached_search_news, news_signals, datalab_signals, google_signals,
+            )
+            if top2 is not None:
+                top, candidates = top2, candidates2
+
         # Top10 최근성 가드
-        recent_kw = sum(
-            1 for t in top if (t.get("news_meta") or {}).get("recent_count", 0) >= 1
-        )
+        recent_kw = _count_recent_keywords(top)
         if recent_kw < MIN_RECENT_KEYWORDS:
             logger.warning(
                 "[news] 최근 기사 보유 키워드 부족(%d < %d) → skip (실시간성 부족)",
                 recent_kw, MIN_RECENT_KEYWORDS,
             )
             return
+        if len(top) < ranker.TOP_N:
+            logger.warning(
+                "[news] backfill 후에도 품질 통과 후보 부족 → %d개로 진행(품질 기준 유지, filler 미삽입)",
+                len(top),
+            )
 
         # 4) build + data_sources
         data_sources = ["naver_news"]

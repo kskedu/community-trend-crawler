@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from news import ranker, candidates as cand, datalab, google
 from news.builder import build_ranked_issues, build_ranked_entry
 from news.movement import apply_movement
+import main as main_module
 
 
 def _news(recent_count, age, diversity, relevance, articles=None,
@@ -1670,6 +1671,353 @@ class TestDisplayKeywordRepresentative(unittest.TestCase):
         prev = {"keywords": [{"keyword": "보스니아 헤르체고비나", "rank": 2}]}
         out = apply_movement(prev, {"keywords": [dict(entry, rank=1)]})
         self.assertEqual(out["keywords"][0]["movement"], "up")
+
+
+class TestGenericSingletonGuard(unittest.TestCase):
+    """generic singleton 방어(2026-07-03 운영 관찰: canonical=display="수사" 단독 노출).
+
+    ranker._DISPLAY_GENERIC_WORDS 확장("조사" 추가) + exclude_generic_singletons().
+    """
+
+    def _rk(self, kw, score, articles=None, sources=None, related=None):
+        item = {
+            "keyword": kw, "score": score,
+            "source_breakdown": {"news": score}, "rank_reason": "",
+            "news_meta": {"articles": articles or []}, "used_signals": ["news"],
+            "sources": sources if sources is not None else {"daum": 1},
+        }
+        if related is not None:
+            item["related_keywords"] = related
+        return item
+
+    def test_investigation_singleton_excluded_from_final(self):
+        # "수사" 단독 후보는 merge group을 이루지 못하면(singleton) final에서 제외돼야 함.
+        merged = [self._rk("수사", 0.9), self._rk("정상이슈 사건", 0.5, related=[])]
+        kept, excluded = ranker.exclude_generic_singletons(merged)
+        self.assertIn("수사", excluded)
+        self.assertNotIn("수사", [k["keyword"] for k in kept])
+
+    def test_appointment_singleton_excluded_from_final(self):
+        # "신임" 단독 후보도 동일하게 제외돼야 함(기존 merge-group 대표 방어와 별개로
+        # singleton 경로도 방어).
+        merged = [self._rk("신임", 0.9)]
+        kept, excluded = ranker.exclude_generic_singletons(merged)
+        self.assertEqual(kept, [])
+        self.assertIn("신임", excluded)
+
+    def test_typhoon_singleton_kept(self):
+        # "태풍"처럼 명확한 자연재난 단독 키워드는 generic 집합에 없으므로 통과해야 함.
+        merged = [self._rk("태풍", 0.9)]
+        kept, excluded = ranker.exclude_generic_singletons(merged)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0]["keyword"], "태풍")
+        self.assertEqual(excluded, [])
+
+    def test_generic_keyword_absorbed_into_merge_group_is_kept(self):
+        # merge group의 멤버로 흡수된 generic keyword(related_keywords에 존재)는
+        # 그룹 자체가 singleton이 아니므로 제외되지 않는다(정보 손실 없음 확인).
+        merged = [self._rk("홍석기 치안감", 0.9, related=["신임"])]
+        kept, excluded = ranker.exclude_generic_singletons(merged)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(excluded, [])
+
+    def test_survey_word_added_to_display_generic(self):
+        self.assertTrue(ranker._is_generic_only_display("조사"))
+        self.assertIn("조사", ranker._DISPLAY_GENERIC_WORDS)
+
+
+def _phrase_news_signal(keyword, articles):
+    """derive_phrase_candidates 입력용 news_signals 값(compute_news_signal 형식 흉내)."""
+    return {"articles": articles}
+
+
+def _phrase_article(title, url, hours_ago=1.0, relevance_reason="keyword_main_topic"):
+    a = _article(title, url, published_at=_recent_iso(hours_ago))
+    a["relevance_reason"] = relevance_reason
+    a["is_incidental"] = relevance_reason in (
+        "incidental_giveaway_mention", "keyword_not_found", "object_side_mention",
+    )
+    return a
+
+
+class TestPhraseCandidates(unittest.TestCase):
+    """backfill pass 전용 phrase 후보 발굴(candidates.derive_phrase_candidates)."""
+
+    def test_generates_multiword_phrase_from_repeated_titles(self):
+        arts = [
+            _phrase_article("손흥민 월드컵 일정 공개", "https://n.com/1"),
+            _phrase_article("손흥민 월드컵 일정 확정 발표", "https://n.com/2"),
+        ]
+        signals = {"손흥민": _phrase_news_signal("손흥민", arts)}
+        phrases = cand.derive_phrase_candidates(signals, existing_keywords=[])
+        self.assertTrue(any("손흥민" in p and "월드컵" in p for p in phrases))
+
+    def test_single_article_fragment_not_a_candidate(self):
+        # 단일 기사에서만 등장하는 n-gram은 DF<2라 후보가 되면 안 됨.
+        arts = [_phrase_article("전기택시 배터리 10분 완충 교환 도입", "https://n.com/1")]
+        signals = {"전기택시": _phrase_news_signal("전기택시", arts)}
+        phrases = cand.derive_phrase_candidates(signals, existing_keywords=[])
+        self.assertEqual(phrases, [])
+
+    def test_generic_only_phrase_excluded(self):
+        # "수사 발표"류 일반 서술어만의 조합은 phrase 후보에서도 제외.
+        arts = [
+            _phrase_article("경찰 수사 발표 진행", "https://n.com/1"),
+            _phrase_article("검찰 수사 발표 확산", "https://n.com/2"),
+        ]
+        signals = {"수사": _phrase_news_signal("수사", arts)}
+        phrases = cand.derive_phrase_candidates(signals, existing_keywords=[])
+        self.assertNotIn("수사 발표", phrases)
+
+    def test_shopping_marker_title_excluded_from_phrase_source(self):
+        # 경품/판촉 마커가 title에 있으면 그 title 전체를 phrase 원천에서 제외.
+        arts = [
+            _phrase_article("닌텐도 스위치 2 증정 이벤트 진행", "https://n.com/1"),
+            _phrase_article("닌텐도 스위치 2 증정 이벤트 연장", "https://n.com/2"),
+        ]
+        signals = {"닌텐도": _phrase_news_signal("닌텐도", arts)}
+        phrases = cand.derive_phrase_candidates(signals, existing_keywords=[])
+        self.assertEqual(phrases, [])
+
+    def test_stale_article_not_used_as_phrase_source(self):
+        # FRESH_RELEVANCE_HOURS(72h)를 넘는 오래된 기사는 phrase 원천에서 제외.
+        arts = [
+            _phrase_article("오래된 이슈 재조명 특집", "https://n.com/1", hours_ago=200),
+            _phrase_article("오래된 이슈 재조명 후속", "https://n.com/2", hours_ago=200),
+        ]
+        signals = {"오래된이슈": _phrase_news_signal("오래된이슈", arts)}
+        phrases = cand.derive_phrase_candidates(signals, existing_keywords=[])
+        self.assertEqual(phrases, [])
+
+    def test_incidental_article_not_used_as_phrase_source(self):
+        arts = [
+            _phrase_article("선풍기 증정 이벤트 당첨자 발표", "https://n.com/1",
+                             relevance_reason="incidental_giveaway_mention"),
+            _phrase_article("선풍기 증정 이벤트 당첨자 공지", "https://n.com/2",
+                             relevance_reason="incidental_giveaway_mention"),
+        ]
+        signals = {"선풍기": _phrase_news_signal("선풍기", arts)}
+        phrases = cand.derive_phrase_candidates(signals, existing_keywords=[])
+        self.assertEqual(phrases, [])
+
+    def test_similar_to_existing_keyword_excluded(self):
+        # pass1 생존 이슈(canonical/alias)와 유사한 phrase는 재발굴하지 않는다.
+        arts = [
+            _phrase_article("손흥민 월드컵 일정 공개", "https://n.com/1"),
+            _phrase_article("손흥민 월드컵 일정 확정", "https://n.com/2"),
+        ]
+        signals = {"손흥민": _phrase_news_signal("손흥민", arts)}
+        phrases = cand.derive_phrase_candidates(signals, existing_keywords=["손흥민 월드컵 일정"])
+        self.assertEqual(phrases, [])
+
+    def test_phrase_max_limit_respected(self):
+        arts = []
+        for i in range(20):
+            arts.append(_phrase_article(f"키워드{i} 이슈 발생 확산", f"https://n.com/a{i}"))
+            arts.append(_phrase_article(f"키워드{i} 이슈 발생 후속", f"https://n.com/b{i}"))
+        signals = {"k": _phrase_news_signal("k", arts)}
+        phrases = cand.derive_phrase_candidates(signals, existing_keywords=[], phrase_max=3)
+        self.assertLessEqual(len(phrases), 3)
+
+
+class TestPhraseStrictRelevance(unittest.TestCase):
+    """phrase 후보 전용 require_all_tokens strict relevance(Codex 계획 리뷰 P1/P2)."""
+
+    def test_partial_token_match_not_high_relevance_under_strict(self):
+        # phrase="손흥민 월드컵 일정" 중 "손흥민"만 있는 기사는 strict에서 고관련이 아니어야.
+        a = _article("손흥민 근황 공개", "https://n.com/1")
+        rel = cand.compute_article_relevance("손흥민 월드컵 일정", a, require_all_tokens=True)
+        self.assertLess(rel["relevance_score"], cand.HIGH_RELEVANCE_THRESHOLD)
+
+    def test_full_token_match_high_relevance_under_strict(self):
+        a = _article("손흥민 월드컵 일정 공개", "https://n.com/1")
+        rel = cand.compute_article_relevance("손흥민 월드컵 일정", a, require_all_tokens=True)
+        self.assertGreaterEqual(rel["relevance_score"], cand.HIGH_RELEVANCE_THRESHOLD)
+
+    def test_particle_suffixed_title_still_matches_strict(self):
+        # 조사/어미가 붙은 정상 제목("국가수사본부장에")이 exact subset 비교였다면
+        # 탈락했을 케이스 — substring 포함 판정이라 통과해야 한다(2차 리뷰 P2 반영).
+        a = _article("홍석기 신임 국가수사본부장에 임명", "https://n.com/1")
+        rel = cand.compute_article_relevance("홍석기 국가수사본부장", a, require_all_tokens=True)
+        self.assertGreaterEqual(rel["relevance_score"], cand.HIGH_RELEVANCE_THRESHOLD)
+
+    def test_default_seed_relevance_unaffected(self):
+        # require_all_tokens 기본값 False 경로는 기존 동작과 동일해야 한다(회귀 방지).
+        a = _article("유럽 폭염에 에어컨·선풍기 품귀", "https://n.com/1", "폭염으로 선풍기 수요 급증")
+        rel = cand.compute_article_relevance("선풍기", a)
+        self.assertEqual(rel["relevance_reason"], "keyword_main_topic")
+
+
+class TestPhraseCandidateDiversitySource(unittest.TestCase):
+    """phrase 소스가 다양성 hard guard를 우회하지 않는지(2차 리뷰 P1 반영)."""
+
+    def test_phrase_source_excluded_from_non_daum_count(self):
+        candidates_ = [{"keyword": "월드컵 일정", "sources": {"phrase": True}}]
+        self.assertEqual(cand.count_non_daum(candidates_), 0)
+
+    def test_phrase_mixed_with_independent_source_still_counted(self):
+        candidates_ = [{"keyword": "월드컵", "sources": {"phrase": True, "danawa": 1}}]
+        self.assertEqual(cand.count_non_daum(candidates_), 1)
+
+    def test_collect_candidates_includes_phrase_keywords(self):
+        result = cand.collect_candidates([], [], [], [], phrase_keywords=["신규 이슈 phrase"])
+        kws = [c["keyword"] for c in result]
+        self.assertIn("신규 이슈 phrase", kws)
+        self.assertEqual(result[0]["sources"].get("phrase"), True)
+
+
+class TestBackfillPassSelection(unittest.TestCase):
+    """_rank_and_select/exclude_generic_singletons를 통한 backfill 선택 로직 —
+    main._backfill_pass는 실 I/O(seed/naver) 의존이라 여기서는 ranker 계층에서
+    "gate 통과분만 최종 편입, 미통과는 미편입, 중복 미발생"을 검증한다.
+    """
+
+    def _candidates(self, kws, sources=None):
+        return [{"keyword": k, "sources": (sources or {}).get(k, {"daum": i + 1})}
+                for i, k in enumerate(kws)]
+
+    def test_backfill_candidate_passing_gate_included_in_final(self):
+        cands = self._candidates(["A", "B"], sources={"A": {"daum": 1}, "B": {"phrase": True}})
+        arts_a = [_article("금리 인상 전망 확산", "https://x.com/a-only")]
+        arts_b = [_article("반도체 수출 증가 발표", "https://x.com/b-only")]
+        signals = {
+            "news": {
+                "A": _news(3, 1, 2, 0.9, articles=arts_a),
+                "B": _news(3, 1, 2, 0.9, articles=arts_b),
+            },
+            "datalab": {}, "google": {}, "daum": {"A": 1},
+        }
+        ranked = ranker.compute_scores(cands, signals)
+        merged = ranker.dedupe_and_merge(ranked)
+        kept, _ = ranker.exclude_generic_singletons(merged)
+        top = ranker.select_top(kept)
+        self.assertIn("B", [t["keyword"] for t in top])
+
+    def test_backfill_candidate_failing_gate_not_included(self):
+        # 고관련 기사 부족(gate 미통과) phrase 후보는 final에 들어가면 안 됨.
+        cands = self._candidates(["A", "B"], sources={"A": {"daum": 1}, "B": {"phrase": True}})
+        signals = {
+            "news": {
+                "A": _news(3, 1, 2, 0.9),
+                "B": _news(0, 20, 1, 0.1, high_relevance_count=0, quality_cluster_size=0,
+                           fresh_high_relevance_count=0),
+            },
+            "datalab": {}, "google": {}, "daum": {"A": 1},
+        }
+        ranked = ranker.compute_scores(cands, signals)
+        self.assertNotIn("B", [r["keyword"] for r in ranked])
+
+    def test_backfill_no_duplicate_same_issue_across_passes(self):
+        # backfill 후보가 pass1 생존 이슈와 same-issue면 merge로 흡수돼 중복 노출되지 않음.
+        shared = _article("손흥민 월드컵 16강 진출 확정", "https://n.com/shared")
+        shared["relevance_reason"] = "keyword_main_topic"
+        cands = self._candidates(
+            ["손흥민 월드컵", "월드컵 16강 진출"],
+            sources={"손흥민 월드컵": {"daum": 1}, "월드컵 16강 진출": {"phrase": True}},
+        )
+        signals = {
+            "news": {
+                "손흥민 월드컵": {**_news(3, 1, 2, 0.9), "articles": [shared]},
+                "월드컵 16강 진출": {**_news(3, 1, 2, 0.9), "articles": [shared]},
+            },
+            "datalab": {}, "google": {}, "daum": {"손흥민 월드컵": 1},
+        }
+        ranked = ranker.compute_scores(cands, signals)
+        merged = ranker.dedupe_and_merge(ranked)
+        self.assertEqual(len(merged), 1)
+
+
+class TestBackfillPassIntegration(unittest.TestCase):
+    """main._backfill_pass() 자체를 호출하는 통합 테스트(Codex diff 리뷰 P2 반영).
+
+    ranker 계층 단위 테스트만으로는 pass1 aux 보존/재계산/rollback 같은 pass2 통합
+    버그(예: aux top 확장 시 pass1 aux가 aux2에서 누락되는 문제, Codex diff 리뷰 P1)를
+    잡지 못하므로, fetch 함수를 fixture로 주입해 _backfill_pass 전체 경로를 검증한다.
+    seed(daum/danawa)와 search_news는 순수 인자/콜백이라 실제 DB/Naver 호출 없음.
+    """
+
+    def _news_fixture_fetch(self, articles_by_kw):
+        def fetch(keyword):
+            return articles_by_kw.get(keyword, [])
+        return fetch
+
+    def test_pass1_aux_preserved_when_aux_top_expands(self):
+        # pass1 aux(top=5)에서 뽑힌 키워드가 pass2 aux 확장(top=10) 재추출에서
+        # 우연히 빠지더라도(aux_max 상한 등으로), union 덕에 candidates2에 남아있어야 한다.
+        daum_ranked = [{"keyword": f"daum{i}", "rank": i + 1} for i in range(10)]
+        # 다양성 가드(MIN_NON_DAUM_CANDIDATES=4) 통과용 독립 소스 4개.
+        danawa_ranked = [{"keyword": f"danawa상품{i}", "rank": i + 1} for i in range(4)]
+        pass1_aux = ["생존이슈phrase"]
+        pass1_top = [{"keyword": "daum1", "related_keywords": []}]
+
+        # pass2 aux_expanded 재계산 시 "생존이슈phrase"가 다시 나오지 않도록(다른 강한
+        # aux 후보들로 상한 12를 채워 밀려나는 상황을 흉내) fetch fixture 구성.
+        recent = _recent_iso(1.0)
+        news_by_kw = {}
+        for i in range(10):
+            news_by_kw[f"daum{i}"] = [
+                {"title": f"daum{i} 강한아ux단어{j} 발생", "originallink": "", "link": f"https://x.com/{i}-{j}",
+                 "description": "", "pubDate": recent}
+                for j in range(3)
+            ]
+        fetch = self._news_fixture_fetch(news_by_kw)
+
+        news_signals = {"daum1": cand.compute_news_signal("daum1", news_by_kw["daum1"])}
+
+        top2, candidates2 = main_module._backfill_pass(
+            pass1_top, pass1_aux, daum_ranked, danawa_ranked, [],
+            fetch, news_signals, {}, {},
+        )
+        self.assertIsNotNone(candidates2, "다양성 가드 통과 + aux 신규 후보 있으므로 pass2가 채택돼야 함")
+        kws = [c["keyword"] for c in candidates2]
+        self.assertIn("생존이슈phrase", kws, "pass1 aux는 top 확장 재추출 결과에 없어도 union으로 보존돼야 함")
+
+    def test_backfill_pass_returns_none_when_no_new_candidates(self):
+        # aux/phrase 둘 다 신규 후보를 못 만들면 (None, None)으로 pass1 유지를 알린다.
+        daum_ranked = []
+        fetch = self._news_fixture_fetch({})
+        top2, candidates2 = main_module._backfill_pass(
+            [], [], daum_ranked, [], [], fetch, {}, {}, {},
+        )
+        self.assertIsNone(top2)
+        self.assertIsNone(candidates2)
+
+
+class TestInsufficientFinalLogging(unittest.TestCase):
+    """final_count가 TOP_N 미만일 때 부족 사유를 관찰할 수 있는 단계별 카운트 검증
+    (main._rank_and_select가 로그로 남기는 값들의 기반 로직)."""
+
+    def test_gate_exclusion_reduces_ranked_below_candidates(self):
+        cands = [
+            {"keyword": "정상이슈", "sources": {"daum": 1}},
+            {"keyword": "저품질", "sources": {"daum": 2}},
+        ]
+        signals = {
+            "news": {
+                "정상이슈": _news(3, 1, 2, 0.9),
+                "저품질": _news(0, 50, 1, 0.05, high_relevance_count=0, quality_cluster_size=0,
+                              fresh_high_relevance_count=0),
+            },
+            "datalab": {}, "google": {}, "daum": {"정상이슈": 1, "저품질": 2},
+        }
+        ranked = ranker.compute_scores(cands, signals)
+        # 저품질 후보는 quality gate에서 hard exclude되어 ranked에 없어야 함(부족 사유 관찰 가능).
+        self.assertEqual(len(ranked), 1)
+        self.assertEqual([r["keyword"] for r in ranked], ["정상이슈"])
+
+    def test_final_below_top_n_does_not_get_generic_filler(self):
+        # final이 TOP_N 미만이어도 generic singleton을 filler로 채우지 않는다.
+        cands = [{"keyword": "정상이슈 사건", "sources": {"daum": 1}}]
+        signals = {
+            "news": {"정상이슈 사건": _news(3, 1, 2, 0.9)},
+            "datalab": {}, "google": {}, "daum": {"정상이슈 사건": 1},
+        }
+        ranked = ranker.compute_scores(cands, signals)
+        merged = ranker.dedupe_and_merge(ranked)
+        kept, excluded = ranker.exclude_generic_singletons(merged)
+        top = ranker.select_top(kept)
+        self.assertLess(len(top), ranker.TOP_N)
+        self.assertEqual(excluded, [])  # generic이 아니므로 제외 대상 아님, 그냥 개수 부족
 
 
 if __name__ == "__main__":

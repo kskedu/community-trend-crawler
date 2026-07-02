@@ -28,6 +28,15 @@ AUX_MAX = 8             # 보조후보 최대 개수
 RECENT_HOURS = 12       # News 최근성 기준
 MIN_NON_DAUM_CANDIDATES = 4
 
+# === backfill pass(최소 10개 확보) 전용 상수 — strict pass(pass1)에는 영향 없음 ===
+BACKFILL_CANDIDATE_MAX = 45   # pass2 병합 pool 상한(daum10+danawa10+aux12+phrase10 수용)
+AUX_SEED_TOP_BACKFILL = 10    # pass2 aux 확장: daum 전체(Top10)에서 보조후보 추출
+AUX_MAX_BACKFILL = 12
+PHRASE_MAX = 10               # phrase 후보 상한(신규 API fetch 증가 억제)
+PHRASE_NGRAM_MIN = 2
+PHRASE_NGRAM_MAX = 4
+PHRASE_MIN_DF = 2             # phrase가 서로 다른 기사 몇 건에 등장해야 후보로 인정하는가
+
 # incidental mention(부수적 언급) 판정 문맥 마커 — 경품/판촉/부가 물품 문맥.
 # "제공"/"지급"처럼 일반 기사에도 흔한 단어는 keyword 근접(proximity) 조건과
 # 함께일 때만 incidental로 본다(Codex diff 리뷰 P2: 전체 텍스트 any-match는
@@ -90,6 +99,18 @@ def _has_keyword_token(keyword: str, text: str) -> bool:
     return bool(kw_toks & text_toks) or any(
         kt in (text or "") for kt in kw_toks
     )
+
+
+def _has_all_keyword_tokens(keyword: str, text: str) -> bool:
+    """keyword의 모든 토큰이 text에 (소문자 substring으로) 등장하는지 — phrase 후보 전용
+    strict 판정. exact token subset이 아니라 substring 포함으로 본다(Codex 계획 리뷰 P2:
+    "국가수사본부장에"처럼 조사/어미가 붙은 정상 제목이 exact 비교로 대량 탈락하면
+    backfill이 무력화됨)."""
+    kw_toks = [t.lower() for t in set(_tokens(keyword))]
+    text_low = (text or "").lower()
+    if not kw_toks:
+        return (keyword or "").lower() in text_low
+    return all(kt in text_low for kt in kw_toks)
 
 
 def _find_all(needle: str, haystack: str) -> List[tuple]:
@@ -205,7 +226,7 @@ def _has_marker_near_keyword(keyword: str, title: str, snippet: str, markers=Non
     return False
 
 
-def compute_article_relevance(keyword: str, article: Dict) -> Dict:
+def compute_article_relevance(keyword: str, article: Dict, require_all_tokens: bool = False) -> Dict:
     """단일 기사의 키워드 중심성 판정 → {relevance_score, relevance_reason, is_incidental}.
 
     판정 기준(가벼운 규칙 기반, docs/news-ranking-quality-plan.md 개선4/5):
@@ -213,12 +234,18 @@ def compute_article_relevance(keyword: str, article: Dict) -> Dict:
     - title에 keyword 없고 description에만 등장 → snippet_only_incidental_mention(낮은 점수)
     - title/description에 incidental 마커가 keyword 근처에 있음 → incidental_giveaway_mention(낮은 점수)
     - 그 외 title에 keyword 있으나 마커도 있음 → 마커 우선(낮은 점수)
+
+    require_all_tokens(phrase 후보 전용, Codex 계획 리뷰 P1): 다어절 phrase 후보는
+    토큰 하나만 title에 있어도 0.9가 되는 기존 판정으로는 일부 토큰만 겹치는 기사로
+    quality gate를 통과할 수 있다. True면 keyword의 모든 토큰이 존재해야 등장으로
+    인정한다(기존 seed/aux 후보는 기본값 False — 동작 불변).
     """
     title = article.get("title") or ""
     snippet = article.get("snippet") or ""
 
-    in_title = _has_keyword_token(keyword, title)
-    in_desc = _has_keyword_token(keyword, snippet)
+    _matcher = _has_all_keyword_tokens if require_all_tokens else _has_keyword_token
+    in_title = _matcher(keyword, title)
+    in_desc = _matcher(keyword, snippet)
     # marker가 keyword와 근접(_INCIDENTAL_PROXIMITY_CHARS 이내)할 때만 incidental로
     # 낮춘다(keyword-relative 판정). 같은 기사라도 keyword마다 marker와의 거리가
     # 다르므로("한국투자증권"은 멀고 "선풍기"는 가까움), 별도 절 구분 없이 순수
@@ -259,14 +286,14 @@ def compute_article_relevance(keyword: str, article: Dict) -> Dict:
     return {"relevance_score": 0.2, "relevance_reason": "snippet_only_incidental_mention", "is_incidental": True}
 
 
-def score_articles_relevance(keyword: str, articles: List[Dict]) -> List[Dict]:
+def score_articles_relevance(keyword: str, articles: List[Dict], require_all_tokens: bool = False) -> List[Dict]:
     """articles 각 원소에 relevance_score/relevance_reason/is_incidental 필드를 부여한 복사본 반환.
 
     relevance_score 내림차순 정렬(동점이면 원 순서 유지 — stable sort).
     """
     scored = []
     for a in articles:
-        rel = compute_article_relevance(keyword, a)
+        rel = compute_article_relevance(keyword, a, require_all_tokens=require_all_tokens)
         merged = dict(a)
         merged.update(rel)
         scored.append(merged)
@@ -391,8 +418,13 @@ def collect_candidates(
     google_candidates: List[dict],
     aux_keywords: List[str],
     limit: int = CANDIDATE_MAX,
+    phrase_keywords: Optional[List[str]] = None,
 ) -> List[dict]:
-    """여러 소스 후보를 병합/dedup → [{keyword, sources:{...}}] (상한 적용)."""
+    """여러 소스 후보를 병합/dedup → [{keyword, sources:{...}}] (상한 적용).
+
+    phrase_keywords: backfill pass 전용 phrase 후보(derive_phrase_candidates 결과).
+    strict pass(pass1) 호출부는 인자를 생략하면 기존과 동일하게 동작한다.
+    """
     pool: Dict[str, dict] = {}
     for item in daum_ranked or []:
         _merge(pool, item.get("keyword"), "daum", item.get("rank"))
@@ -402,6 +434,8 @@ def collect_candidates(
         _merge(pool, item.get("keyword"), "google", item.get("rank"))
     for kw in aux_keywords or []:
         _merge(pool, kw, "aux", None)
+    for kw in phrase_keywords or []:
+        _merge(pool, kw, "phrase", None)
 
     candidates = list(pool.values())
     # daum rank 우선 정렬(후보 안정성). 최종 순위는 ranker가 결정.
@@ -411,7 +445,9 @@ def collect_candidates(
 
 # Daum 파생/종속 소스 — 다양성 카운트에서 제외.
 #   aux 는 Daum 상위 키워드의 뉴스 title 토큰에서 파생되므로 독립 소스가 아니다.
-_DAUM_DEPENDENT_SOURCES = {"daum", "aux"}
+#   phrase 는 seed 후보들의 뉴스 기사에서 파생되므로 마찬가지로 독립 소스가 아니다
+#   (Codex 계획 리뷰 P1: phrase가 non-daum으로 계산되면 다양성 hard guard가 우회됨).
+_DAUM_DEPENDENT_SOURCES = {"daum", "aux", "phrase"}
 
 
 def count_non_daum(candidates: List[dict]) -> int:
@@ -465,7 +501,7 @@ def _age_hours(published_at: Optional[str]) -> Optional[float]:
     return age if age >= 0 else None
 
 
-def compute_news_signal(keyword: str, raw_items: List[dict]) -> Optional[dict]:
+def compute_news_signal(keyword: str, raw_items: List[dict], require_all_tokens: bool = False) -> Optional[dict]:
     """키워드별 News 신호 산출(normalizer 파생). 유효 기사 없으면 None.
 
     반환: {recent_count, latest_age_hours, domain_diversity, title_relevance, articles,
@@ -505,7 +541,7 @@ def compute_news_signal(keyword: str, raw_items: List[dict]) -> Optional[dict]:
                 recent_count += 1
 
     # relevance 산출(개선4/5) → articles는 relevance 내림차순으로 재배열됨
-    scored_articles = score_articles_relevance(keyword, normalized)
+    scored_articles = score_articles_relevance(keyword, normalized, require_all_tokens=require_all_tokens)
 
     # clustering(개선2) → primary cluster 기준 representative 선택
     clusters = cluster_articles(scored_articles)
@@ -578,11 +614,104 @@ def build_news_signals(
     candidates: List[dict],
     fetch_news: Callable[[str], List[dict]],
 ) -> Dict[str, dict]:
-    """후보별 News 신호맵 + normalized articles 보관."""
+    """후보별 News 신호맵 + normalized articles 보관.
+
+    phrase 후보(sources에 "phrase")는 strict relevance(require_all_tokens)로 산출한다 —
+    다어절 phrase가 일부 토큰만 겹치는 기사로 quality gate를 통과하는 것을 방지
+    (Codex 계획 리뷰 P1). seed/aux 후보는 기존 판정 그대로.
+    """
     out = {}
     for c in candidates:
         kw = c["keyword"]
-        sig = compute_news_signal(kw, fetch_news(kw))
+        strict = bool((c.get("sources") or {}).get("phrase"))
+        sig = compute_news_signal(kw, fetch_news(kw), require_all_tokens=strict)
         if sig:
             out[kw] = sig
+    return out
+
+
+def _is_phrase_source_article(article: Dict) -> bool:
+    """phrase 후보 발굴 원천으로 쓸 수 있는 기사인지(Codex 계획 리뷰 P2 반영).
+
+    - incidental/side-mention/keyword_not_found 기사 배제(부수 언급에서 phrase가
+      만들어지는 것을 차단 — ranker._is_same_issue_evidence_article와 동일 기준).
+    - published_at 파싱 가능 + FRESH_RELEVANCE_HOURS 이내 기사만(오래된 기사 기반
+      phrase 배제 — 최근성을 증명 못 하면 보수적으로 제외).
+    """
+    reason = article.get("relevance_reason")
+    if reason in ("incidental_giveaway_mention", "keyword_not_found", "object_side_mention"):
+        return False
+    if reason is None and article.get("is_incidental"):
+        return False
+    age = _age_hours(article.get("published_at"))
+    if age is None or age > FRESH_RELEVANCE_HOURS:
+        return False
+    return True
+
+
+def derive_phrase_candidates(
+    news_signals: Dict[str, dict],
+    existing_keywords: List[str],
+    phrase_max: int = PHRASE_MAX,
+) -> List[str]:
+    """backfill pass 전용: 이미 수집된 뉴스 기사 title에서 사건형 phrase 후보 추출.
+
+    signal.bz류 "뉴스 title 기반 이슈 phrase"를 경량으로 근사한다(형태소 분석 없음,
+    추가 API 호출 없음 — pass1에서 fetch한 news_signals의 기사만 사용).
+
+    추출/채택 조건:
+    - 원천 기사: _is_phrase_source_article 통과분만. URL 기준 dedupe(같은 기사가 여러
+      keyword 신호에 중복 등장해 DF를 부풀리는 것 방지). 경품/판촉 마커가 title에
+      있으면 그 title 전체를 원천에서 제외.
+    - title 토큰의 연속 n-gram(PHRASE_NGRAM_MIN~MAX어절). 숫자 단독 토큰 포함 배제.
+    - 서로 다른 기사 PHRASE_MIN_DF건 이상에서 등장(단일 기사 파편 배제).
+    - generic-only 조합 배제(ranker._is_generic_only_display 재사용 — "수사"/"신임
+      발표" 같은 일반 서술어만의 phrase 금지).
+    - existing_keywords(pass1 랭킹 생존 keyword)와 유사(_is_similar_keyword)하면 배제 —
+      생존 이슈의 변형 표기는 어차피 same-issue merge로 흡수되므로 재발굴 불필요.
+      gate에서 탈락한 seed의 phrase 확장형은 배제하지 않는다(정밀한 phrase 검색으로
+      통과할 새 기회 — backfill의 핵심 발굴 경로).
+    - DF 내림차순, 동률이면 더 긴(구체적) phrase 우선. 이미 채택된 phrase와 유사하면
+      skip(겹치는 n-gram 파편 정리). 상한 phrase_max.
+    """
+    from news.ranker import _is_generic_only_display, _is_similar_keyword
+
+    source_articles: Dict[str, Dict] = {}
+    for sig in (news_signals or {}).values():
+        for a in sig.get("articles") or []:
+            if not _is_phrase_source_article(a):
+                continue
+            key = a.get("url") or a.get("title")
+            if key and key not in source_articles:
+                source_articles[key] = a
+
+    df: Dict[str, set] = {}
+    for key, a in source_articles.items():
+        title = a.get("title") or ""
+        if any(m in title for m in _INCIDENTAL_MARKERS_STRONG):
+            continue
+        toks = _tokens(title)
+        for n in range(PHRASE_NGRAM_MIN, PHRASE_NGRAM_MAX + 1):
+            for i in range(len(toks) - n + 1):
+                gram = toks[i:i + n]
+                if any(t.isdigit() for t in gram):
+                    continue
+                phrase = " ".join(gram)
+                df.setdefault(phrase, set()).add(key)
+
+    ranked = sorted(
+        ((p, len(keys)) for p, keys in df.items() if len(keys) >= PHRASE_MIN_DF),
+        key=lambda x: (-x[1], -len(x[0].split()), x[0]),
+    )
+    out: List[str] = []
+    for phrase, _count in ranked:
+        if _is_generic_only_display(phrase):
+            continue
+        if any(_is_similar_keyword(phrase, kw) for kw in existing_keywords or []):
+            continue
+        if any(_is_similar_keyword(phrase, p) for p in out):
+            continue
+        out.append(phrase)
+        if len(out) >= phrase_max:
+            break
     return out
