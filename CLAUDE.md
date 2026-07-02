@@ -3,6 +3,16 @@
 커뮤니티 사이트 인기글을 수집해 Supabase에 저장하는 크롤러.
 GitHub Actions로 주기적 실행.
 
+## 참조 워크플로우
+
+이 프로젝트는 StartHub 서비스의 커뮤니티/키워드/뉴스 크롤러로 운영된다.
+작업 승인, 검증, diff review-only, allowed files stage, commit/push 기준은 StartHub의 워크플로우 문서를 따른다.
+
+- [../StartHub/docs/workflow/ai-workflow.md](../StartHub/docs/workflow/ai-workflow.md)
+- [../StartHub/docs/workflow/ai-workflow-git.md](../StartHub/docs/workflow/ai-workflow-git.md)
+
+단, 운영 DB 마이그레이션, 운영 데이터 삭제/복구, secret/env 변경, 외부 서비스 설정 변경은 별도 사용자 확인 후 진행한다.
+
 ## 트리거 방식 (2026-05-05~)
 
 GitHub Actions 무료 정시 cron 큐 지연 문제(최대 3시간+) 회피를 위해
