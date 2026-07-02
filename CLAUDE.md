@@ -31,10 +31,11 @@ community-trend-crawler/
 │   ├── cook82.py · instiz.py · ygosu.py · natepann.py
 │   └── (fmkorea.py, ddanzi.py — 비활성)
 ├── keywords/            # 검색엔진 실시간 키워드 크롤러
-│   ├── base.py          # BaseKeywordScraper
+│   ├── base.py          # BaseKeywordScraper (active 플래그로 optional/degraded 소스 skip)
 │   ├── danawa.py        # 다나와 인기 키워드 Top 10
 │   ├── daum.py          # 다음 실시간 트렌드 Top 10
-│   └── namuwiki.py      # namu.news SSR 기반 실시간 검색어 Top 10
+│   ├── daangn.py        # 당근마켓 인기 검색어 Top 10 (gnb_popular_keyword 앵커 파싱)
+│   └── namuwiki.py      # 비활성(active=False) — namu.news 서비스 종료, 대체 upstream 없음
 ├── processor/
 │   ├── dedup.py         # URL 기반 중복 제거
 │   ├── filter.py        # 광고/공지/노이즈 필터
@@ -57,7 +58,7 @@ community-trend-crawler/
 | 웃긴대학 | humoruniv | ✅ | |
 | 더쿠 | theqoo | ✅ | og:image |
 | SLR클럽 | slrclub | ✅ | EUC-KR, 자체 이미지 |
-| 오늘의유머 | todayhumor | ✅ | EUC-KR |
+| 오늘의유머 | todayhumor | ⚠️ | EUC-KR. 국내 IP 정상, GH Actions 등 해외 IP에서 403 가능 — 발생 시 source-level skipped, 전체 실패로 안 번짐 |
 | 이토랜드 | etoland | ✅ | `/hit/list` (UTF-8). 리스트 썸네일 우선, 부족 시 og:image 폴백 |
 | 82쿡 | 82cook | ✅ | best_article.php |
 | 인스티즈 | instiz | ✅ | |
@@ -75,7 +76,8 @@ community-trend-crawler/
 |---|---|---|---|
 | 다나와 | danawa | `/dsearch.php?query=best` | `hot_keyword` 섹션 파싱. Vercel은 403 차단되어 GH Actions(한국 친화 IP)로 이관 |
 | 다음 | daum | `/search?w=tot&q=ㄴㄴ` | `list_trend` 내 `data-keyword` 추출 |
-| 나무위키 | namuwiki | `https://namu.news/` | SSR HTML의 `WikiRank` JSON 파싱, 클릭 시 `namu.wiki/Go?q=` |
+| 당근마켓 | daangn | `/kr/buy-sell/` | 헤더 네비 `data-gtm="gnb_popular_keyword"` 앵커 텍스트 파싱. href의 `in={지역코드}`는 요청 IP 기준 지역값이라 저장 URL에서 제거하고 `search=` 파라미터로 재조립 |
+| 나무위키 | namuwiki | (비활성) | `namu.news` 2026-06 서비스 종료(복구 시도 금지). 대안으로 `namu.wiki` 본사이트 우측 "실시간 검색어" 위젯을 검토했으나 raw HTML(SSR)에 미포함 — 클라이언트 JS 렌더링 전용이라 브라우저 크롤링 없이는 수집 불가. `keywords/namuwiki.py`의 `active=False`로 표시, `main.py` run()에서 skip |
 
 ## Supabase DB 스키마
 
@@ -106,11 +108,14 @@ community-trend-crawler/
 - **프론트 조회**: [StartHub/js/community.js](../StartHub/js/community.js)에서 `source_site` 필터 + `score/comments/views` 정렬
 
 ### keyword_cache
-검색엔진 실시간 키워드. `keywords/` 크롤러 3종이 30분 주기로 upsert.
+검색엔진 실시간 키워드. `keywords/` 크롤러가 30분 주기로 upsert.
+`namuwiki`는 2026-07 이후 비활성(source 미실행)이라 신규 upsert가 없음 — 기존 row는
+TTL 없이 남아있는 stale 데이터이므로 `updated_at` 기준으로 최신 여부를 판단해야 함
+(후속 이슈: TTL 미도입).
 
 | 컬럼 | 타입 | 설명 |
 |---|---|---|
-| source | text (PK) | `danawa` / `daum` / `namuwiki` |
+| source | text (PK) | `danawa` / `daum` / `daangn` / (`namuwiki`, 비활성) |
 | keywords | jsonb | `[{keyword, url}, ...]` |
 | updated_at | timestamptz | 마지막 수집 시각 |
 

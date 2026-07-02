@@ -79,6 +79,7 @@ KEYWORD_SCRAPERS = [
 
 def run():
     all_posts = []
+    source_status = {}  # site_id/source -> "ok" | "failed" | "skipped"
 
     for scraper in SCRAPERS:
         logger.info(f"[{scraper.site_id}] 크롤링 시작")
@@ -86,8 +87,13 @@ def run():
             posts = scraper.scrape()
             logger.info(f"[{scraper.site_id}] {len(posts)}건 수집")
             all_posts.extend(posts)
+            # scrape()가 내부에서 예외를 삼키고 빈 리스트를 반환하는 경우(예: todayhumor
+            # 403), scraper.last_status로 failed/skipped를 구분한다. BaseScraper 기반이
+            # 아닌 scraper가 추가돼도 AttributeError 없이 failed로 방어.
+            source_status[scraper.site_id] = "ok" if posts else getattr(scraper, "last_status", "failed")
         except Exception as e:
             logger.error(f"[{scraper.site_id}] 실패: {e}")
+            source_status[scraper.site_id] = "failed"
 
     logger.info(f"총 수집: {len(all_posts)}건")
 
@@ -108,15 +114,32 @@ def run():
 
     # 검색엔진 키워드 수집
     for ks in KEYWORD_SCRAPERS:
+        if not ks.active:
+            logger.info(f"[{ks.source}] 비활성(skipped) — upstream 없음, 크롤링 생략")
+            source_status[ks.source] = "skipped"
+            continue
         logger.info(f"[{ks.source}] 키워드 크롤링 시작")
         try:
             items = ks.scrape()
             if upsert_keywords(ks.source, items):
                 logger.info(f"[{ks.source}] 키워드 {len(items)}개 저장")
+                source_status[ks.source] = "ok"
             else:
                 logger.warning(f"[{ks.source}] 키워드 저장 실패")
+                source_status[ks.source] = "failed"
         except Exception as e:
             logger.error(f"[{ks.source}] 키워드 실패: {e}")
+            source_status[ks.source] = "failed"
+
+    # source별 최종 상태 리포트 — optional/degraded 실패가 전체 실패처럼 보이지 않도록
+    # active(ok/failed)와 skipped를 분리 표시. 판단 자체는 개별 except에서 이미 격리됨.
+    ok = [s for s, v in source_status.items() if v == "ok"]
+    failed = [s for s, v in source_status.items() if v == "failed"]
+    skipped = [s for s, v in source_status.items() if v == "skipped"]
+    logger.info(
+        f"[source 상태] ok={len(ok)} failed={len(failed)} skipped={len(skipped)} "
+        f"| failed={failed} skipped={skipped}"
+    )
 
     # 실시간 이슈 브리핑 (P0-2) — 실패해도 위 커뮤니티/키워드 수집 결과에 영향 없도록 격리
     run_news_briefing()

@@ -16,9 +16,11 @@ class TodayhumorScraper(BaseScraper):
 
     def scrape(self) -> List[Post]:
         posts = []
+        self.last_status = "failed"
         try:
             content = self.fetch_bytes(
-                f"{BASE_URL}/board/list.php?table=bestofbest"
+                f"{BASE_URL}/board/list.php?table=bestofbest",
+                referer=f"{BASE_URL}/",
             )
             soup = BeautifulSoup(content, "html.parser")
 
@@ -58,7 +60,14 @@ class TodayhumorScraper(BaseScraper):
                 ))
 
         except Exception as e:
-            logger.error(f"[todayhumor] 스크래핑 실패: {e}")
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status == 403:
+                # 로컬(국내 IP)에서는 정상 응답 확인됨 — GH Actions 등 해외 IP 대역
+                # 차단으로 추정. 소스 자체는 살아있어 제거하지 않고 skipped로만 기록.
+                logger.warning(f"[todayhumor] 403 skipped(지역/IP 차단 추정, source 유지): {e}")
+                self.last_status = "skipped"
+            else:
+                logger.error(f"[todayhumor] 스크래핑 실패: {e}")
 
         return posts
 

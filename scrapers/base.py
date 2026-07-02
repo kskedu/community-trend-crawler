@@ -16,6 +16,9 @@ class BaseScraper(ABC):
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
+        # scrape() 내부에서 예외를 삼키고 빈 리스트를 반환하는 경우, 이 값으로
+        # main.py가 failed/skipped를 구분한다. 기본 "failed" — skipped는 scraper가 직접 설정.
+        self.last_status = "failed"
 
     def fetch(self, url: str) -> str:
         for attempt in range(RETRY_COUNT):
@@ -30,12 +33,13 @@ class BaseScraper(ABC):
                     raise
         return ""
 
-    def fetch_bytes(self, url: str) -> bytes:
+    def fetch_bytes(self, url: str, referer: str = None) -> bytes:
         """인코딩 자동 감지가 필요한 사이트용 (EUC-KR 등)"""
+        headers = {"Referer": referer} if referer else {}
         for attempt in range(RETRY_COUNT):
             try:
                 time.sleep(REQUEST_DELAY)
-                resp = self.session.get(url, timeout=REQUEST_TIMEOUT)
+                resp = self.session.get(url, timeout=REQUEST_TIMEOUT, headers=headers)
                 resp.raise_for_status()
                 return resp.content
             except Exception as e:
