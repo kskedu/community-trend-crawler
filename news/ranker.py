@@ -427,7 +427,18 @@ def _is_same_issue_evidence_article(article: Dict) -> bool:
 # STOPWORDS 확장(1차 시도)은 "발표"/"내용" 같은 단어가 끝없이 늘어나는 유지보수
 # 문제가 있었다(Codex review-only 지적). 이 블랙리스트는 same-issue 최종 게이트
 # (_is_same_issue)에서만 좁게 쓰여 다른 로직(요약/dedupe)에는 영향을 주지 않는다.
-_GENERIC_EVENT_PREDICATE_WORDS = {"발표", "오늘", "내용", "관련", "예정", "공개", "진행"}
+#
+# "정치/국회/선거" 맥락(국조특위/개표소 등)과 "범죄/수사/인물 사건" 맥락(경찰/검찰/
+# 진입 등)이 일반 사건 단어만 겹쳐 오탐 merge되는 문제(운영 반영 후속: "국조특위
+# 개표소 진입"과 "장윤기 사건"이 "사건" 한 단어만으로 anchor 조건을 통과해 잘못
+# 병합됨)를 막기 위해 확장한다. "국조특위"는 토크나이저(_TOKEN_RE, summarizer.py)가
+# 형태소 분석 없이 정규식으로만 토큰화하므로 "국조"/"특위"로 자동 분리되지 않아
+# 복합어 형태 그대로도 등록한다(Codex review-only 지적).
+_GENERIC_EVENT_PREDICATE_WORDS = {
+    "발표", "오늘", "내용", "관련", "예정", "공개", "진행",
+    "사건", "경찰", "검찰", "감찰", "증거", "진입", "논란", "수사",
+    "의혹", "확인", "폐기", "충돌", "국조", "특위", "국조특위",
+}
 
 
 def _count_same_issue_evidence_articles(articles: List[Dict]) -> int:
@@ -478,14 +489,25 @@ def _tokens_of(article: Dict) -> List[str]:
 
 
 def _keyword_anchor_tokens(item: Dict) -> set:
-    """item의 keyword 자체를 토큰화한 집합(2자 이상). same-issue merge의 precision
-    게이트로 쓴다 — "정부 오늘 새 정책 발표" vs "기업 오늘 실적 발표"처럼 사건 자체가
-    다른데 흔한 서술어만 겹치는 경우, 상대 keyword가 서로의 기사/키워드에 전혀
-    등장하지 않으므로 이 게이트에서 막힌다.
+    """item의 keyword 자체를 토큰화한 집합(2자 이상) 중 일반 사건/정치 단어
+    (_GENERIC_EVENT_PREDICATE_WORDS)를 제외한 고유명사성 anchor만 반환한다.
+    same-issue merge의 precision 게이트로 쓴다.
+
+    - "정부 오늘 새 정책 발표" vs "기업 오늘 실적 발표"처럼 사건 자체가 다른데
+      흔한 서술어만 겹치는 경우, 상대 keyword가 서로의 기사/키워드에 전혀
+      등장하지 않으므로 이 게이트에서 막힌다.
+    - "장윤기 사건"처럼 keyword 자체에 일반 사건 단어("사건")가 포함된 경우, 그
+      단어를 anchor 후보에서 제외해야 한다(운영 반영 후속: "사건"이 anchor로
+      인정되면 "국조특위 개표소 진입" 그룹 기사에 "사건"이라는 흔한 단어만
+      등장해도 anchor 교차 조건을 통과해 서로 다른 이슈가 병합됨). anchor는
+      "장윤기"처럼 그 이슈에 고유한 토큰으로만 좁혀야 한다.
     """
     from news.summarizer import _tokens
 
-    return {t for t in _tokens(item.get("keyword", "")) if len(t) >= 2}
+    return {
+        t for t in _tokens(item.get("keyword", ""))
+        if len(t) >= 2 and t not in _GENERIC_EVENT_PREDICATE_WORDS
+    }
 
 
 def _has_cross_keyword_anchor(item_a: Dict, item_b: Dict, shared_tokens: set) -> bool:

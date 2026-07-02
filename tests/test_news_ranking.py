@@ -860,6 +860,106 @@ class TestSameIssueMerge(unittest.TestCase):
         merged = ranker.dedupe_and_merge(ranked)
         self.assertEqual(len(merged), 2)  # anchor 없이 서술어만 겹침 → merge 안 됨
 
+    def test_politics_and_crime_context_not_merged_by_generic_words(self):
+        # 실측 재현: "국조특위 개표소 진입"(정치/국회 맥락)과 "장윤기 사건"(범죄/수사
+        # 맥락)이 "사건"/"경찰"/"진입"/"국조특위" 같은 일반 단어만 겹쳐 오탐 merge됐다.
+        # 두 그룹은 실제로 무관한 이슈이므로 merge되면 안 되고, display_keyword도
+        # 서로의 keyword를 조합해서는 안 된다.
+        a_articles = [
+            _article("국조특위, 개표소 강제 진입 논란...여야 충돌", "https://x.com/gukjo-a1",
+                     "국조특위 위원들이 개표소에 진입하는 과정에서 여야 의원 간 충돌이 벌어졌다."),
+            _article("국조특위 개표소 진입 두고 여야 공방", "https://x.com/gukjo-a2",
+                     "국조특위의 개표소 진입 절차를 두고 여야가 서로 책임을 미루며 공방을 벌였다."),
+        ]
+        b_articles = [
+            _article("장윤기 사건 재수사...경찰 진입 당시 정황 확인", "https://x.com/jangyk-b1",
+                     "경찰이 장윤기 사건 현장에 진입한 당시 정황을 다시 확인하고 있다고 밝혔다."),
+            _article("장윤기 사건, 검찰 추가 수사 착수", "https://x.com/jangyk-b2",
+                     "검찰은 장윤기 사건과 관련한 의혹을 확인하기 위해 추가 수사에 착수했다."),
+        ]
+        self.assertLess(ranker._article_overlap(a_articles, b_articles), ranker.MERGE_ARTICLE_OVERLAP_THRESHOLD)
+
+        ranked = [
+            self._ranked_with_articles("국조특위 개표소 진입", 0.9, a_articles),
+            self._ranked_with_articles("장윤기 사건", 0.7, b_articles),
+        ]
+        merged = ranker.dedupe_and_merge(ranked)
+        self.assertEqual(len(merged), 2)  # 서로 다른 이슈 → merge 금지
+
+        display_keywords = {m["display_keyword"] for m in merged}
+        self.assertIn("국조특위 개표소 진입", display_keywords)
+        self.assertIn("장윤기 사건", display_keywords)
+        # 두 keyword가 하나로 조합된 display_keyword가 나오면 안 됨
+        for d in display_keywords:
+            self.assertFalse("국조특위" in d and "장윤기" in d)
+
+    def test_keyword_anchor_tokens_excludes_generic_event_words(self):
+        # _keyword_anchor_tokens()가 일반 사건 단어를 anchor 후보에서 실제로 제외하는지
+        # 직접 고정한다(Codex review-only P3: 통합 테스트만으로는 blacklist의 앞단 게이트
+        # (shared - _GENERIC_EVENT_PREDICATE_WORDS)와 anchor 제외 로직을 구분해 검증하지
+        # 못함).
+        item = {"keyword": "장윤기 사건"}
+        self.assertEqual(ranker._keyword_anchor_tokens(item), {"장윤기"})
+
+    def test_non_generic_shared_token_but_no_real_anchor_not_merged(self):
+        # shared token 중 비-일반 단어(앞단 게이트 통과)가 하나 있어도, 그 토큰이 두
+        # keyword 중 어느 쪽의 anchor도 아니고 상대 article 그룹에도 keyword anchor가
+        # 등장하지 않으면 merge되면 안 된다 — _GENERIC_EVENT_PREDICATE_WORDS 확장(첫
+        # 번째 게이트) 만으로는 이 케이스를 막지 못하고, _keyword_anchor_tokens()의
+        # anchor 제외가 실제로 cross anchor 판정에 관여해야 막힌다.
+        a_articles = [
+            _article("국조특위, 개표소 강제 진입 논란...국회 파행", "https://x.com/anchor-a1",
+                     "국조특위 위원들이 개표소에 진입하며 국회가 파행을 겪었다."),
+            _article("국조특위 개표소 진입 두고 여야 파행", "https://x.com/anchor-a2",
+                     "국조특위의 개표소 진입 절차를 두고 여야가 파행을 겪었다."),
+        ]
+        b_articles = [
+            _article("장윤기 사건 재수사...국회 국정감사 파행 우려", "https://x.com/anchor-b1",
+                     "장윤기 사건 여파로 국회 국정감사가 파행을 겪을 수 있다는 우려가 나왔다."),
+            _article("장윤기 사건, 국회서도 파행 공방", "https://x.com/anchor-b2",
+                     "장윤기 사건을 두고 국회에서도 파행 책임 공방이 벌어졌다."),
+        ]
+        self.assertLess(ranker._article_overlap(a_articles, b_articles), ranker.MERGE_ARTICLE_OVERLAP_THRESHOLD)
+        shared = ranker._representative_overlap(
+            self._ranked_with_articles("국조특위 개표소 진입", 0.9, a_articles),
+            self._ranked_with_articles("장윤기 사건", 0.7, b_articles),
+        )
+        # "파행"이 비-일반 단어로 앞단 게이트(shared - _GENERIC_EVENT_PREDICATE_WORDS)는
+        # 통과하지만, 두 keyword("국조특위 개표소 진입"/"장윤기 사건")의 실제 anchor와는
+        # 무관하므로 cross anchor 게이트에서 최종 차단돼야 한다.
+        self.assertTrue(shared - ranker._GENERIC_EVENT_PREDICATE_WORDS)
+
+        ranked = [
+            self._ranked_with_articles("국조특위 개표소 진입", 0.9, a_articles),
+            self._ranked_with_articles("장윤기 사건", 0.7, b_articles),
+        ]
+        merged = ranker.dedupe_and_merge(ranked)
+        self.assertEqual(len(merged), 2)  # anchor 없는 우연한 공통어만으로는 merge 금지
+
+    def test_only_generic_incident_words_shared_not_merged(self):
+        # "경찰"/"사건"/"증거"/"진입" 같은 일반 사건 단어만 반복 등장하고, 실제
+        # 이슈를 특정하는 고유명사 anchor가 서로 겹치지 않으면 merge하지 않는다.
+        a_articles = [
+            _article("서울 강남 사건 현장서 경찰 증거 확보", "https://x.com/generic-a1",
+                     "경찰이 사건 현장에 진입해 증거를 확보했다고 밝혔다."),
+            _article("경찰, 사건 관련 증거 추가 확보", "https://x.com/generic-a2",
+                     "경찰은 이번 사건과 관련한 증거를 추가로 확보했다고 전했다."),
+        ]
+        b_articles = [
+            _article("부산 해운대 사건 현장 경찰 진입", "https://x.com/generic-b1",
+                     "경찰이 사건 현장에 진입해 초동 수사를 벌였다."),
+            _article("경찰, 사건 증거 국과수 감정 의뢰", "https://x.com/generic-b2",
+                     "경찰은 확보한 증거를 국립과학수사연구원에 감정 의뢰했다고 밝혔다."),
+        ]
+        self.assertLess(ranker._article_overlap(a_articles, b_articles), ranker.MERGE_ARTICLE_OVERLAP_THRESHOLD)
+
+        ranked = [
+            self._ranked_with_articles("강남 사건", 0.9, a_articles),
+            self._ranked_with_articles("해운대 사건", 0.7, b_articles),
+        ]
+        merged = ranker.dedupe_and_merge(ranked)
+        self.assertEqual(len(merged), 2)  # 일반 사건 단어만 겹침 → merge 금지
+
 
 class TestArticleDisplayFilter(unittest.TestCase):
     """개선 2: incidental/저관련 기사를 상세 articles에서 기본 제외."""
