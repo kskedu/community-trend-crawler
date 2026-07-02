@@ -135,14 +135,45 @@ def compute_scores(candidates: List[Dict], signals: Dict[str, Dict]) -> List[Dic
     if not keywords:
         return []
 
-    # --- 가용 신호 판정 (소스 단위) ---
     news_map = signals.get("news") or {}
     datalab_map = signals.get("datalab") or {}
     google_map = signals.get("google") or {}
     daum_map = signals.get("daum") or {}
 
+    # --- keyword-level quality gate (범위 한정: 이번에 새로 추가하는 gate 대상만 정규화
+    # 이전에 제외한다. "news 신호 자체가 없는 후보"가 rc_raw/delta_raw/g_raw/d_raw 등
+    # 정규화 입력에 섞였다가 메인 루프 사후 continue로만 걸러지는 기존 구조(290163d 이전
+    # 부터 존재)는 이번 스코프 밖으로 분리하고 후속 이슈로 남긴다 — compute_scores()
+    # 정규화 파이프라인 전체 재작성은 이번 작업 범위가 아니다(사용자 승인).
+    #
+    # quality gate 조건: 고관련 기사(candidates.HIGH_RELEVANCE_THRESHOLD 이상)가 2건 미만
+    # 이고 quality_cluster_size(고관련 기사만의 primary cluster 크기)도 2 미만이면, 그
+    # keyword는 관련 기사가 사실상 없는 것으로 보고 후보에서 완전히 제외한다(감점이 아니라
+    # hard exclude — 감점만으로는 score가 높은 다른 신호 덕에 여전히 Top10에 남을 수 있음).
+    #
+    # news_available_before_gate를 quality gate 필터링 *이전*에 원본 keywords 기준으로
+    # 먼저 확정한다(Codex review-only P1: quality gate로 news 있는 후보가 전부 걸러지면
+    # available["news"] 판정 자체가 꺼져, 이후 news-required 최종 제외(메인 루프의
+    # "if 'news' in available and not news_map.get(k): continue")도 무력화되고 datalab/
+    # google/daum만으로 결과에 들어오는 새로운 회귀가 생긴다).
+    news_available_before_gate = any(news_map.get(k) for k in keywords)
+
+    def _passes_keyword_quality_gate(news_meta: Dict) -> bool:
+        hrc = news_meta.get("high_relevance_count", 0)
+        qcs = news_meta.get("quality_cluster_size", 0)
+        return hrc >= 2 or qcs >= 2
+
+    candidates = [
+        c for c in candidates
+        if news_map.get(c["keyword"]) is None or _passes_keyword_quality_gate(news_map.get(c["keyword"]))
+    ]
+    keywords = [c["keyword"] for c in candidates]
+    if not keywords:
+        return []
+
+    # --- 가용 신호 판정 (소스 단위) ---
     available = {}
-    if any(news_map.get(k) for k in keywords):
+    if news_available_before_gate:
         available["news"] = WEIGHTS["news"]
     if any(datalab_map.get(k) for k in keywords):
         available["datalab"] = WEIGHTS["datalab"]
@@ -315,19 +346,23 @@ def _article_overlap(articles_a: List[Dict], articles_b: List[Dict]) -> float:
     """두 keyword의 대표 기사 묶음 간 overlap(0~1). URL 일치 우선, 없으면 article-level
     pairwise 최댓값(title/snippet token Jaccard).
 
-    incidental mention 기사(candidates.compute_article_relevance가 is_incidental=True로
-    판정한 부수 언급/판촉/증정 기사)는 비교 대상에서 제외한다(Codex diff 리뷰 P2:
-    "선풍기 증정" 같은 부수 언급 기사가 다른 후보와 URL/문구를 공유한다는 이유만으로
-    same-issue merge되면, article relevance 필터링(개선4/5)의 설계 의도와 충돌한다 —
-    부수 언급은애초에 "그 키워드의 핵심 이슈"가 아니므로 이슈 동일성 판정 근거가 될 수 없다).
+    incidental/side-mention 기사(candidates.compute_article_relevance가 is_incidental=True로
+    판정한 부수 언급/판촉/증정 기사, 또는 object_side_mention으로 판정한 조치 대상 물품
+    언급 기사)는 비교 대상에서 제외한다(Codex diff 리뷰 P2: "선풍기 증정" 같은 부수 언급
+    기사가 다른 후보와 URL/문구를 공유한다는 이유만으로 same-issue merge되면, article
+    relevance 필터링(개선4/5)의 설계 의도와 충돌한다 — 부수 언급은애초에 "그 키워드의
+    핵심 이슈"가 아니므로 이슈 동일성 판정 근거가 될 수 없다. object_side_mention은
+    is_incidental=False이지만 같은 이유로 근거에서 제외해야 한다 — Codex review-only P1:
+    "노트북 회수" 기사가 URL/token overlap으로 다른 keyword와 merge되는 것을 방지 —
+    아래서 _is_same_issue_evidence_article()로 판정 기준을 통일한다).
 
     기사들을 하나의 token union으로 합쳐서 비교하지 않는다(이전 리뷰 P2 재발 방지: 한
     키워드가 무관 기사를 여러 건 가지고 있으면 union이 커져, 실제로 겹치는 기사 쌍이
     있어도 전체 Jaccard가 희석돼 놓칠 수 있었음). 대신 A의 기사 하나하나를 B의 기사
     하나하나와 짝지어 비교해 가장 높은 pair의 overlap을 채택한다.
     """
-    relevant_a = [a for a in (articles_a or []) if not a.get("is_incidental")]
-    relevant_b = [b for b in (articles_b or []) if not b.get("is_incidental")]
+    relevant_a = [a for a in (articles_a or []) if _is_same_issue_evidence_article(a)]
+    relevant_b = [b for b in (articles_b or []) if _is_same_issue_evidence_article(b)]
 
     urls_a = {a.get("url") for a in relevant_a if a.get("url")}
     urls_b = {b.get("url") for b in relevant_b if b.get("url")}
@@ -373,7 +408,7 @@ def _is_same_issue_evidence_article(article: Dict) -> bool:
     (Codex review-only 조언: relevance_reason별 세분화, keyword_not_found도 근거 배제).
     """
     reason = article.get("relevance_reason")
-    if reason in ("incidental_giveaway_mention", "keyword_not_found"):
+    if reason in ("incidental_giveaway_mention", "keyword_not_found", "object_side_mention"):
         return False
     # relevance_reason이 없는 경우(구버전 데이터/방어적 기본값)는 is_incidental 플래그만으로
     # 판단 — 세분화된 사유를 알 수 없으면 보수적으로 근거에서 제외한다.

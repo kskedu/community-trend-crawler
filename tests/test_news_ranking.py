@@ -22,7 +22,12 @@ from news.builder import build_ranked_issues, build_ranked_entry
 from news.movement import apply_movement
 
 
-def _news(recent_count, age, diversity, relevance, articles=None):
+def _news(recent_count, age, diversity, relevance, articles=None,
+          high_relevance_count=2, quality_cluster_size=2):
+    # high_relevance_count/quality_cluster_size 기본값은 keyword-level quality gate
+    # (ranker._passes_keyword_quality_gate)를 통과하도록 채운다 — 이 헬퍼를 쓰는 기존
+    # 테스트들은 quality gate 자체가 아니라 score/penalty/정규화 로직을 검증 대상으로
+    # 하므로, 신규 gate 때문에 무관하게 회귀하지 않아야 한다.
     return {
         "recent_count": recent_count,
         "latest_age_hours": age,
@@ -30,6 +35,8 @@ def _news(recent_count, age, diversity, relevance, articles=None):
         "title_relevance": relevance,
         "articles": articles or [{"title": "t", "url": "https://x.com/a", "snippet": "s",
                                   "press": "x", "published_at": None, "thumbnail": None}],
+        "high_relevance_count": high_relevance_count,
+        "quality_cluster_size": quality_cluster_size,
     }
 
 
@@ -898,6 +905,154 @@ class TestArticleDisplayFilter(unittest.TestCase):
         primary = cand.select_primary_cluster(clusters)
         rep = cand.select_representative(primary)
         self.assertIsNone(rep)  # incidental만 있으면 대표 없음
+
+
+class TestKeywordQualityGate(unittest.TestCase):
+    """운영 반영(290163d) 후속: article-level 필터는 통과했지만 keyword 자체가 Top10에
+    남을 자격이 있는지 판단하는 gate."""
+
+    def _fan_articles(self):
+        # 실측 재현: "선풍기" 상세 기사 5건 전부 incidental(경품/비유/무관 문맥).
+        return [
+            _article("폭염 속 독특한 패션쇼?…\"대박\" 시선 집중", "https://x.com/fan1",
+                     "마치 입는 선풍기, 입는 에어컨을 연상시키는 모습으로 관객들의 시선을 사로잡았습니다."),
+            _article("[컨슈머리뷰] 손품 팔던 쇼핑은 끝났다", "https://x.com/fan2",
+                     "\"3만 원대 선풍기 중에 분홍색이나 파란색 제품 있어?\" AI 쇼핑 에이전트에게 물었다."),
+            _article("큰손들의 기업금융, 개인 계좌로 내려와", "https://x.com/fan3",
+                     "1억원 이상 가입 고객 중 2명에게는 다이슨 쿨 선풍기를 증정한다."),
+        ]
+
+    def test_all_incidental_keyword_excluded_from_candidates(self):
+        articles = self._fan_articles()
+        sig = cand.compute_news_signal("선풍기", articles)
+        self.assertEqual(sig["high_relevance_count"], 0)
+        self.assertEqual(sig["quality_cluster_size"], 0)
+
+        candidates = [{"keyword": "선풍기", "sources": {"daum": 1}}]
+        signals = {"news": {"선풍기": sig}, "datalab": {}, "google": {}, "daum": {"선풍기": 1}}
+        ranked = ranker.compute_scores(candidates, signals)
+        self.assertEqual(ranked, [])  # quality gate 미달 → 후보에서 완전히 제외
+
+    def test_quality_gate_does_not_use_backfilled_count(self):
+        # filter_articles_for_display로 5건까지 보충돼도, quality 집계는 보충 이전
+        # (원본 scored_articles) 기준이어야 한다.
+        articles = self._fan_articles()
+        sig = cand.compute_news_signal("선풍기", articles)
+        filtered = cand.filter_articles_for_display(sig["articles"], min_count=5)
+        self.assertEqual(len(filtered), 3)  # 보충 대상 자체가 3건뿐(min_count 미만이어도 그대로)
+        # 보충 여부와 무관하게 quality 집계는 여전히 0
+        self.assertEqual(sig["high_relevance_count"], 0)
+        self.assertEqual(sig["quality_cluster_size"], 0)
+
+    def test_high_relevance_keyword_passes_gate(self):
+        good_articles = [
+            _article("AI 노트북 시장 성장", "https://x.com/good1", "노트북 수요가 늘고 있다."),
+            _article("신형 노트북 출시", "https://x.com/good2", "새로운 노트북 라인업이 공개됐다."),
+        ]
+        sig = cand.compute_news_signal("노트북", good_articles)
+        self.assertGreaterEqual(sig["high_relevance_count"], 2)
+
+        candidates = [{"keyword": "노트북", "sources": {"daum": 1}}]
+        signals = {"news": {"노트북": sig}, "datalab": {}, "google": {}, "daum": {"노트북": 1}}
+        ranked = ranker.compute_scores(candidates, signals)
+        self.assertEqual(len(ranked), 1)
+
+    def test_newsless_candidate_still_excluded_by_existing_rule(self):
+        # quality gate와 무관하게, 애초에 news 신호가 없는 후보는 기존 규칙대로 제외돼야 한다
+        # (quality gate 도입으로 이 기존 동작이 깨지지 않는지 확인).
+        good_articles = [
+            _article("AI 노트북 시장 성장", "https://x.com/n1"),
+            _article("신형 노트북 출시", "https://x.com/n2"),
+        ]
+        sig = cand.compute_news_signal("노트북", good_articles)
+        candidates = [{"keyword": "노트북", "sources": {"daum": 1}}, {"keyword": "무관", "sources": {"daum": 2}}]
+        signals = {
+            "news": {"노트북": sig},  # "무관"은 news 자체가 없음
+            "datalab": {"무관": {"recent_delta": 2.0}},
+            "google": {}, "daum": {"노트북": 1, "무관": 2},
+        }
+        ranked = ranker.compute_scores(candidates, signals)
+        kws = [r["keyword"] for r in ranked]
+        self.assertIn("노트북", kws)
+        self.assertNotIn("무관", kws)
+
+
+class TestObjectSideMention(unittest.TestCase):
+    """운영 반영(290163d) 후속: keyword가 조치 대상 물품으로만 언급되는 곁가지 기사 필터."""
+
+    def test_recall_context_is_side_mention(self):
+        art = _article(
+            "美 하원 \"韓 정부, 쿠팡 차별적 규정…노트북 회수까지 지시\"",
+            "https://x.com/laptop1",
+            "보고서엔 국정원이 중국 상하이강에 버려진 노트북을 회수하도록 지시하는 등 쿠팡에 과도한 압박을...",
+        )
+        rel = cand.compute_article_relevance("노트북", art)
+        self.assertEqual(rel["relevance_reason"], "object_side_mention")
+        self.assertFalse(rel["is_incidental"])
+        self.assertLess(rel["relevance_score"], cand.HIGH_RELEVANCE_THRESHOLD)
+
+    def test_seizure_and_submission_context_is_side_mention(self):
+        for title in (
+            "검찰, 압수수색으로 노트북 압수",
+            "직원 노트북 제출 요구에 반발",
+            "퇴사자 노트북 반납 절차 안내",
+        ):
+            art = _article(title, "https://x.com/side")
+            rel = cand.compute_article_relevance("노트북", art)
+            self.assertEqual(rel["relevance_reason"], "object_side_mention", msg=title)
+
+    def test_snippet_only_side_mention_also_classified_as_object_side_mention(self):
+        # keyword가 title에는 없고 snippet에만 side-mention 마커와 근접해 등장하는 경우도
+        # object_side_mention으로 분류돼야 same-issue merge 근거에서 제외된다(Codex
+        # review-only P2: in_title 조건에만 걸리면 이 케이스가 snippet_only_incidental_mention
+        # 으로 새어나가 merge 근거로 우회 가능했음).
+        art = _article(
+            "압수수색 확대 논란", "https://x.com/snippet-side",
+            "검찰은 이번 압수수색에서 노트북을 압수했다고 밝혔다.",
+        )
+        rel = cand.compute_article_relevance("노트북", art)
+        self.assertEqual(rel["relevance_reason"], "object_side_mention")
+        self.assertTrue(rel["is_incidental"])
+        self.assertFalse(ranker._is_same_issue_evidence_article(dict(art, **rel)))
+
+    def test_genuine_topic_titles_keep_main_topic(self):
+        for title in (
+            "AI 노트북 시장 성장",
+            "신형 노트북 출시",
+            "노트북 가격 인상",
+            "게이밍 노트북 추천",
+        ):
+            art = _article(title, "https://x.com/main")
+            rel = cand.compute_article_relevance("노트북", art)
+            self.assertEqual(rel["relevance_reason"], "keyword_main_topic", msg=title)
+            self.assertFalse(rel["is_incidental"])
+
+    def test_side_mention_excluded_from_representative(self):
+        articles = [_article(
+            "美 하원 \"韓 정부, 쿠팡 차별적 규정…노트북 회수까지 지시\"",
+            "https://x.com/laptop2",
+            "보고서엔 국정원이 중국 상하이강에 버려진 노트북을 회수하도록 지시하는 등...",
+        )]
+        scored = cand.score_articles_relevance("노트북", articles)
+        clusters = cand.cluster_articles(scored)
+        primary = cand.select_primary_cluster(clusters)
+        rep = cand.select_representative(primary)
+        self.assertIsNone(rep)  # relevance 0.35 < REPRESENTATIVE_MIN_RELEVANCE(0.5) → 대표 없음
+
+    def test_side_mention_not_used_for_same_issue_merge(self):
+        # object_side_mention 기사가 URL을 공유해도 same-issue merge 근거가 되면 안 된다.
+        side_mention_shared = dict(
+            _article("쿠팡, 노트북 회수 논란 확산", "https://x.com/shared-side"),
+            is_incidental=False, relevance_reason="object_side_mention", relevance_score=0.35,
+        )
+        ranked = [
+            {"keyword": "쿠팡", "score": 0.9, "source_breakdown": {"news": 0.9}, "rank_reason": "",
+             "news_meta": {"articles": [side_mention_shared]}, "used_signals": ["news"], "sources": {"daum": 1}},
+            {"keyword": "노트북", "score": 0.5, "source_breakdown": {"news": 0.5}, "rank_reason": "",
+             "news_meta": {"articles": [side_mention_shared]}, "used_signals": ["news"], "sources": {"daum": 2}},
+        ]
+        merged = ranker.dedupe_and_merge(ranked)
+        self.assertEqual(len(merged), 2)  # object_side_mention 기사 공유만으로는 merge 안 됨
 
 
 class TestBuilderRepresentativeFields(unittest.TestCase):

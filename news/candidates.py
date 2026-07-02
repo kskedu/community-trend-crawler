@@ -46,11 +46,24 @@ _INCIDENTAL_MARKERS_STRONG = (
 _INCIDENTAL_MARKERS_PROXIMITY_ONLY = ("이벤트", "제공", "지급")
 _INCIDENTAL_PROXIMITY_CHARS = 15  # marker가 keyword 앞뒤 이 범위 안에 있어야 근접으로 인정
 
+# object/side-mention 판정 마커 — keyword가 기사 핵심 주제가 아니라 "조치 대상 물품/
+# 소지품"으로만 언급되는 문맥(예: "노트북 회수까지 지시" — 실제 주제는 쿠팡-국정원 갈등).
+# 경품/판촉(_INCIDENTAL_MARKERS_*)과는 다른 의미 축이라 별도 상수로 분리한다.
+# "물품"/"장비"/"지급"/"지원"/"전달"/"차원"/"조치"/"대상"은 일반 기사에도 매우 흔해
+# ("노트북 지원 사업", "장비 지원금" 등) 단독으로는 오탐 위험이 커서 제외한다.
+_SIDE_MENTION_MARKERS = ("회수", "압수", "제출", "반납", "수거", "압수수색", "소지품", "대상으로")
+
 # clustering 시 token overlap 임계값(Jaccard). 이 이상이면 같은 클러스터.
 CLUSTER_JACCARD_THRESHOLD = 0.3
 
 # 상세 articles 노출 최소 relevance_score 기준 — 미만이면 기본 제외(filter_articles_for_display).
 LOW_RELEVANCE_ARTICLE_THRESHOLD = 0.3
+
+# keyword-level quality gate: 이 값 이상인 기사만 "고관련"으로 집계(compute_news_signal).
+HIGH_RELEVANCE_THRESHOLD = 0.7
+
+# select_representative()가 대표로 인정하는 최소 relevance_score.
+REPRESENTATIVE_MIN_RELEVANCE = 0.5
 
 
 def _jaccard(a: set, b: set) -> float:
@@ -149,16 +162,21 @@ def _norm_for_loose_compare(s: str) -> str:
     return "".join((s or "").split()).lower()
 
 
-def _has_marker_near_keyword(keyword: str, title: str, snippet: str) -> bool:
-    """incidental 마커가 keyword와 근접(interval distance)하고, keyword가
-    title 첫 절 전체와 일치하는 "완전한 주체"가 아닐 때만 incidental로 인정한다.
+def _has_marker_near_keyword(keyword: str, title: str, snippet: str, markers=None) -> bool:
+    """마커가 keyword와 근접(interval distance)하고, keyword가 title 첫 절 전체와
+    일치하는 "완전한 주체"가 아닐 때만 True를 반환한다.
 
     - keyword == title 첫 절(완전 일치) → marker 존재와 무관하게 항상 주체로
-      보고 incidental 처리하지 않는다(예: "쿠팡, 선풍기 증정 이벤트"의 "쿠팡").
+      보고 incidental/side-mention 처리하지 않는다(예: "쿠팡, 선풍기 증정 이벤트"의 "쿠팡").
     - 그 외(keyword가 첫 절의 일부이거나, 뒤쪽 절에 있거나, 구분자 자체가
       없는 title)에는 marker와의 순수 거리 판정을 적용한다. 짧은 상품명이
       marker와 붙어 있으면(예: "다이슨 선풍기, 증정 이벤트"의 "선풍기") 여전히
       incidental로 낮아진다.
+
+    markers: 판정에 쓸 마커 목록. None이면 기존 경품/판촉 마커
+    (_INCIDENTAL_MARKERS_STRONG + _INCIDENTAL_MARKERS_PROXIMITY_ONLY)를 기본값으로 쓴다
+    (object/side-mention 판정 등 다른 마커 집합 재사용을 위한 일반화 — 기존 호출부는
+    인자를 생략하면 이전과 동일하게 동작).
     """
     if _is_keyword_the_whole_first_clause(keyword, title):
         return False
@@ -170,8 +188,9 @@ def _has_marker_near_keyword(keyword: str, title: str, snippet: str) -> bool:
     if not kw_positions:
         return False
 
-    all_markers = _INCIDENTAL_MARKERS_STRONG + _INCIDENTAL_MARKERS_PROXIMITY_ONLY
-    marker_positions = _marker_positions_in(text_low, all_markers)
+    if markers is None:
+        markers = _INCIDENTAL_MARKERS_STRONG + _INCIDENTAL_MARKERS_PROXIMITY_ONLY
+    marker_positions = _marker_positions_in(text_low, markers)
 
     for m_start, m_end in marker_positions:
         for kw_start, kw_end in kw_positions:
@@ -199,6 +218,10 @@ def compute_article_relevance(keyword: str, article: Dict) -> Dict:
     # 다르므로("한국투자증권"은 멀고 "선풍기"는 가까움), 별도 절 구분 없이 순수
     # 거리 기준만으로 주체/부속물이 자연히 구분된다.
     has_marker = _has_marker_near_keyword(keyword, title, snippet)
+    # object/side-mention: keyword가 기사 핵심 주제가 아니라 "조치 대상 물품"으로만
+    # 언급되는 문맥(예: "노트북 회수까지 지시" — 실제 주제는 쿠팡-국정원 갈등). 경품/판촉
+    # 마커와는 다른 의미 축이므로 별도 마커 목록(_SIDE_MENTION_MARKERS)으로 판정한다.
+    has_side_mention = _has_marker_near_keyword(keyword, title, snippet, markers=_SIDE_MENTION_MARKERS)
 
     if not in_title and not in_desc:
         return {"relevance_score": 0.0, "relevance_reason": "keyword_not_found", "is_incidental": True}
@@ -206,12 +229,27 @@ def compute_article_relevance(keyword: str, article: Dict) -> Dict:
     if in_title and has_marker:
         return {"relevance_score": 0.25, "relevance_reason": "incidental_giveaway_mention", "is_incidental": True}
 
+    if in_title and has_side_mention:
+        # 완전히 무관하지는 않음(keyword가 실제로 언급됨)이나 기사 핵심 주제는 아니므로
+        # is_incidental=True로 두지 않는다(요구사항: incidental과는 다른 신호). 대신
+        # relevance_score를 낮춰 representative 선택/keyword quality gate에서 불리하게
+        # 반영한다(select_representative의 REPRESENTATIVE_MIN_RELEVANCE, ranker의
+        # HIGH_RELEVANCE_THRESHOLD 둘 다 이 값 미만).
+        return {"relevance_score": 0.35, "relevance_reason": "object_side_mention", "is_incidental": False}
+
     if in_title and not has_marker:
         return {"relevance_score": 0.9, "relevance_reason": "keyword_main_topic", "is_incidental": False}
 
     # title에는 없고 description에만 등장
     if has_marker:
         return {"relevance_score": 0.15, "relevance_reason": "incidental_giveaway_mention", "is_incidental": True}
+    if has_side_mention:
+        # title에 keyword가 없어 이미 relevance가 낮지만(0.2 미만), reason을
+        # object_side_mention으로 명시해 _is_same_issue_evidence_article()의 same-issue
+        # merge 근거 배제 대상에도 포함시킨다(Codex review-only P2: in_title 조건에만
+        # 걸리면 snippet-only side-mention 기사가 snippet_only_incidental_mention으로
+        # 분류돼 merge 근거로 남는 우회 경로가 생김).
+        return {"relevance_score": 0.1, "relevance_reason": "object_side_mention", "is_incidental": True}
     return {"relevance_score": 0.2, "relevance_reason": "snippet_only_incidental_mention", "is_incidental": True}
 
 
@@ -306,9 +344,15 @@ def select_representative(primary_cluster: List[Dict]) -> Optional[Dict]:
     """primary cluster 안에서 대표 기사 선택.
 
     - incidental mention 기사는 대표 후보에서 제외.
+    - relevance_score가 REPRESENTATIVE_MIN_RELEVANCE 미만인 기사도 제외한다(object_side_mention
+    (0.35)처럼 is_incidental=False이지만 기사 핵심 주제가 아닌 기사가 대표로 뽑히는 것을 방지 —
+    예: "노트북 회수까지 지시" 기사가 keyword="노트북"의 대표로 선택되던 문제).
     - 남은 기사 중 relevance_score가 가장 높은 기사(동점 시 먼저 나온 기사).
     """
-    candidates_ = [a for a in primary_cluster if not a.get("is_incidental")]
+    candidates_ = [
+        a for a in primary_cluster
+        if not a.get("is_incidental") and a.get("relevance_score", 0.0) >= REPRESENTATIVE_MIN_RELEVANCE
+    ]
     if not candidates_:
         return None
     return max(candidates_, key=lambda a: a.get("relevance_score", 0.0))
@@ -475,6 +519,18 @@ def compute_news_signal(keyword: str, raw_items: List[dict]) -> Optional[dict]:
         if scored_articles else 0.0
     )
 
+    # keyword-level quality gate 집계(고관련 기사 수 / 고관련 기사만의 primary cluster 크기).
+    # filter_articles_for_display()의 min_count 하한 보충 *이전*(원본 scored_articles) 기준
+    # 으로 계산해야 한다 — 하한 보충으로 채워진 결과를 품질 판단 근거로 쓰면 안 되므로
+    # (예: "선풍기"처럼 5건 전부 incidental인 키워드가 보충 로직 덕에 정상처럼 보이는 문제).
+    high_relevance_articles = [
+        a for a in scored_articles if a.get("relevance_score", 0.0) >= HIGH_RELEVANCE_THRESHOLD
+    ]
+    high_relevance_count = len(high_relevance_articles)
+    quality_clusters = cluster_articles(high_relevance_articles)
+    quality_primary = select_primary_cluster(quality_clusters)
+    quality_cluster_size = len(quality_primary)
+
     return {
         "recent_count": recent_count,
         "latest_age_hours": min(ages) if ages else None,
@@ -486,6 +542,8 @@ def compute_news_signal(keyword: str, raw_items: List[dict]) -> Optional[dict]:
         "representative_article": representative,
         "primary_cluster_size": len(primary),
         "topic_coherence": topic_coherence,
+        "high_relevance_count": high_relevance_count,
+        "quality_cluster_size": quality_cluster_size,
     }
 
 
