@@ -53,4 +53,6 @@ jobs:
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
           NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
+          GOOGLE_TRENDS_ENABLED: ${{ vars.GOOGLE_TRENDS_ENABLED || 'false' }}
+          GOOGLE_TRENDS_PROVIDER: ${{ vars.GOOGLE_TRENDS_PROVIDER || 'rss' }}
         run: python main.py "${{ steps.mode.outputs.RUN_MODE }}"
