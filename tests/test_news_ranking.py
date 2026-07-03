@@ -240,40 +240,76 @@ class TestGoogleProvider(unittest.TestCase):
         os.environ["GOOGLE_TRENDS_PROVIDER"] = "rss"
         self.assertTrue(google.is_enabled())
 
+    # 현행 "Trending now" RSS 실응답(geo=KR, 2026-07-03 curl 확인) 축약 fixture.
+    # 실제 스키마 그대로: xmlns:ht=trending/rss, 빈 description/snippet, ht:picture,
+    # HTML entity 이스케이프된 news_item_title, 작은 단위 approx_traffic("1000+").
+    _TRENDING_RSS_FIXTURE = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<rss xmlns:atom="http://www.w3.org/2005/Atom"'
+        ' xmlns:ht="https://trends.google.com/trending/rss" version="2.0">'
+        '<channel>'
+        '<title>Daily Search Trends</title>'
+        '<item><title>이종석</title>'
+        '<ht:approx_traffic>200+</ht:approx_traffic>'
+        '<description/>'
+        '<link>https://trends.google.com/trending/rss?geo=KR</link>'
+        '<pubDate>Fri, 3 Jul 2026 08:40:00 -0700</pubDate>'
+        '<ht:picture>https://img.example/p1</ht:picture>'
+        '<ht:picture_source>Daum</ht:picture_source>'
+        '<ht:news_item>'
+        '<ht:news_item_title>&apos;아이유&apos; 이종석 근황</ht:news_item_title>'
+        '<ht:news_item_snippet/>'
+        '<ht:news_item_url>https://n.example/1</ht:news_item_url>'
+        '<ht:news_item_source>뉴시스</ht:news_item_source>'
+        '</ht:news_item>'
+        '</item>'
+        '<item><title>유조선</title>'
+        '<ht:approx_traffic>1000+</ht:approx_traffic>'
+        '<pubDate>Fri, 3 Jul 2026 07:50:00 -0700</pubDate>'
+        '</item>'
+        '</channel></rss>'
+    )
+
+    @staticmethod
+    def _resp(body: str):
+        class _Resp:
+            content = body.encode("utf-8")
+            def raise_for_status(self):
+                pass
+        return _Resp()
+
     def test_rss_parse_candidates(self):
         os.environ["GOOGLE_TRENDS_ENABLED"] = "true"
         os.environ["GOOGLE_TRENDS_PROVIDER"] = "rss"
-        rss = (
-            '<?xml version="1.0" encoding="UTF-8"?>'
-            '<rss xmlns:ht="https://trends.google.com/trends/trendingsearches/daily">'
-            '<channel>'
-            '<item><title>손흥민</title>'
-            '<ht:approx_traffic>2,000,000+</ht:approx_traffic>'
-            '<pubDate>Sat, 04 Jul 2026 00:00:00 +0900</pubDate>'
-            '<ht:news_item><ht:news_item_title>손흥민 결승골</ht:news_item_title>'
-            '<ht:news_item_url>https://n.example/1</ht:news_item_url></ht:news_item>'
-            '</item>'
-            '<item><title>환율</title>'
-            '<ht:approx_traffic>500,000+</ht:approx_traffic></item>'
-            '</channel></rss>'
-        )
-
-        class _Resp:
-            content = rss.encode("utf-8")
-            def raise_for_status(self):
-                pass
-
         orig = google.requests.get
-        google.requests.get = lambda *a, **k: _Resp()
+        google.requests.get = lambda *a, **k: self._resp(self._TRENDING_RSS_FIXTURE)
         try:
             cands = google.fetch_candidates()
         finally:
             google.requests.get = orig
-        self.assertEqual([c["keyword"] for c in cands], ["손흥민", "환율"])
+        self.assertEqual([c["keyword"] for c in cands], ["이종석", "유조선"])
         self.assertEqual(cands[0]["rank"], 1)
-        self.assertEqual(cands[0]["volume_bucket"], "2,000,000+")
+        self.assertEqual(cands[0]["volume_bucket"], "200+")
         self.assertTrue(cands[0]["active"])
+        self.assertEqual(cands[0]["started_at"], "Fri, 3 Jul 2026 08:40:00 -0700")
+        # entity 이스케이프 복원 + url 보존
+        self.assertEqual(cands[0]["related_news"][0]["title"], "'아이유' 이종석 근황")
         self.assertEqual(cands[0]["related_news"][0]["url"], "https://n.example/1")
+        # news_item 없는 item은 related_news 필드 자체를 생략(있으면 보존 정책)
+        self.assertNotIn("related_news", cands[1])
+        self.assertEqual(cands[1]["volume_bucket"], "1000+")
+
+    def test_rss_malformed_xml_returns_empty(self):
+        # 200이어도 XML 파싱 불가 body → google_fetch_failed 경로로 [] (pipeline 안 죽임)
+        os.environ["GOOGLE_TRENDS_ENABLED"] = "true"
+        os.environ["GOOGLE_TRENDS_PROVIDER"] = "rss"
+        orig = google.requests.get
+        google.requests.get = lambda *a, **k: self._resp("<html>not-rss</html><broken")
+        try:
+            self.assertEqual(google.fetch_candidates(), [])
+            self.assertEqual(google.fetch_signals(["이종석"]), {})
+        finally:
+            google.requests.get = orig
 
     def test_signals_from_trends(self):
         os.environ["GOOGLE_TRENDS_ENABLED"] = "true"

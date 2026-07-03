@@ -30,10 +30,14 @@ GEO = "KR"
 CANDIDATE_MAX = 20
 REQUEST_TIMEOUT = 10
 
-# 공식 Google Trends daily RSS export. ht:approx_traffic / ht:news_item / pubDate 포함.
-RSS_URL = f"https://trends.google.com/trends/trendingsearches/daily/rss?geo={GEO}"
-# Google Hot Trends 네임스페이스
-_HT_NS = "https://trends.google.com/trends/trendingsearches/daily"
+# 공식 Google Trends "Trending now" RSS export (2026-07 현행 확인).
+#   구 경로(trends/trendingsearches/daily/rss)는 404로 폐기됨 — 운영 run 28673259205에서 확인.
+#   실응답(geo=KR) 스키마: item당 title(keyword) / ht:approx_traffic("1000+") / pubDate /
+#   ht:picture(_source) / ht:news_item{title, snippet, url, picture, source} ×N.
+#   active·명시적 rank 필드는 없음 → 문서 순서를 rank로, active는 피드 등재 자체를 활성으로 본다.
+RSS_URL = f"https://trends.google.com/trending/rss?geo={GEO}"
+# Trending now RSS 네임스페이스 (rss 루트의 xmlns:ht)
+_HT_NS = "https://trends.google.com/trending/rss"
 
 # 프로세스 1회성 cron 실행 기준 — fetch_candidates()/fetch_signals()가 각각 호출돼도
 # RSS를 한 번만 fetch하도록 파싱 결과를 프로세스 수명 동안 메모이즈한다(쿼터 보호).
@@ -62,11 +66,17 @@ def _parse_traffic(text: Optional[str]) -> Optional[int]:
 
 
 def _volume_score(volume_int: Optional[int]) -> float:
-    """approx_traffic 정수 → 0~1 volume score(log 스케일, 100만+를 상한 근사로)."""
+    """approx_traffic 정수 → 0~1 volume score(log 스케일, 100만+를 상한 근사로).
+
+    Trending now RSS(geo=KR)의 실측 버킷은 "200+"/"1000+"/"10,000+"처럼 작은 단위가
+    흔하다(구 daily 피드의 "2,000,000+"보다 작음) → 이 스케일에서는 0.3~0.7대가 나오고,
+    _demand_interest가 rank 역수와 max를 취하므로 상위 rank 후보는 volume이 작아도
+    demand가 과소평가되지 않는다.
+    """
     if not volume_int or volume_int <= 0:
         return 0.0
     import math
-    # 1,000 → ~0.3, 100,000 → ~0.83, 1,000,000+ → 1.0 근사
+    # 200 → ~0.38, 1,000 → 0.5, 100,000 → ~0.83, 1,000,000+ → 1.0 근사
     return min(1.0, math.log10(volume_int) / 6.0)
 
 
@@ -94,6 +104,9 @@ def _fetch_trends() -> List[dict]:
         keyword = _tag(item, "title")
         if not keyword:
             continue
+        # rank: 피드에 명시 필드가 없어 문서 순서(1-base)를 사용.
+        # active: 피드에 필드가 없음 — Trending now RSS는 현재 트렌딩 중인 항목만 실으므로
+        #   등재 자체를 활성으로 본다(True 고정). 필드가 없어도 파싱은 실패하지 않는다.
         cand: dict = {"keyword": keyword, "rank": idx + 1, "active": True}
 
         approx = _tag(item, f"{{{_HT_NS}}}approx_traffic")
