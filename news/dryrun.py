@@ -133,8 +133,15 @@ def run_ranking(verbose: bool = True) -> dict:
         "google": {},  # stub
         "daum": daum_signals,
     }
+    # production(_rank_and_select)과 동일 시퀀스로 랭킹을 산출한다 — dry-run 검증 경로가
+    # 실제 파이프라인과 어긋나지 않도록(Codex diff 리뷰 P2). PR hard exclude → dedupe/merge →
+    # display/articles invariant → generic singleton 제외 → Top10.
     ranked = ranker.compute_scores(candidates, signals)
-    top = ranker.select_top(ranked)
+    ranked, _pr_excluded = ranker.exclude_pr_clusters(ranked)
+    merged = ranker.dedupe_and_merge(ranked)
+    merged = ranker.enforce_display_article_consistency(merged)
+    kept, _generic_excluded = ranker.exclude_generic_singletons(merged)
+    top = ranker.select_top(kept)
     candidate_map = {c["keyword"]: c for c in candidates}
     data_sources = ["naver_news"]
     if datalab_signals:

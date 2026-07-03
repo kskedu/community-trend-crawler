@@ -165,14 +165,22 @@ def _rank_and_select(candidates, signals, pass_name):
     있도록 단계별 수를 항상 남긴다(품질 기준 완화 없이 개수만 관찰).
     """
     ranked = ranker.compute_scores(candidates, signals)
+    gate_passed = len(ranked)
+    # PR/광고성 클러스터 hard exclude — merge 이전 per-keyword 기준(문제 B).
+    ranked, pr_excluded = ranker.exclude_pr_clusters(ranked)
+    if pr_excluded:
+        logger.warning("[news] %s: PR/광고성 클러스터 제외 %s", pass_name, pr_excluded)
     merged = ranker.dedupe_and_merge(ranked)
+    # display_keyword/articles 정합성 invariant — merge 후, generic guard 전(문제 A).
+    merged = ranker.enforce_display_article_consistency(merged)
     kept, generic_excluded = ranker.exclude_generic_singletons(merged)
     if generic_excluded:
         logger.warning("[news] %s: generic singleton 제외 %s", pass_name, generic_excluded)
     top = ranker.select_top(kept)
     logger.info(
-        "[news] %s: candidates=%d gate통과=%d merge후=%d generic제외=%d final=%d",
-        pass_name, len(candidates), len(ranked), len(merged), len(generic_excluded), len(top),
+        "[news] %s: candidates=%d gate통과=%d PR제외=%d merge후=%d generic제외=%d final=%d",
+        pass_name, len(candidates), gate_passed, len(pr_excluded), len(merged),
+        len(generic_excluded), len(top),
     )
     return top
 

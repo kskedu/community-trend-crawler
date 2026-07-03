@@ -2020,5 +2020,217 @@ class TestInsufficientFinalLogging(unittest.TestCase):
         self.assertEqual(excluded, [])  # generic이 아니므로 제외 대상 아님, 그냥 개수 부족
 
 
+class TestPromotionalPRArticle(unittest.TestCase):
+    """문제 B: article-level PR/공익 판정(두 등급 override, 사용자 확정 2026-07-03)."""
+
+    def test_pr_marker_in_title_is_promotional(self):
+        a = _article("세라젬, KLPGA 롯데오픈 공식 후원", "https://x.com/p1", "공식 후원사로 나섰다")
+        self.assertTrue(cand.is_promotional_pr(a))
+        self.assertFalse(cand.is_public_interest(a))
+
+    def test_pr_marker_only_in_snippet_not_promotional(self):
+        # title에 마커 없고 snippet에만 있으면 PR 아님(경기결과 boilerplate 오탐 방지 — title-only).
+        a = _article("김민지, 롯데오픈 최종 3R 우승", "https://x.com/p2", "대회 공식 후원사는 세라젬")
+        self.assertFalse(cand.is_promotional_pr(a))
+
+    def test_strong_public_interest_overrides_even_with_pr_marker(self):
+        # 강한 사건성 토큰(화재)은 PR 마커(공식 후원) 동반해도 override → 공익, PR 아님.
+        a = _article("세라젬 공식 후원 행사장 화재", "https://x.com/p3", "")
+        self.assertTrue(cand.is_public_interest(a))
+        self.assertFalse(cand.is_promotional_pr(a))
+
+    def test_compound_public_interest_with_spacing(self):
+        a = _article("현대차 본사 압수 수색", "https://x.com/p4", "")
+        self.assertTrue(cand.is_public_interest(a))
+
+    def test_market_token_without_pr_marker_is_public_interest(self):
+        a = _article("SK하이닉스 주가 급등", "https://x.com/p5", "증권시장에서 강세")
+        self.assertTrue(cand.is_public_interest(a))
+        self.assertFalse(cand.is_promotional_pr(a))
+
+    def test_market_token_with_pr_marker_is_not_override(self):
+        # "브랜드 캠페인 효과로 실적 기대" — 시장성 토큰이 PR 마커와 같은 title → override 불인정, PR.
+        a = _article("세라젬 브랜드 캠페인 효과로 실적 기대", "https://x.com/p6", "")
+        self.assertFalse(cand.is_public_interest(a))
+        self.assertTrue(cand.is_promotional_pr(a))
+
+    def test_market_token_pr_marker_in_snippet_also_blocks_override(self):
+        a = _article("세라젬 주가 상승 기대", "https://x.com/p7", "신제품 출시 기대감")
+        self.assertFalse(cand.is_public_interest(a))
+
+    def test_no_substring_false_positive_for_market_token(self):
+        # "무사고"⊅"사고", "주가지수"⊅"주가" — 토큰 매칭이라 오탐 없음.
+        a1 = _article("무사고 운전 캠페인", "https://x.com/p8", "")
+        a2 = _article("코스피 주가지수 보합", "https://x.com/p9", "")
+        # "무사고"는 토큰 "무사고" 하나라 "사고"와 매칭 안 됨 → 강한 공익 아님.
+        self.assertNotIn("사고", set(cand._tokens("무사고 운전 캠페인")))
+        self.assertFalse(cand._has_strong_public_interest("무사고 운전 캠페인"))
+        # "주가지수"는 토큰 "주가지수"라 시장성 토큰 "주가"와 매칭 안 됨 → 이 title만으로 override 안 됨.
+        self.assertNotIn("주가", set(cand._tokens("코스피 주가지수 보합")))
+        self.assertFalse(cand.is_public_interest(a2))
+        self.assertFalse(cand.is_public_interest(a1))
+
+
+class TestPRClusterExclude(unittest.TestCase):
+    """문제 B: PR 클러스터 hard exclude(pre-merge, per-keyword)."""
+
+    def _serajem_signal(self, extra=None):
+        arts = [
+            _article("세라젬, KLPGA 롯데오픈 공식 후원", "https://x.com/s1",
+                     "세라젬이 공식 후원사로 나섰다", _recent_iso()),
+            _article("세라젬 롯데오픈 체험존 운영", "https://x.com/s2",
+                     "세라젬 체험존에서 헬스케어 체험", _recent_iso()),
+            _article("세라젬 브랜드 캠페인 확대", "https://x.com/s3",
+                     "세라젬 브랜드 캠페인", _recent_iso()),
+        ]
+        if extra:
+            arts.extend(extra)
+        return cand.compute_news_signal("세라젬", arts)
+
+    def test_pure_pr_cluster_excluded(self):
+        sig = self._serajem_signal()
+        self.assertEqual(sig["pr_article_count"], 3)
+        self.assertEqual(sig["public_interest_count"], 0)
+        self.assertGreaterEqual(sig["commercial_pr_ratio"], 0.6)
+        cands = [{"keyword": "세라젬", "sources": {"danawa": 1}}]
+        signals = {"news": {"세라젬": sig}, "datalab": {}, "google": {}, "daum": {"세라젬": 1}}
+        ranked = ranker.compute_scores(cands, signals)
+        self.assertEqual(len(ranked), 1)  # quality gate는 통과(고관련 기사)
+        kept, excluded = ranker.exclude_pr_clusters(ranked)
+        self.assertEqual(kept, [])
+        self.assertIn("세라젬", excluded)
+
+    def test_pr_cluster_with_market_hype_still_excluded(self):
+        # 사용자 테스트 #1/#2: 후원/캠페인 + "실적 기대"/"주가 상승 기대"가 섞여도 제외.
+        extra = [
+            _article("세라젬 신제품 출시로 주가 상승 기대", "https://x.com/s4", "", _recent_iso()),
+        ]
+        sig = self._serajem_signal(extra)
+        self.assertEqual(sig["public_interest_count"], 0)  # 시장성+PR마커 → override 안 됨
+        cands = [{"keyword": "세라젬", "sources": {"danawa": 1}}]
+        signals = {"news": {"세라젬": sig}, "datalab": {}, "google": {}, "daum": {"세라젬": 1}}
+        _, excluded = ranker.exclude_pr_clusters(ranker.compute_scores(cands, signals))
+        self.assertIn("세라젬", excluded)
+
+    def test_strong_public_interest_keeps_cluster(self):
+        # 사용자 테스트 #5: 사건성 토큰(소송)이 있으면 PR 다수여도 유지.
+        extra = [_article("세라젬 후원 계약 소송 제기", "https://x.com/s5", "", _recent_iso())]
+        sig = self._serajem_signal(extra)
+        self.assertGreaterEqual(sig["public_interest_count"], 1)
+        cands = [{"keyword": "세라젬", "sources": {"danawa": 1}}]
+        signals = {"news": {"세라젬": sig}, "datalab": {}, "google": {}, "daum": {"세라젬": 1}}
+        kept, excluded = ranker.exclude_pr_clusters(ranker.compute_scores(cands, signals))
+        self.assertNotIn("세라젬", excluded)
+        self.assertEqual(len(kept), 1)
+
+    def test_recall_and_stock_news_kept(self):
+        # 사용자 테스트 #3/#4: PR 마커 없는 실제 리콜/주가 기사는 유지.
+        for kw, arts in [
+            ("테슬라", [
+                _article("테슬라 모델Y 리콜 결정", "https://x.com/t1", "리콜 대상 확대", _recent_iso()),
+                _article("테슬라 브레이크 결함 리콜", "https://x.com/t2", "", _recent_iso()),
+            ]),
+            ("하이닉스", [
+                _article("SK하이닉스 주가 급등", "https://x.com/h1", "실적 개선 기대", _recent_iso()),
+                _article("하이닉스 주가 장중 신고가", "https://x.com/h2", "", _recent_iso()),
+            ]),
+        ]:
+            sig = cand.compute_news_signal(kw, arts)
+            self.assertEqual(sig["pr_article_count"], 0)
+            cands = [{"keyword": kw, "sources": {"daum": 1}}]
+            signals = {"news": {kw: sig}, "datalab": {}, "google": {}, "daum": {kw: 1}}
+            _, excluded = ranker.exclude_pr_clusters(ranker.compute_scores(cands, signals))
+            self.assertNotIn(kw, excluded)
+
+    def test_mixed_sports_cluster_kept_by_ratio(self):
+        # 경기 결과 다수 + 후원 언급 title 소수 → ratio<0.6으로 유지(정상 이슈 오제외 방지).
+        arts = [
+            _article("롯데오픈 최종 3R 김민지 우승", "https://x.com/m1", "리더보드 1위", _recent_iso()),
+            _article("롯데오픈 2R 종료 컷 통과", "https://x.com/m2", "", _recent_iso()),
+            _article("롯데오픈 갤러리 역대 최다", "https://x.com/m3", "", _recent_iso()),
+            _article("롯데오픈 공식 후원 세라젬 체험존", "https://x.com/m4", "", _recent_iso()),
+        ]
+        sig = cand.compute_news_signal("롯데오픈", arts)
+        self.assertLess(sig["commercial_pr_ratio"], 0.6)
+        cands = [{"keyword": "롯데오픈", "sources": {"daum": 1}}]
+        signals = {"news": {"롯데오픈": sig}, "datalab": {}, "google": {}, "daum": {"롯데오픈": 1}}
+        _, excluded = ranker.exclude_pr_clusters(ranker.compute_scores(cands, signals))
+        self.assertNotIn("롯데오픈", excluded)
+
+    def test_single_pr_article_not_excluded_boundary(self):
+        # 경계: PR 기사 1건(pr_article_count<2)은 제외하지 않음(단건 stray 마커 노이즈 방어).
+        item1 = {"keyword": "A", "news_meta": {"pr_article_count": 1, "commercial_pr_ratio": 1.0,
+                                               "public_interest_count": 0}}
+        item2 = {"keyword": "B", "news_meta": {"pr_article_count": 2, "commercial_pr_ratio": 1.0,
+                                               "public_interest_count": 0}}
+        kept, excluded = ranker.exclude_pr_clusters([item1, item2])
+        self.assertEqual([k["keyword"] for k in kept], ["A"])
+        self.assertEqual(excluded, ["B"])
+
+
+class TestDisplayArticleInvariant(unittest.TestCase):
+    """문제 A: display_keyword가 표시 기사와 다른 이슈를 가리키지 않게 하는 invariant."""
+
+    def _item(self, keyword, display, article_titles):
+        arts = [_article(t, f"https://x.com/{i}", "") for i, t in enumerate(article_titles)]
+        return {"keyword": keyword, "display_keyword": display, "news_meta": {"articles": arts}}
+
+    def test_mismatched_display_downgraded_to_canonical(self):
+        # display="조타 교통사고 사망"인데 기사는 전부 구제역 → canonical(구제역)로 강등.
+        item = self._item("구제역", "조타 교통사고 사망",
+                          ["경북 예천 돼지농장 구제역 발생", "예천 구제역 확산 방역"])
+        out = ranker.enforce_display_article_consistency([item])
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["display_keyword"], "구제역")
+
+    def test_consistent_display_kept(self):
+        item = self._item("월드컵", "월드컵 16강",
+                          ["한국 월드컵 16강 진출 확정", "월드컵 16강 대진표 공개"])
+        out = ranker.enforce_display_article_consistency([item])
+        self.assertEqual(out[0]["display_keyword"], "월드컵 16강")
+
+    def test_synonym_absent_token_downgrades(self):
+        # 같은 이슈라도 canonical 기사가 "본선 진출" 동의표현만 쓰고 "16강" 미등장 → 강등(안전).
+        item = self._item("월드컵", "월드컵 16강",
+                          ["한국 월드컵 본선 진출 확정", "월드컵 토너먼트 대진 공개"])
+        out = ranker.enforce_display_article_consistency([item])
+        self.assertEqual(out[0]["display_keyword"], "월드컵")
+
+    def test_event_tag_token_must_be_supported(self):
+        # "A 사망" display에서 사망이 기사에 없으면(A만 있음) 강등 — 사건 꼬리표 검증(Codex 10차).
+        item = self._item("배우B", "배우B 사망",
+                          ["배우B 신작 드라마 출연 확정", "배우B 인터뷰 공개"])
+        out = ranker.enforce_display_article_consistency([item])
+        self.assertEqual(out[0]["display_keyword"], "배우B")
+
+    def test_split_tokens_across_articles_downgraded(self):
+        # 검증토큰이 서로 다른 기사에 흩어져 있으면(배우B 기사 + 별개 사망 기사) 강등해야 한다.
+        # 단일 기사가 display 검증토큰 전부를 커버해야 지지로 인정(Codex diff 리뷰 P1).
+        item = self._item("배우B", "배우B 사망",
+                          ["배우B 신작 드라마 출연 확정", "원로배우 별세 사망 애도 물결"])
+        out = ranker.enforce_display_article_consistency([item])
+        self.assertEqual(out[0]["display_keyword"], "배우B")
+
+    def test_weak_modifier_not_required(self):
+        # 약한 수식어(신임/발표)는 검증 대상 아님 → 엔티티만 맞으면 유지.
+        item = self._item("홍석기", "홍석기 신임",
+                          ["홍석기 치안감 프로필", "홍석기 국가수사본부장 발탁"])
+        out = ranker.enforce_display_article_consistency([item])
+        self.assertEqual(out[0]["display_keyword"], "홍석기 신임")
+
+    def test_generic_only_canonical_rejected(self):
+        # 강등 대상 canonical이 generic-only(수사)면 reject(노출 안 함).
+        item = self._item("수사", "조타 교통사고 사망",
+                          ["경북 예천 돼지농장 구제역 발생", "예천 구제역 확산"])
+        out = ranker.enforce_display_article_consistency([item])
+        self.assertEqual(out, [])
+
+    def test_singleton_consistent_item_unaffected(self):
+        item = self._item("반도체", "반도체", ["삼성 반도체 실적 개선", "반도체 수요 회복"])
+        out = ranker.enforce_display_article_consistency([item])
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["display_keyword"], "반도체")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

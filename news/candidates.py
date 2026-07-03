@@ -80,6 +80,84 @@ FRESH_RELEVANCE_HOURS = 72
 # select_representative()가 대표로 인정하는 최소 relevance_score.
 REPRESENTATIVE_MIN_RELEVANCE = 0.5
 
+# === PR/광고성 클러스터 판정 (실시간 이슈 품질 — 문제 B) ===
+# PR 마커는 title에서만 substring 판정한다. snippet까지 보면 경기 결과 기사의 후원 boilerplate가
+# 오탐되어 정상 스포츠 이슈가 제외될 수 있다(Codex review-only 3·6차: 정상 이슈 오제외가 PR
+# 누수보다 나쁘다는 우선순위). keyword 자체가 될 수 있는 단독어(팝업/콜라보/프로모션)는 제외하고
+# phrase형만 둔다(Codex 6차 P2). 실기사 표기 변형(공식후원/공식 후원, 체험부스/체험 부스)을 함께
+# 등록하고 매칭 시 양쪽 공백 제거로 spacing 변형을 포섭한다.
+_PR_MARKERS = (
+    "공식 후원", "후원사", "후원 협약", "협찬사",
+    "체험존", "체험 부스", "체험 마케팅", "브랜드관",
+    "팝업스토어", "플래그십스토어", "플래그십", "스위트라운지", "VIP 라운지",
+    "앰버서더", "홍보대사", "시승 행사", "나눔 행사", "사회공헌",
+    "ESG 경영", "신제품 출시", "브랜드 캠페인", "협업 이벤트",
+)
+
+# public-interest override — 두 등급(사용자 확정 2026-07-03).
+# (1) 강한 사건성: title에 1건만 있어도 PR hard exclude를 무효화하고 유지한다(PR 마커 동반해도).
+#     브랜드 PR 문맥에 우연히 섞일 가능성이 낮고, 정상 사건 이슈 오제외가 더 나쁘다.
+_STRONG_PUBLIC_INTEREST_TOKENS = {
+    "사고", "리콜", "소송", "규제", "파업", "범죄", "사망", "재난",
+    "화재", "기소", "수사", "제재",
+}
+# 길어서 substring FP가 없는 compound는 substring + 공백 제거 변형("압수 수색")으로 포섭.
+_STRONG_PUBLIC_INTEREST_COMPOUNDS = ("압수수색", "보안사고", "과징금")
+# (2) 약한 시장성: 마케팅 title에도 흔하므로, 같은 기사(title+snippet)에 PR 마커가 없을 때만
+#     override로 인정한다("브랜드 캠페인 효과로 실적 기대"류를 PR로 유지 — 사용자 확정).
+_MARKET_TOKENS = {"실적", "주가", "매출", "영업이익", "순이익", "전망", "기대"}
+
+
+def _text_has_pr_marker(text: str) -> bool:
+    """text(주로 title)에 PR 마커가 substring으로 있는지. 양쪽 공백 제거로 spacing 변형 포섭."""
+    t = text or ""
+    t_nospace = "".join(t.split())
+    for m in _PR_MARKERS:
+        if m in t or "".join(m.split()) in t_nospace:
+            return True
+    return False
+
+
+def _has_strong_public_interest(title: str) -> bool:
+    if set(_tokens(title)) & _STRONG_PUBLIC_INTEREST_TOKENS:
+        return True
+    t_nospace = "".join((title or "").split())
+    return any(c in t_nospace for c in _STRONG_PUBLIC_INTEREST_COMPOUNDS)
+
+
+def is_public_interest(article: Dict) -> bool:
+    """공익/사건 override 대상 기사인지(두 등급, title 기준).
+
+    강한 사건성 토큰이 title에 있으면 무조건 True. 약한 시장성 토큰(실적/주가 등)은 같은
+    기사(title+snippet)에 PR 마커가 없을 때만 True(마케팅 hype 제외 — 사용자 확정 2026-07-03).
+    토큰 매칭(summarizer._tokens)이라 "무사고"⊅"사고", "주가지수"⊅"주가" 오탐이 없다.
+    """
+    title = article.get("title") or ""
+    if _has_strong_public_interest(title):
+        return True
+    if set(_tokens(title)) & _MARKET_TOKENS:
+        snippet = article.get("snippet") or ""
+        if not _text_has_pr_marker(title) and not _text_has_pr_marker(snippet):
+            return True
+    return False
+
+
+def is_promotional_pr(article: Dict) -> bool:
+    """title에 PR 마커가 있고 공익 override 대상이 아닌 기사(PR/광고성)."""
+    if not _text_has_pr_marker(article.get("title") or ""):
+        return False
+    return not is_public_interest(article)
+
+
+def _is_issue_defining_article(article: Dict) -> bool:
+    """PR ratio 분모로 쓸 "그 keyword의 이슈를 정의하는 기사"인지.
+    부수 언급(is_incidental)·조치 대상 물품 언급(object_side_mention)·저관련 기사는 제외."""
+    if article.get("is_incidental"):
+        return False
+    if article.get("relevance_reason") == "object_side_mention":
+        return False
+    return article.get("relevance_score", 0.0) >= LOW_RELEVANCE_ARTICLE_THRESHOLD
+
 
 def _jaccard(a: set, b: set) -> float:
     if not a and not b:
@@ -591,6 +669,20 @@ def compute_news_signal(keyword: str, raw_items: List[dict], require_all_tokens:
     ]
     latest_relevant_age_hours = min(high_relevance_ages) if high_relevance_ages else None
 
+    # PR/광고성 집계(문제 B). 분모 = 이슈 정의 기사 전체 pool(_is_issue_defining_article).
+    # primary cluster로 좁히면 relevance score 합 기준 primary 선택의 약점 때문에 "PR 소수지만
+    # relevance 높은 클러스터"가 primary가 되어 정상 keyword를 오제외할 수 있어(Codex review-only
+    # 11·12차) 전체 pool을 분모로 둔다 — 정상 이슈 오제외 최소화 우선. per-article 플래그도
+    # 남겨(is_promotional_pr/is_public_interest) 디버깅/후속 판단에 쓴다.
+    for a in scored_articles:
+        a["is_promotional_pr"] = is_promotional_pr(a)
+        a["is_public_interest"] = is_public_interest(a)
+    issue_defining = [a for a in scored_articles if _is_issue_defining_article(a)]
+    issue_article_count = len(issue_defining)
+    pr_article_count = sum(1 for a in issue_defining if a["is_promotional_pr"])
+    public_interest_count = sum(1 for a in issue_defining if a["is_public_interest"])
+    commercial_pr_ratio = (pr_article_count / issue_article_count) if issue_article_count else 0.0
+
     return {
         "recent_count": recent_count,
         "latest_age_hours": min(ages) if ages else None,
@@ -607,6 +699,10 @@ def compute_news_signal(keyword: str, raw_items: List[dict], require_all_tokens:
         "fresh_high_relevance_count": fresh_high_relevance_count,
         "fresh_quality_cluster_size": fresh_quality_cluster_size,
         "latest_relevant_age_hours": latest_relevant_age_hours,
+        "pr_article_count": pr_article_count,
+        "public_interest_count": public_interest_count,
+        "issue_article_count": issue_article_count,
+        "commercial_pr_ratio": round(commercial_pr_ratio, 4),
     }
 
 

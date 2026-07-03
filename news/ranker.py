@@ -994,6 +994,128 @@ def exclude_generic_singletons(merged: List[Dict]) -> tuple:
     return kept, excluded
 
 
+# === PR/광고성 클러스터 hard exclude (문제 B) ===
+COMMERCIAL_PR_RATIO_THRESHOLD = 0.6
+PR_MIN_ARTICLES = 2  # 순수 PR 판정에 필요한 최소 PR 기사 수(단건 stray 마커 노이즈 방어)
+
+
+def exclude_pr_clusters(ranked: List[Dict]) -> tuple:
+    """PR/광고성(공식 후원/체험존/브랜드 캠페인 등) 클러스터를 최종 후보에서 제외(hard exclude).
+
+    dedupe_and_merge() *이전*, per-keyword news_meta 기준으로 적용한다. merge 이후 group 단위
+    제외는 canonical=score 1위 고정 구조상 흡수된 정상 이슈까지 삭제하므로 하지 않는다
+    (Codex review-only 8·9차: 정상 이슈 오제외 > PR 누수 우선순위). 대신 PR 키워드를 merge 전에
+    제거해 PR이 canonical이 되어 정상 이슈를 흡수하는 것 자체를 막는다.
+
+    제외 조건(candidates.compute_news_signal 집계 기준):
+    - pr_article_count >= PR_MIN_ARTICLES (순수 PR 기사가 최소 2건)
+    - commercial_pr_ratio >= COMMERCIAL_PR_RATIO_THRESHOLD (이슈 정의 기사의 60% 이상이 PR)
+    - public_interest_count == 0 (사건성/시장성 override 기사가 하나도 없음)
+    public-interest override(강한 사건성 title 1건, 시장성은 PR 마커 없을 때만)는 candidates에서
+    이미 public_interest_count에 반영돼 있어, 하나라도 있으면 여기서 제외되지 않는다.
+
+    Top10이 부족해도 이 제외로 빈 자리를 PR filler로 채우지 않는다(개수 감소는 정상).
+    반환: (kept, excluded_keywords).
+    """
+    kept: List[Dict] = []
+    excluded: List[str] = []
+    for item in ranked:
+        nm = item.get("news_meta") or {}
+        if (
+            nm.get("pr_article_count", 0) >= PR_MIN_ARTICLES
+            and nm.get("commercial_pr_ratio", 0.0) >= COMMERCIAL_PR_RATIO_THRESHOLD
+            and nm.get("public_interest_count", 0) == 0
+        ):
+            excluded.append(item.get("keyword", ""))
+            continue
+        kept.append(item)
+    return kept, excluded
+
+
+# === display_keyword / articles 정합성 invariant (문제 A) ===
+# merge된 item은 news_meta(=articles/representative)가 canonical(primary) 것만 실리는데
+# display_keyword는 group union coverage로 별도 선택돼, false merge 시 display가 표시 기사와
+# 다른 이슈를 가리킬 수 있다("조타 교통사고 사망" display + 구제역 articles). display의 이슈
+# 식별 토큰이 표시 기사에 실제 등장하는지 검증해 불일치를 원천 차단한다.
+#
+# skip-list는 이슈 식별에 무의미한 "약한 수식어"만 담는다. 수사/조사/논란/의혹/진입/충돌/사망/
+# 사고/화재 같은 사건 식별 토큰은 검증 대상으로 남긴다(Codex review-only 10·11차: 이들을
+# 검증에서 빼면 "A 사망" display가 A만 등장해도 통과해 사건 꼬리표가 기사로 뒷받침되지 않음).
+_INVARIANT_SKIP_TOKENS = {
+    "신임", "임명", "승진", "취임", "내정", "발탁", "선임", "인사", "전보",
+    "발표", "공개", "예정", "오늘", "관련", "진행", "계획",
+}
+
+
+def _invariant_check_tokens(text: str) -> set:
+    """정합성 검증 대상 토큰: len>=2 이고 약한 수식어(_INVARIANT_SKIP_TOKENS)가 아닌 것."""
+    from news.summarizer import _tokens
+
+    return {t for t in _tokens(text) if len(t) >= 2 and t not in _INVARIANT_SKIP_TOKENS}
+
+
+def _displayed_article_units(articles: List[Dict]) -> List[tuple]:
+    """실제 화면에 노출되는 기사 집합을 builder와 동일하게 산출해, 기사별 (토큰집합, 원문)
+    리스트로 반환한다. builder.build_ranked_entry가 dedup_articles → filter_articles_for_display
+    → [:ARTICLES_MAX] 순으로 노출 집합을 만들므로(Codex diff 리뷰 P2), invariant도 같은
+    집합으로 검증해야 "표시 기사" 정합성이 보장된다.
+
+    검증은 기사별 단위로 한다(aggregate 금지). display 검증 토큰이 서로 다른 기사에 흩어져
+    있어도 통과하던 split-token 오탐(Codex diff 리뷰 P1: "배우B 사망"이 배우B 기사 + 원로배우
+    사망 기사로 각각 존재해도 통과)을 막기 위함이다.
+    """
+    from news.dedup import dedup_articles
+    from news.candidates import filter_articles_for_display
+    from news.builder import ARTICLES_MIN, ARTICLES_MAX
+    from news.summarizer import _tokens
+
+    displayed = filter_articles_for_display(dedup_articles(articles or []), min_count=ARTICLES_MIN)[:ARTICLES_MAX]
+    units = []
+    for a in displayed:
+        text = f"{a.get('title', '')} {a.get('snippet', '')}"
+        units.append((set(_tokens(text)), text))
+    return units
+
+
+def _supported_by_single_article(check_toks: set, units: List[tuple]) -> bool:
+    """검증 대상 토큰 전부를 한 기사(단일 unit)가 커버하는지 — 하나라도 그런 기사가 있으면 True.
+    토큰집합 exact 또는 원문 substring(조사/어미 결합 대응) 매칭. substring은 false-reject
+    (정상 이슈 버림)를 피하는 안전 방향이다."""
+    for art_toks, art_text in units:
+        if all(t in art_toks or t in art_text for t in check_toks):
+            return True
+    return False
+
+
+def enforce_display_article_consistency(items: List[Dict]) -> List[Dict]:
+    """각 item의 display_keyword가 표시 기사(canonical news_meta.articles 중 실제 노출분)와
+    정합인지 검증한다.
+
+    - display 검증 토큰 전부를 표시 기사 중 한 기사가 커버하면 그대로 유지.
+    - 그런 기사가 없으면 display를 canonical(keyword)로 강등한다(canonical은 quality gate상
+      자기 기사에 등장이 보장돼 항상 정합). 단 canonical이 generic-only거나 canonical
+      검증 토큰조차 표시 기사에 없으면(방어) 그 item을 reject(노출 안 함).
+    dedupe_and_merge() 이후, exclude_generic_singletons()/select_top() 이전에 적용한다.
+    """
+    result: List[Dict] = []
+    for item in items:
+        news_meta = item.get("news_meta") or {}
+        units = _displayed_article_units(news_meta.get("articles") or [])
+        canonical = item.get("keyword", "")
+        display = item.get("display_keyword") or canonical
+        disp_check = _invariant_check_tokens(display)
+        if disp_check and not _supported_by_single_article(disp_check, units):
+            if _is_generic_only_display(canonical):
+                continue  # 강등 대상이 generic-only(수사/신임 등) → reject
+            canon_check = _invariant_check_tokens(canonical)
+            if canon_check and not _supported_by_single_article(canon_check, units):
+                continue  # canonical조차 표시 기사와 불일치 → reject
+            item = dict(item)
+            item["display_keyword"] = canonical
+        result.append(item)
+    return result
+
+
 def select_top(ranked: List[Dict], top_n: int = TOP_N) -> List[Dict]:
     """dedupe/merge 이후 리스트에서 상위 N개를 뽑는다.
 
