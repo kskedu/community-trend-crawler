@@ -640,6 +640,13 @@ _DISPLAY_GENERIC_WORDS = {
     # same-issue merge 판정에 side effect가 생기므로 display/singleton 전용인
     # 이 집합에 둔다(2026-07-03 운영 관찰: generic singleton 방어 확장).
     "조사",
+    # 경제/행위 일반명사 — 운영 반영 후속 hotfix(2026-07-03): merge group에서 "한화
+    # 영남권 55조"의 display가 "투자" 단독으로 뽑힘("신임" 회귀와 동일한 구조 — 고유명사
+    # 없이 일반 서술어 토큰만으로 대표가 채택됨). "한화 투자"처럼 고유명사와 조합되면
+    # _is_generic_only_display가 False라 그대로 허용되고, 단독일 때만 canonical로
+    # fallback된다("조사"와 동일 메커니즘). "발표"는 _GENERIC_EVENT_PREDICATE_WORDS에
+    # 이미 있어 중복 추가하지 않는다.
+    "투자", "사업", "계획", "추진", "확대", "지원", "협력", "체결", "공급", "운영",
 }
 
 

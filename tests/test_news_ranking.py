@@ -1564,6 +1564,57 @@ class TestDisplayKeywordRepresentative(unittest.TestCase):
         for w in ["홍석기 치안감", "국가수사본부장 임명", "손흥민 발탁"]:
             self.assertFalse(ranker._is_generic_only_display(w), f"{w} should NOT be generic-only")
 
+    def test_economic_generic_word_not_selected_as_display_alone(self):
+        # 운영 반영 후속 hotfix(2026-07-03): canonical="한화 영남권 55조"인데 merge group의
+        # "투자" 단독 후보가 그룹 기사 전반(coverage 높음)에 등장해 display로 잘못 뽑히던
+        # 실사례 재현("신임" 회귀와 동일 구조). "투자" 단독이 되면 안 되고, canonical 또는
+        # 고유명사가 섞인 조합형이어야 한다.
+        arts = [
+            self._rel("한화, 2040년까지 55조원 투자...AI 우주강국 청사진 제시", "https://f.com/1"),
+            self._rel("한화·현대차·삼성·SK 등 영남권에 312조 투자…AI·반도체·로봇 육성", "https://f.com/2"),
+            self._rel("김동관 부회장, 영남권 55조 베팅…한화 'AI 우주강국' 승부수", "https://f.com/3"),
+        ]
+        ranked = [
+            self._rk("한화 영남권 55조", 0.9, arts, {"daum": 3}),
+            self._rk("투자", 0.5, arts, {"aux": True}),
+        ]
+        merged = ranker.dedupe_and_merge(ranked)
+        display = merged[0]["display_keyword"]
+        self.assertNotEqual(display, "투자")
+        self.assertFalse(ranker._is_generic_only_display(display))
+        self.assertIn(display, {
+            "한화 영남권 55조", "한화 투자", "한화 55조 투자", "한화 영남권 투자",
+        })
+        # canonical은 movement 안정성 위해 그대로 유지.
+        self.assertEqual(merged[0]["keyword"], "한화 영남권 55조")
+
+    def test_economic_generic_word_allowed_in_combination(self):
+        # "투자"가 고유명사와 조합된 표현은 차단하면 안 된다(단독일 때만 방어).
+        for w in ["한화 투자", "55조 투자", "한화 영남권 투자", "한화 사업 확대"]:
+            self.assertFalse(ranker._is_generic_only_display(w), f"{w} should NOT be generic-only")
+
+    def test_economic_generic_words_rejected_alone(self):
+        # 사용자 확정 경제/행위 일반명사 목록 — 단독/조합 전부 generic-only여야 한다.
+        for w in ["투자", "사업", "계획", "추진", "확대", "지원", "협력", "체결", "공급", "운영",
+                  "사업 확대", "투자 계획"]:
+            self.assertTrue(ranker._is_generic_only_display(w), f"{w} should be generic-only")
+            self.assertIn(w.split()[0], ranker._DISPLAY_GENERIC_WORDS | ranker._GENERIC_EVENT_PREDICATE_WORDS)
+
+    def test_typhoon_like_specific_keyword_not_blocked_by_economic_words(self):
+        # "태풍"처럼 명확한 단독 이슈 키워드는 경제 generic 확장과 무관하게 유지돼야 함.
+        self.assertFalse(ranker._is_generic_only_display("태풍"))
+
+    def test_economic_generic_words_not_leaked_into_merge_predicate_set(self):
+        # Codex diff 리뷰 P3: display 전용 확장이 same-issue merge 판정에 쓰이는
+        # _GENERIC_EVENT_PREDICATE_WORDS로 새지 않아야 한다(_DISPLAY_GENERIC_WORDS와
+        # 분리된 별도 집합이라는 설계 불변을 직접 고정 — 누군가 실수로 옮기면 이 테스트가
+        # 즉시 깨진다. merge 로직 자체는 이 diff에서 변경되지 않았음을 보장).
+        # _INVARIANT_SKIP_TOKENS(예: "계획")는 별개 목적(display/article 정합 검증에서
+        # 요구 면제)의 독립된 리스트라 겹쳐도 무방 — merge 판정에 쓰이지 않으므로 여기서
+        # 확인하지 않는다.
+        for w in ["투자", "사업", "계획", "추진", "확대", "지원", "협력", "체결", "공급", "운영"]:
+            self.assertNotIn(w, ranker._GENERIC_EVENT_PREDICATE_WORDS)
+
     def test_singleton_candidate_display_equals_keyword(self):
         # merge되지 않은 단독 후보는 display_keyword가 canonical keyword와 동일해야 한다
         # (Codex diff 리뷰 P3: singleton 경로도 _build_display_keyword로 통일했으나
@@ -1724,6 +1775,14 @@ class TestGenericSingletonGuard(unittest.TestCase):
     def test_survey_word_added_to_display_generic(self):
         self.assertTrue(ranker._is_generic_only_display("조사"))
         self.assertIn("조사", ranker._DISPLAY_GENERIC_WORDS)
+
+    def test_investment_singleton_excluded_from_final(self):
+        # 운영 반영 후속 hotfix(2026-07-03): "투자" 단독 후보도 "신임"/"수사"와 동일하게
+        # merge group을 이루지 못하면(singleton) final에서 제외돼야 함.
+        merged = [self._rk("투자", 0.9)]
+        kept, excluded = ranker.exclude_generic_singletons(merged)
+        self.assertEqual(kept, [])
+        self.assertIn("투자", excluded)
 
 
 def _phrase_news_signal(keyword, articles):
