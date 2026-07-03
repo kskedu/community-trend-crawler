@@ -46,6 +46,7 @@ community-trend-crawler/
 │   ├── daum.py          # 다음 실시간 트렌드 Top 10
 │   ├── daangn.py        # 당근마켓 인기 검색어 Top 10 (gnb_popular_keyword 앵커 파싱)
 │   ├── nate.py          # 네이트 실시간 이슈 키워드 Top 10 (jsonLiveKeywordDataV1.js EUC-KR JSON 파싱)
+│   ├── msn.py           # MSN 최신 인기 검색어 Top 10 (api.msn.com trendingsearch 비공식 JSON 파싱)
 │   └── namuwiki.py      # 비활성(active=False) — namu.news 서비스 종료, 대체 upstream 없음
 ├── processor/
 │   ├── dedup.py         # URL 기반 중복 제거
@@ -88,6 +89,7 @@ community-trend-crawler/
 | 다나와 | danawa | `/dsearch.php?query=best` | `hot_keyword` 섹션 파싱. Vercel은 403 차단되어 GH Actions(한국 친화 IP)로 이관 |
 | 다음 | daum | `/search?w=tot&q=ㄴㄴ` | `list_trend` 내 `data-keyword` 추출 |
 | 네이트 | nate | `/js/data/jsonLiveKeywordDataV1.js` | 네이트 메인 홈 `#olLiveIssueKeyword`는 5개씩 두 페이지로 로테이션 렌더링(정적 HTML엔 5개만 존재)돼 자체 JS(`nate_general_v20260202.js`)가 호출하는 이 비공식 JSON 엔드포인트를 직접 사용 — EUC-KR 인코딩, `[rank, title, flag, delta, 검색어]` 배열 10개. `item[4]`를 keyword로 사용 |
+| MSN | msn | `api.msn.com/news/feed/segments/trendingsearch` | msn.com/ko-kr은 완전 SPA(React)라 정적 HTML엔 위젯이 없음 — 실제 브라우저 네트워크 캡처로 찾은 비공식 API. `Referer: https://www.msn.com/` 헤더만 있으면 세션/쿠키 불필요. 응답의 `data` 필드가 JSON 문자열로 이중 인코딩돼 있어 한 번 더 `json.loads` 필요. `IsAds` 광고 항목 제외 후 `Score` 내림차순 Top 10. 키워드 클릭은 Bing 검색(`bing.com/search?mkt=ko-kr&q=`)으로 연결 — MSN 자체 검색창도 Bing으로 위임하는 것 확인 |
 | 당근마켓 | daangn | `/kr/buy-sell/` | 헤더 네비 `data-gtm="gnb_popular_keyword"` 앵커 텍스트 파싱. href의 `in={지역코드}`는 요청 IP 기준 지역값이라 저장 URL에서 제거하고 `search=` 파라미터로 재조립 |
 | 나무위키 | namuwiki | (비활성) | `namu.news` 2026-06 서비스 종료(복구 시도 금지). 대안으로 `namu.wiki` 본사이트 우측 "실시간 검색어" 위젯을 검토했으나 raw HTML(SSR)에 미포함 — 클라이언트 JS 렌더링 전용이라 브라우저 크롤링 없이는 수집 불가. `keywords/namuwiki.py`의 `active=False`로 표시, `main.py` run()에서 skip |
 
@@ -127,7 +129,7 @@ TTL 없이 남아있는 stale 데이터이므로 `updated_at` 기준으로 최�
 
 | 컬럼 | 타입 | 설명 |
 |---|---|---|
-| source | text (PK) | `danawa` / `daum` / `daangn` / `nate` / (`namuwiki`, 비활성) |
+| source | text (PK) | `danawa` / `daum` / `daangn` / `nate` / `msn` / (`namuwiki`, 비활성) |
 | keywords | jsonb | `[{keyword, url}, ...]` |
 | updated_at | timestamptz | 마지막 수집 시각 |
 
