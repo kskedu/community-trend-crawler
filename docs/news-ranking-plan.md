@@ -3,6 +3,16 @@
 > 상태: **계획서 단계**. 코드 수정/외부 API 호출/DB write/workflow 실행/secret 변경/push **전부 금지**.
 > 진행: 계획서 → Codex 계획 리뷰 → 원문 출력 → Claude 해석 → P0~P3 정리 → (P0/P1 있으면 수정 후 최대 5회 재리뷰) → P0/P1 소멸 시 구현 승인 요청.
 
+> **갱신(2026-07-04) — seed source / 가중치 / 다양성 가드 구조 변경 반영**
+> 이 v1 문서의 아래 세부(§3 seed 목록, §4 adapter, §7 가중치, §10 다양성 가드)는 이후 구조 개편으로 대체됐다. 최신 동작 기준:
+> - **Danawa seed 제거**: 일반 실시간 이슈(`news_top`) seed에서 뺐다(쇼핑 편향). Danawa 스크래퍼/`keyword_cache(danawa)`는 존치(추후 shopping_top용). 추가로 **Nate(`nate_home`)·Bing(=`keyword_cache(msn)`, `bing_home`)·Google Trends RSS(`google_trends`)** 를 seed family로 편입.
+> - **후보 sources**: `{keyword, sources: {google_trends|daum_home|nate_home|bing_home: rank, naver_news_aux|naver_news_phrase: True}}`. 독립 홈/트렌드 family = `{google_trends, naver_home(예약), daum_home, nate_home, bing_home}`.
+> - **다양성 가드 교체**: "Daum 비단독 후보 < `MIN_NON_DAUM_CANDIDATES`" → **독립 source family 종수 < `MIN_SOURCE_FAMILIES`(=2)** 이면 upsert skip + last-good 유지(`candidates.count_source_families`).
+> - **가중치 재구성(4축)**: News Evidence 0.45 / Search Demand 0.30 / Source Consensus 0.15 / Freshness 0.10. DataLab은 seed가 아니라 Search Demand 보조 신호로만 유지.
+> - **DB 덮어쓰기 정책**: hard guard 실패(no news / source diversity / recent guard)는 upsert skip + last-good 유지. quality/fresh gate + recent guard를 통과한 5~9개는 저품질 filler 없이 partial snapshot으로 발행(오래된 last-good 10개보다 신선한 부분 결과 우선).
+> - **Google Trends RSS provider**: 기본 disabled. `GOOGLE_TRENDS_ENABLED=true` **AND** `GOOGLE_TRENDS_PROVIDER=rss`일 때만 외부 HTTP 호출, 실패는 `google_fetch_failed` 로그만(전체 pipeline 안 죽임).
+> 상세 최신 계약은 코드(`news/candidates.py`, `news/ranker.py`, `news/google.py`, `main.py`)와 `docs/news-ranking-quality-plan.md`를 우선한다.
+
 ---
 
 ## 1. 현재 Daum 복제 구조의 문제 정의

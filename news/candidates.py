@@ -1,11 +1,12 @@
 """후보 수집/병합 + News 신호 산출.
 
 설계 계약 (docs/news-ranking-plan.md §3, §4-2, docs/news-ranking-quality-plan.md §7):
-- 후보 pool = Daum seed + Danawa seed + Google(stub) + 경량 보조후보(뉴스 title 토큰).
+- 후보 pool = 홈/트렌드 seed(google_trends/daum_home/nate_home/bing_home)
+  + 경량 보조후보(naver_news_aux: 뉴스 title 토큰, naver_news_phrase: 사건형 phrase).
 - normalize/dedup 후 상한(기본 30)으로 자른다.
 - News 신호(recent_count/latest_age_hours/domain_diversity/title_relevance)는
   normalizer 결과에서 파생 — 기사 본문 전문 저장 없음.
-- 다양성 hard guard: Daum 단독 출처가 아닌 후보 수 < MIN_NON_DAUM_CANDIDATES 이면
+- 다양성 guard: 독립 홈/트렌드 source family 종수 < MIN_SOURCE_FAMILIES 이면
   상위에서 upsert skip (이 모듈은 카운트만 제공).
 
 품질 개선(article relevance / clustering / representative selection):
@@ -23,10 +24,10 @@ from news.summarizer import _tokens  # 기존 토크나이저 재사용(신규 �
 logger = logging.getLogger(__name__)
 
 CANDIDATE_MAX = 30
-AUX_SEED_TOP = 5        # 보조후보 추출에 쓸 daum 상위 키워드 수
+AUX_SEED_TOP = 5        # 보조후보 추출에 쓸 daum_home 상위 키워드 수
 AUX_MAX = 8             # 보조후보 최대 개수
 RECENT_HOURS = 12       # News 최근성 기준
-MIN_NON_DAUM_CANDIDATES = 4
+MIN_SOURCE_FAMILIES = 2   # 독립 홈/트렌드 source family 최소 종수(다양성 guard)
 
 # === backfill pass(최소 10개 확보) 전용 상수 — strict pass(pass1)에는 영향 없음 ===
 BACKFILL_CANDIDATE_MAX = 45   # pass2 병합 pool 상한(daum10+danawa10+aux12+phrase10 수용)
@@ -491,54 +492,86 @@ def _merge(pool: Dict[str, dict], keyword: str, source: str, rank: Optional[int]
 
 
 def collect_candidates(
-    daum_ranked: List[dict],
-    danawa_ranked: List[dict],
-    google_candidates: List[dict],
+    seed_sources: Dict[str, List[dict]],
     aux_keywords: List[str],
-    limit: int = CANDIDATE_MAX,
     phrase_keywords: Optional[List[str]] = None,
+    limit: int = CANDIDATE_MAX,
 ) -> List[dict]:
-    """여러 소스 후보를 병합/dedup → [{keyword, sources:{...}}] (상한 적용).
+    """홈/트렌드 seed + 보조후보를 병합/dedup → [{keyword, sources:{...}}] (상한 적용).
 
+    seed_sources: {family: [{keyword, rank}]}. family 키는 그대로 candidate.sources 키가 된다
+      (google_trends/daum_home/nate_home/bing_home 등). aux/phrase는 naver_news_* 로 표기.
     phrase_keywords: backfill pass 전용 phrase 후보(derive_phrase_candidates 결과).
-    strict pass(pass1) 호출부는 인자를 생략하면 기존과 동일하게 동작한다.
+    strict pass(pass1) 호출부는 phrase_keywords를 생략하면 기존과 동일하게 동작한다.
     """
     pool: Dict[str, dict] = {}
-    for item in daum_ranked or []:
-        _merge(pool, item.get("keyword"), "daum", item.get("rank"))
-    for item in danawa_ranked or []:
-        _merge(pool, item.get("keyword"), "danawa", item.get("rank"))
-    for item in google_candidates or []:
-        _merge(pool, item.get("keyword"), "google", item.get("rank"))
+    for family, ranked in (seed_sources or {}).items():
+        for item in ranked or []:
+            _merge(pool, item.get("keyword"), family, item.get("rank"))
     for kw in aux_keywords or []:
-        _merge(pool, kw, "aux", None)
+        _merge(pool, kw, "naver_news_aux", None)
     for kw in phrase_keywords or []:
-        _merge(pool, kw, "phrase", None)
+        _merge(pool, kw, "naver_news_phrase", None)
 
     candidates = list(pool.values())
-    # daum rank 우선 정렬(후보 안정성). 최종 순위는 ranker가 결정.
-    candidates.sort(key=lambda c: c["sources"].get("daum", 9999))
+    # 후보 pool 절단(truncation) 방지용 정렬: 특정 family 단독 기준(예전 daum_home rank)으로
+    # 정렬하면 홈 3종이 모두 fresh할 때 뒤에 병합된 google_trends가 상한에 밀려 통째로
+    # 잘려나간다(Codex diff 리뷰 P1). 독립 family 중 "최상 rank"를 1차 키로 삼아 각 family의
+    # 상위 후보가 고르게 생존하도록 한다. 동률이면 family priority → keyword로 안정 정렬.
+    # 이 정렬은 어디까지나 truncation 방지용이고, 최종 순위는 ranker가 다시 계산한다.
+    candidates.sort(key=lambda c: (_best_family_rank(c), _best_family_priority(c), c["keyword"]))
     return candidates[:limit]
 
 
-# Daum 파생/종속 소스 — 다양성 카운트에서 제외.
-#   aux 는 Daum 상위 키워드의 뉴스 title 토큰에서 파생되므로 독립 소스가 아니다.
-#   phrase 는 seed 후보들의 뉴스 기사에서 파생되므로 마찬가지로 독립 소스가 아니다
-#   (Codex 계획 리뷰 P1: phrase가 non-daum으로 계산되면 다양성 hard guard가 우회됨).
-_DAUM_DEPENDENT_SOURCES = {"daum", "aux", "phrase"}
+# 독립 홈/트렌드 source family — 다양성 guard / source consensus는 이 집합만 센다.
+#   naver_news_aux/phrase는 Daum 상위 키워드/기사에서 파생되므로 독립 검색 source가 아니다
+#   (Gate 7: naver_news_* 는 독립 검색 source로 계산하지 않는다).
+#   naver_home은 수집 소스가 아직 없어 예약만 해 둔다(현재 후보에 등장하지 않음).
+_INDEPENDENT_SEARCH_FAMILIES = {
+    "google_trends", "naver_home", "daum_home", "nate_home", "bing_home",
+}
+
+# family 동률 tie-breaker 우선순위(작을수록 우선). truncation 정렬 전용 — 최종 ranking과 무관.
+_FAMILY_SORT_PRIORITY = {
+    "google_trends": 0, "bing_home": 1, "daum_home": 2, "nate_home": 3,
+}
 
 
-def count_non_daum(candidates: List[dict]) -> int:
-    """독립 소스(danawa/google 등)에서 온 후보 수(다양성 hard guard용).
+def _best_family_rank(candidate: dict) -> int:
+    """후보의 독립 홈/트렌드 family rank 중 최상(최소)값. rank 없으면 9999.
+    naver_news_aux/phrase의 True(bool)는 rank가 아니므로 제외."""
+    ranks = [
+        r for fam, r in (candidate.get("sources") or {}).items()
+        if fam in _INDEPENDENT_SEARCH_FAMILIES
+        and isinstance(r, int) and not isinstance(r, bool)
+    ]
+    return min(ranks) if ranks else 9999
 
-    Daum 및 Daum 파생(aux)만 가진 후보는 세지 않는다 → 진짜 독립 후보만 카운트.
+
+def _best_family_priority(candidate: dict) -> int:
+    """후보가 rank를 가진 독립 family 중 tie-break 우선순위 최상값(작을수록 우선). 없으면 99.
+
+    _best_family_rank과 동일하게 "유효 int rank를 가진 family"만 센다 — rank 없는 항목
+    (naver_news_aux/phrase의 True, 또는 rankless 독립 family)이 우선순위에 끼어들어
+    (best_rank=9999, priority=0)처럼 꼬리 후보를 잘못 앞세우는 것을 막는다(Codex 2차 P2)."""
+    prios = [
+        _FAMILY_SORT_PRIORITY[fam]
+        for fam, r in (candidate.get("sources") or {}).items()
+        if fam in _FAMILY_SORT_PRIORITY
+        and isinstance(r, int) and not isinstance(r, bool)
+    ]
+    return min(prios) if prios else 99
+
+
+def count_source_families(candidates: List[dict]) -> int:
+    """후보 pool 전체에서 등장한 독립 홈/트렌드 source family 종수(다양성 guard용).
+
+    naver_news_aux/phrase만 가진 후보는 새 family를 더하지 않는다 → 진짜 독립 source만 카운트.
     """
-    n = 0
+    families: set = set()
     for c in candidates:
-        srcs = set(c["sources"].keys())
-        if srcs - _DAUM_DEPENDENT_SOURCES:
-            n += 1
-    return n
+        families |= set(c["sources"].keys()) & _INDEPENDENT_SEARCH_FAMILIES
+    return len(families)
 
 
 def derive_aux_keywords(
@@ -712,14 +745,14 @@ def build_news_signals(
 ) -> Dict[str, dict]:
     """후보별 News 신호맵 + normalized articles 보관.
 
-    phrase 후보(sources에 "phrase")는 strict relevance(require_all_tokens)로 산출한다 —
+    phrase 후보(sources에 "naver_news_phrase")는 strict relevance(require_all_tokens)로 산출한다 —
     다어절 phrase가 일부 토큰만 겹치는 기사로 quality gate를 통과하는 것을 방지
     (Codex 계획 리뷰 P1). seed/aux 후보는 기존 판정 그대로.
     """
     out = {}
     for c in candidates:
         kw = c["keyword"]
-        strict = bool((c.get("sources") or {}).get("phrase"))
+        strict = bool((c.get("sources") or {}).get("naver_news_phrase"))
         sig = compute_news_signal(kw, fetch_news(kw), require_all_tokens=strict)
         if sig:
             out[kw] = sig

@@ -4,8 +4,9 @@
 - ranker: score 결정성, News 지배, 재정규화, penalty, 동점 tiebreak, 0-division
 - candidates: dedup/병합/상한, 다양성 카운트, News 신호 산출
 - datalab: recent_delta 계산, 0-division 방어, fixture skip
-- google: stub skip
-- Daum 복제 방지(순서 탈동조)
+- google: RSS provider(기본 disabled, 외부호출 0), RSS 파싱, demand 신호
+- source family(google_trends/daum_home/nate_home/bing_home) 편입/다양성/4축 score
+- seed 복제 방지(순서 탈동조)
 - JSON backward compatibility(기존 프론트 필드 보존)
 - 랭킹 품질 개선(docs/news-ranking-quality-plan.md): 유사 키워드 dedupe,
   same-issue merge, article relevance/incidental mention 필터, clustering/
@@ -74,13 +75,16 @@ class TestRanker(unittest.TestCase):
         self.assertEqual(r1[0]["score"], r2[0]["score"])
 
     def test_renormalize_news_only(self):
-        # datalab/google/daum 없음 → news weight 1.0로 재정규화
+        # 독립 family/demand 신호 없음(sources 비어있음) → news+freshness 축만 가용
         cands = [{"keyword": "A", "sources": {}}, {"keyword": "B", "sources": {}}]
         signals = {"news": {"A": _news(5, 1, 3, 1.0), "B": _news(1, 10, 1, 1.0)},
-                   "datalab": {}, "google": {}, "daum": {}}
+                   "datalab": {}, "google": {}}
         ranked = ranker.compute_scores(cands, signals)
-        self.assertEqual(ranked[0]["used_signals"], ["news"])
-        # news weight 1.0 → A의 score ≈ news_norm(A)
+        used = set(ranked[0]["used_signals"])
+        self.assertIn("news", used)
+        self.assertIn("freshness", used)  # freshness는 news 근거에서 파생돼 함께 가용
+        self.assertNotIn("search_demand", used)
+        self.assertNotIn("source_consensus", used)
         self.assertGreater(ranked[0]["score"], 0)
 
     def test_all_signals_empty_returns_empty(self):
@@ -206,42 +210,159 @@ class TestDataLab(unittest.TestCase):
             datalab.requests.post = orig
 
 
-class TestGoogleStub(unittest.TestCase):
-    def test_candidates_skip(self):
-        os.environ.pop("GOOGLE_TRENDS_ENABLED", None)
-        self.assertEqual(google.fetch_candidates(), [])
+class TestGoogleProvider(unittest.TestCase):
+    def setUp(self):
+        google.reset_cache()
 
-    def test_signals_skip(self):
+    def tearDown(self):
         os.environ.pop("GOOGLE_TRENDS_ENABLED", None)
-        self.assertEqual(google.fetch_signals(["A"]), {})
+        os.environ.pop("GOOGLE_TRENDS_PROVIDER", None)
+        google.reset_cache()
+
+    def test_disabled_by_default_no_http(self):
+        # 기본 비활성: env 미설정 → 외부 호출 0, 빈 결과
+        os.environ.pop("GOOGLE_TRENDS_ENABLED", None)
+        os.environ.pop("GOOGLE_TRENDS_PROVIDER", None)
+        called = {"n": 0}
+        orig = google.requests.get
+        google.requests.get = lambda *a, **k: called.__setitem__("n", called["n"] + 1)
+        try:
+            self.assertEqual(google.fetch_candidates(), [])
+            self.assertEqual(google.fetch_signals(["A"]), {})
+        finally:
+            google.requests.get = orig
+        self.assertEqual(called["n"], 0)  # 외부 HTTP 호출 없음
+
+    def test_enabled_requires_both_env(self):
+        os.environ["GOOGLE_TRENDS_ENABLED"] = "true"
+        os.environ.pop("GOOGLE_TRENDS_PROVIDER", None)
+        self.assertFalse(google.is_enabled())  # provider=rss 아니면 비활성
+        os.environ["GOOGLE_TRENDS_PROVIDER"] = "rss"
+        self.assertTrue(google.is_enabled())
+
+    def test_rss_parse_candidates(self):
+        os.environ["GOOGLE_TRENDS_ENABLED"] = "true"
+        os.environ["GOOGLE_TRENDS_PROVIDER"] = "rss"
+        rss = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<rss xmlns:ht="https://trends.google.com/trends/trendingsearches/daily">'
+            '<channel>'
+            '<item><title>손흥민</title>'
+            '<ht:approx_traffic>2,000,000+</ht:approx_traffic>'
+            '<pubDate>Sat, 04 Jul 2026 00:00:00 +0900</pubDate>'
+            '<ht:news_item><ht:news_item_title>손흥민 결승골</ht:news_item_title>'
+            '<ht:news_item_url>https://n.example/1</ht:news_item_url></ht:news_item>'
+            '</item>'
+            '<item><title>환율</title>'
+            '<ht:approx_traffic>500,000+</ht:approx_traffic></item>'
+            '</channel></rss>'
+        )
+
+        class _Resp:
+            content = rss.encode("utf-8")
+            def raise_for_status(self):
+                pass
+
+        orig = google.requests.get
+        google.requests.get = lambda *a, **k: _Resp()
+        try:
+            cands = google.fetch_candidates()
+        finally:
+            google.requests.get = orig
+        self.assertEqual([c["keyword"] for c in cands], ["손흥민", "환율"])
+        self.assertEqual(cands[0]["rank"], 1)
+        self.assertEqual(cands[0]["volume_bucket"], "2,000,000+")
+        self.assertTrue(cands[0]["active"])
+        self.assertEqual(cands[0]["related_news"][0]["url"], "https://n.example/1")
+
+    def test_signals_from_trends(self):
+        os.environ["GOOGLE_TRENDS_ENABLED"] = "true"
+        os.environ["GOOGLE_TRENDS_PROVIDER"] = "rss"
+        google._cache = [
+            {"keyword": "손흥민", "rank": 1, "active": True, "volume_bucket": "2,000,000+"},
+            {"keyword": "환율", "rank": 2, "active": True},
+        ]
+        google._cache_loaded = True
+        sig = google.fetch_signals(["손흥민", "무관키워드"])
+        self.assertIn("손흥민", sig)
+        self.assertNotIn("무관키워드", sig)  # 트렌드에 없는 후보는 신호 없음
+        self.assertGreater(sig["손흥민"]["interest"], 0)
+        self.assertTrue(0.0 <= sig["손흥민"]["interest"] <= 1.0)
+
+    def test_rss_fetch_failure_returns_empty(self):
+        os.environ["GOOGLE_TRENDS_ENABLED"] = "true"
+        os.environ["GOOGLE_TRENDS_PROVIDER"] = "rss"
+        orig = google.requests.get
+        google.requests.get = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+        try:
+            self.assertEqual(google.fetch_candidates(), [])  # google_fetch_failed → [] (pipeline 안 죽임)
+        finally:
+            google.requests.get = orig
 
 
 class TestCandidates(unittest.TestCase):
     def test_merge_dedup(self):
         c = cand.collect_candidates(
-            [{"keyword": "A", "rank": 1}, {"keyword": "B", "rank": 2}],
-            [{"keyword": "a", "rank": 1}],  # 대소문자 dedup
-            [], [],
+            {
+                "daum_home": [{"keyword": "A", "rank": 1}, {"keyword": "B", "rank": 2}],
+                "nate_home": [{"keyword": "a", "rank": 1}],  # 대소문자 dedup
+            },
+            [],
         )
-        keys = [x["keyword"] for x in c]
         self.assertEqual(len(c), 2)  # A/a 병합
-        self.assertIn("daum", next(x for x in c if x["keyword"] == "A")["sources"])
+        srcs = next(x for x in c if x["keyword"] == "A")["sources"]
+        self.assertIn("daum_home", srcs)
+        self.assertIn("nate_home", srcs)  # 병합 시 두 family 모두 보존
 
     def test_limit(self):
         many = [{"keyword": f"k{i}", "rank": i} for i in range(50)]
-        c = cand.collect_candidates(many, [], [], [], limit=30)
+        c = cand.collect_candidates({"daum_home": many}, [], limit=30)
         self.assertEqual(len(c), 30)
 
-    def test_count_non_daum_excludes_aux(self):
-        # 독립 소스(danawa/google)만 카운트. daum/aux 종속은 제외.
+    def test_google_trends_survives_truncation(self):
+        # 홈 3종이 모두 가득(각 Top10=30개)이어도 정렬이 daum_home 단독이 아니라 family
+        # 최상 rank 기준이므로 google_trends 상위 후보가 truncation에서 생존해야 한다(P1-B).
+        seed_sources = {
+            "daum_home": [{"keyword": f"d{i}", "rank": i + 1} for i in range(10)],
+            "nate_home": [{"keyword": f"n{i}", "rank": i + 1} for i in range(10)],
+            "bing_home": [{"keyword": f"b{i}", "rank": i + 1} for i in range(10)],
+            "google_trends": [{"keyword": f"g{i}", "rank": i + 1} for i in range(10)],
+        }
+        c = cand.collect_candidates(seed_sources, [], limit=30)
+        kws = {x["keyword"] for x in c}
+        self.assertEqual(len(c), 30)
+        self.assertIn("g0", kws)  # google rank1 생존
+        self.assertIn("g1", kws)  # google rank2 생존
+        # rank1 후보는 모든 family에서 살아남아야(각 family 최상위) 한다.
+        for f in ("d0", "n0", "b0", "g0"):
+            self.assertIn(f, kws)
+
+    def test_best_family_rank_ignores_bool(self):
+        # naver_news_aux/phrase의 True는 rank가 아니므로 9999로 처리(우선순위에도 안 낌).
+        c = {"keyword": "x", "sources": {"naver_news_aux": True, "naver_news_phrase": True}}
+        self.assertEqual(cand._best_family_rank(c), 9999)
+        self.assertEqual(cand._best_family_priority(c), 99)
+
+    def test_best_family_priority_defaults_when_rankless(self):
+        # rankless 독립 family(True)만 있으면 priority는 0이 아니라 99로 default 돼야 한다(Codex 2차 P2).
+        c = {"keyword": "x", "sources": {"google_trends": True}}
+        self.assertEqual(cand._best_family_rank(c), 9999)
+        self.assertEqual(cand._best_family_priority(c), 99)
+        # 정상 int rank면 family priority가 그대로 반영된다.
+        c2 = {"keyword": "y", "sources": {"google_trends": 1}}
+        self.assertEqual(cand._best_family_priority(c2), 0)
+
+    def test_count_source_families(self):
+        # 독립 홈/트렌드 family 종수만 카운트. naver_news_* 파생은 제외.
         c = [
-            {"keyword": "A", "sources": {"daum": 1}},               # daum 단독 → 제외
-            {"keyword": "B", "sources": {"daum": 2, "danawa": 1}},  # danawa → 카운트
-            {"keyword": "C", "sources": {"aux": True}},             # aux 단독(Daum 파생) → 제외
-            {"keyword": "D", "sources": {"google": 1}},             # google → 카운트
-            {"keyword": "E", "sources": {"daum": 3, "aux": True}},  # daum+aux → 제외
+            {"keyword": "A", "sources": {"daum_home": 1}},                    # daum_home
+            {"keyword": "B", "sources": {"daum_home": 2, "nate_home": 1}},    # +nate_home
+            {"keyword": "C", "sources": {"naver_news_aux": True}},            # 파생 → 미포함
+            {"keyword": "D", "sources": {"google_trends": 1}},               # +google_trends
+            {"keyword": "E", "sources": {"daum_home": 3, "naver_news_aux": True}},
         ]
-        self.assertEqual(cand.count_non_daum(c), 2)  # B, D만
+        # 등장 family = {daum_home, nate_home, google_trends} → 3종
+        self.assertEqual(cand.count_source_families(c), 3)
 
     def test_compute_news_signal_drops_invalid(self):
         raw = [
@@ -260,12 +381,12 @@ class TestBuilderBackwardCompat(unittest.TestCase):
     def test_entry_has_legacy_and_new_fields(self):
         ranked_item = {
             "keyword": "환율", "score": 0.9,
-            "source_breakdown": {"news": 0.9, "datalab": 0.5, "google": 0.0, "daum": 0.3},
+            "source_breakdown": {"news": 0.9, "search_demand": 0.5, "source_consensus": 0.3, "freshness": 0.4},
             "rank_reason": "최근 뉴스 다수",
             "news_meta": _news(3, 1, 2, 1.0),
-            "used_signals": ["news", "datalab", "daum"],
+            "used_signals": ["news", "search_demand", "freshness"],
         }
-        entry = build_ranked_entry(1, ranked_item, {"keyword": "환율", "sources": {"daum": 1}})
+        entry = build_ranked_entry(1, ranked_item, {"keyword": "환율", "sources": {"daum_home": 1}})
         # 기존 프론트가 읽는 필드(legacy)
         for f in ("rank", "keyword", "summary", "signals", "articles"):
             self.assertIn(f, entry)
@@ -274,8 +395,10 @@ class TestBuilderBackwardCompat(unittest.TestCase):
         # 신규 optional
         for f in ("score", "rank_reason", "source_breakdown"):
             self.assertIn(f, entry)
-        for s in ("datalab", "google", "daum"):
+        # 신규 signals(family 기반)
+        for s in ("daum", "google", "nate", "bing", "search_demand"):
             self.assertIn(s, entry["signals"])
+        self.assertTrue(entry["signals"]["daum"])  # daum_home seed → True
 
     def test_issues_root_optional_fields(self):
         ranked_item = {"keyword": "A", "score": 0.5, "source_breakdown": {"news": 0.5},
@@ -1908,21 +2031,21 @@ class TestPhraseStrictRelevance(unittest.TestCase):
 
 
 class TestPhraseCandidateDiversitySource(unittest.TestCase):
-    """phrase 소스가 다양성 hard guard를 우회하지 않는지(2차 리뷰 P1 반영)."""
+    """naver_news_phrase 소스가 다양성 guard를 우회하지 않는지(Gate 7)."""
 
-    def test_phrase_source_excluded_from_non_daum_count(self):
-        candidates_ = [{"keyword": "월드컵 일정", "sources": {"phrase": True}}]
-        self.assertEqual(cand.count_non_daum(candidates_), 0)
+    def test_phrase_source_not_counted_as_family(self):
+        candidates_ = [{"keyword": "월드컵 일정", "sources": {"naver_news_phrase": True}}]
+        self.assertEqual(cand.count_source_families(candidates_), 0)
 
-    def test_phrase_mixed_with_independent_source_still_counted(self):
-        candidates_ = [{"keyword": "월드컵", "sources": {"phrase": True, "danawa": 1}}]
-        self.assertEqual(cand.count_non_daum(candidates_), 1)
+    def test_phrase_mixed_with_independent_family_still_counted(self):
+        candidates_ = [{"keyword": "월드컵", "sources": {"naver_news_phrase": True, "nate_home": 1}}]
+        self.assertEqual(cand.count_source_families(candidates_), 1)
 
     def test_collect_candidates_includes_phrase_keywords(self):
-        result = cand.collect_candidates([], [], [], [], phrase_keywords=["신규 이슈 phrase"])
+        result = cand.collect_candidates({}, [], phrase_keywords=["신규 이슈 phrase"])
         kws = [c["keyword"] for c in result]
         self.assertIn("신규 이슈 phrase", kws)
-        self.assertEqual(result[0]["sources"].get("phrase"), True)
+        self.assertEqual(result[0]["sources"].get("naver_news_phrase"), True)
 
 
 class TestBackfillPassSelection(unittest.TestCase):
@@ -2004,8 +2127,9 @@ class TestBackfillPassIntegration(unittest.TestCase):
         # pass1 aux(top=5)에서 뽑힌 키워드가 pass2 aux 확장(top=10) 재추출에서
         # 우연히 빠지더라도(aux_max 상한 등으로), union 덕에 candidates2에 남아있어야 한다.
         daum_ranked = [{"keyword": f"daum{i}", "rank": i + 1} for i in range(10)]
-        # 다양성 가드(MIN_NON_DAUM_CANDIDATES=4) 통과용 독립 소스 4개.
-        danawa_ranked = [{"keyword": f"danawa상품{i}", "rank": i + 1} for i in range(4)]
+        # 다양성 guard(MIN_SOURCE_FAMILIES=2) 통과용 두 번째 독립 family.
+        nate_ranked = [{"keyword": f"nate이슈{i}", "rank": i + 1} for i in range(4)]
+        home_fulls = {"daum_home": daum_ranked, "nate_home": nate_ranked}
         pass1_aux = ["생존이슈phrase"]
         pass1_top = [{"keyword": "daum1", "related_keywords": []}]
 
@@ -2024,19 +2148,18 @@ class TestBackfillPassIntegration(unittest.TestCase):
         news_signals = {"daum1": cand.compute_news_signal("daum1", news_by_kw["daum1"])}
 
         top2, candidates2 = main_module._backfill_pass(
-            pass1_top, pass1_aux, daum_ranked, danawa_ranked, [],
+            pass1_top, pass1_aux, home_fulls, [], daum_ranked,
             fetch, news_signals, {}, {},
         )
-        self.assertIsNotNone(candidates2, "다양성 가드 통과 + aux 신규 후보 있으므로 pass2가 채택돼야 함")
+        self.assertIsNotNone(candidates2, "다양성 guard 통과 + aux 신규 후보 있으므로 pass2가 채택돼야 함")
         kws = [c["keyword"] for c in candidates2]
         self.assertIn("생존이슈phrase", kws, "pass1 aux는 top 확장 재추출 결과에 없어도 union으로 보존돼야 함")
 
     def test_backfill_pass_returns_none_when_no_new_candidates(self):
         # aux/phrase 둘 다 신규 후보를 못 만들면 (None, None)으로 pass1 유지를 알린다.
-        daum_ranked = []
         fetch = self._news_fixture_fetch({})
         top2, candidates2 = main_module._backfill_pass(
-            [], [], daum_ranked, [], [], fetch, {}, {}, {},
+            [], [], {}, [], [], fetch, {}, {}, {},
         )
         self.assertIsNone(top2)
         self.assertIsNone(candidates2)
@@ -2289,6 +2412,95 @@ class TestDisplayArticleInvariant(unittest.TestCase):
         out = ranker.enforce_display_article_consistency([item])
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0]["display_keyword"], "반도체")
+
+
+class TestSourceFamilyIntegration(unittest.TestCase):
+    """google_trends/nate_home/bing_home family 편입 + evidence gate + 신규 4축 검증."""
+
+    def test_all_home_families_merged_into_pool(self):
+        seed_sources = {
+            "google_trends": [{"keyword": "손흥민", "rank": 1}],
+            "daum_home": [{"keyword": "환율", "rank": 1}],
+            "nate_home": [{"keyword": "태풍", "rank": 1}],
+            "bing_home": [{"keyword": "손흥민", "rank": 3}],  # google과 병합
+        }
+        c = cand.collect_candidates(seed_sources, [])
+        kws = {x["keyword"] for x in c}
+        self.assertEqual(kws, {"손흥민", "환율", "태풍"})
+        son = next(x for x in c if x["keyword"] == "손흥민")
+        self.assertIn("google_trends", son["sources"])
+        self.assertIn("bing_home", son["sources"])
+        # 등장 family = google_trends/daum_home/nate_home/bing_home → 4종
+        self.assertEqual(cand.count_source_families(c), 4)
+
+    def test_newsless_home_candidate_excluded_from_top(self):
+        # Naver News evidence 없는 google/nate/bing 후보는 최종 랭킹에 없어야 한다(Gate 1).
+        cands = [
+            {"keyword": "실뉴스이슈", "sources": {"daum_home": 1}},
+            {"keyword": "구글단독", "sources": {"google_trends": 1}},
+            {"keyword": "네이트단독", "sources": {"nate_home": 1}},
+        ]
+        signals = {
+            "news": {"실뉴스이슈": _news(3, 1, 2, 0.9)},  # 나머지 news 없음
+            "datalab": {}, "google": {"구글단독": {"interest": 0.9}},
+        }
+        ranked = ranker.compute_scores(cands, signals)
+        kws = [r["keyword"] for r in ranked]
+        self.assertIn("실뉴스이슈", kws)
+        self.assertNotIn("구글단독", kws)   # google 신호 있어도 news 없으면 제외
+        self.assertNotIn("네이트단독", kws)
+
+    def test_source_consensus_rewards_multi_family(self):
+        # news 신호 동일할 때 더 많은 독립 family를 가진 후보의 score가 높아야 한다.
+        cands = [
+            {"keyword": "복수합의", "sources": {"daum_home": 1, "nate_home": 1, "bing_home": 1}},
+            {"keyword": "단일소스", "sources": {"daum_home": 1}},
+        ]
+        signals = {
+            "news": {"복수합의": _news(3, 1, 2, 0.9), "단일소스": _news(3, 1, 2, 0.9)},
+            "datalab": {}, "google": {},
+        }
+        ranked = ranker.compute_scores(cands, signals)
+        scores = {r["keyword"]: r["score"] for r in ranked}
+        self.assertGreater(scores["복수합의"], scores["단일소스"])
+        self.assertIn("source_consensus", ranked[0]["source_breakdown"])
+
+    def test_search_demand_priority_prefers_google(self):
+        # 두 후보 모두 daum rank + google interest 보유. google이 우선순위상 앞서므로
+        # demand는 daum rank가 아니라 google interest를 따라야 한다.
+        #   X: daum rank 나쁨(10) + google interest 높음(1.0)
+        #   Y: daum rank 좋음(1)  + google interest 낮음(0.0)
+        cands = [
+            {"keyword": "X", "sources": {"daum_home": 10}},
+            {"keyword": "Y", "sources": {"daum_home": 1}},
+        ]
+        signals = {
+            "news": {"X": _news(3, 1, 2, 0.9), "Y": _news(3, 1, 2, 0.9)},
+            "datalab": {},
+            "google": {"X": {"interest": 1.0}, "Y": {"interest": 0.0}},
+        }
+        ranked = ranker.compute_scores(cands, signals)
+        bd = {r["keyword"]: r["source_breakdown"]["search_demand"] for r in ranked}
+        # daum rank만 보면 Y가 우세하지만, google 우선순위라 X의 demand가 더 높아야 한다.
+        self.assertGreater(bd["X"], bd["Y"])
+
+
+class TestGuardPredicates(unittest.TestCase):
+    """diversity/recent guard 판정 predicate — 실패 시 upsert skip(last good 유지)의 근거."""
+
+    def test_diversity_guard_predicate(self):
+        # 독립 family 1종뿐이면 MIN_SOURCE_FAMILIES(2) 미만 → skip 대상.
+        c = [{"keyword": "A", "sources": {"daum_home": 1, "naver_news_aux": True}}]
+        self.assertLess(cand.count_source_families(c), cand.MIN_SOURCE_FAMILIES)
+
+    def test_recent_guard_predicate(self):
+        # 최근 기사 보유 키워드 수가 MIN_RECENT_KEYWORDS 미만이면 skip 대상.
+        top = [
+            {"keyword": "A", "news_meta": {"recent_count": 1}},
+            {"keyword": "B", "news_meta": {"recent_count": 0}},
+        ]
+        self.assertEqual(main_module._count_recent_keywords(top), 1)
+        self.assertLess(main_module._count_recent_keywords(top), main_module.MIN_RECENT_KEYWORDS)
 
 
 if __name__ == "__main__":

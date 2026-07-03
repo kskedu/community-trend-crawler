@@ -112,26 +112,25 @@ def run_ranking(verbose: bool = True) -> dict:
     datalab_fx = _load_fixture("datalab.json")
 
     daum_ranked = ranked_seed_from_fixture(seed_fx)
-    danawa_ranked = ranked_seed_from_fixture(danawa_fx)
+    # 두 번째 fixture를 nate_home으로 재활용(다양성 family 데모 — Danawa는 news_top에서 제거됨).
+    nate_ranked = ranked_seed_from_fixture(danawa_fx)
 
     def fetch_news(keyword: str):
         # fixture pubDate를 '지금 기준 최근'으로 재주입(최근성 가드 데모용).
         entry = news_fx.get(keyword) or {}
         return _inject_recent(entry.get("items", []))
 
-    # Google stub → 후보/신호 없음
     aux = cand.derive_aux_keywords(daum_ranked, fetch_news)
-    candidates = cand.collect_candidates(daum_ranked, danawa_ranked, [], aux)
+    seed_sources = {"daum_home": daum_ranked, "nate_home": nate_ranked}
+    candidates = cand.collect_candidates(seed_sources, aux)
     news_signals = cand.build_news_signals(candidates, fetch_news)
     kw_list = [c["keyword"] for c in candidates]
     datalab_signals = datalab_adapter.fetch_from_fixture(datalab_fx, kw_list)
-    daum_signals = {c["keyword"]: c["sources"].get("daum") for c in candidates}
 
     signals = {
         "news": news_signals,
         "datalab": datalab_signals,
-        "google": {},  # stub
-        "daum": daum_signals,
+        "google": {},  # provider 기본 비활성
     }
     # production(_rank_and_select)과 동일 시퀀스로 랭킹을 산출한다 — dry-run 검증 경로가
     # 실제 파이프라인과 어긋나지 않도록(Codex diff 리뷰 P2). PR hard exclude → dedupe/merge →
@@ -146,8 +145,10 @@ def run_ranking(verbose: bool = True) -> dict:
     data_sources = ["naver_news"]
     if datalab_signals:
         data_sources.append("datalab")
-    if any(s is not None for s in daum_signals.values()):
-        data_sources.append("daum")
+    participating = set()
+    for c in candidates:
+        participating |= set(c["sources"].keys()) & cand._INDEPENDENT_SEARCH_FAMILIES
+    data_sources.extend(sorted(participating))
     issues = build_ranked_issues(top, candidate_map, data_sources)
 
     if verbose:

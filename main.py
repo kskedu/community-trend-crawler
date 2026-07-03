@@ -185,52 +185,104 @@ def _rank_and_select(candidates, signals, pass_name):
     return top
 
 
+# 홈/트렌드 seed 확장 단계 상한: pass1은 홈 Top10, pass2(backfill)는 홈 Top20.
+# google_trends는 두 pass 모두 provider 상한(최대 20) 그대로 사용한다.
+HOME_PASS1_TOP = 10
+HOME_PASS2_TOP = 20
+
+# (source, family, 로그용 short) 매핑. bing_home은 keyword_cache source='msn'(bing 검색 연결).
+_HOME_SEED_SPEC = (
+    ("daum", "daum_home", "daum"),
+    ("nate", "nate_home", "nate"),
+    ("msn", "bing_home", "bing"),
+)
+
+
+def _collect_home_seeds():
+    """홈 seed(daum/nate/bing)를 keyword_cache에서 read-only 조회.
+
+    반환: {family: ranked(list, 최대 20)}. fresh 하지 않거나 조회 실패한 family는
+    제외하고 drop_reason 로그를 남긴다(전체 pipeline은 죽이지 않는다).
+    """
+    fulls = {}
+    for source, family, short in _HOME_SEED_SPEC:
+        ranked, fresh = fetch_ranked_seed(source)
+        if not ranked:
+            logger.warning("[news] %s seed 없음/조회 실패 → drop(%s_fetch_failed)", family, short)
+            continue
+        if not fresh:
+            logger.warning("[news] %s seed stale → drop(stale_only)", family)
+            continue
+        fulls[family] = ranked
+    return fulls
+
+
+def _seed_sources_from(home_fulls, google_cands, home_top):
+    """home_fulls(family→최대20) 를 home_top으로 절단 + google_trends(상한 그대로) 결합."""
+    seed_sources = {fam: ranked[:home_top] for fam, ranked in home_fulls.items()}
+    if google_cands:
+        seed_sources["google_trends"] = google_cands  # provider 상한(최대 20) 유지
+    return seed_sources
+
+
+def _google_related_terms(google_cands):
+    """google_trends 후보의 related_terms(있으면)를 pass2 phrase 후보로 수집."""
+    terms = []
+    for c in google_cands or []:
+        for t in c.get("related_terms") or []:
+            if isinstance(t, str) and t.strip():
+                terms.append(t.strip())
+    return list(dict.fromkeys(terms))
+
+
 def _backfill_pass(
-    pass1_top, pass1_aux, daum_ranked, danawa_ranked, google_cands,
+    pass1_top, pass1_aux, home_fulls, google_cands, daum_full,
     cached_search_news, news_signals, datalab_signals, google_signals,
 ):
     """pass2(backfill): 후보 발굴 확장 후 동일 gate/merge로 전체 재계산.
 
-    - 신규 후보 2경로: aux 확장(daum 전체 Top10 기반, 상한 12) + 뉴스 title 기반
-      phrase 후보(derive_phrase_candidates — pass1에서 이미 fetch한 기사만 사용).
+    - 신규 후보 3경로: 홈 seed Top20 확장 + aux 확장(daum_home 전체 기반, 상한 12)
+      + 뉴스 title 기반 phrase 후보 + Google related terms(있으면).
     - 신규 후보만 뉴스 실호출(cached_search_news 메모이즈), datalab/google 신호는
-      pass1 것을 재사용(추가 API 호출 없음 — 신규 후보는 news 신호만으로 평가,
-      가용 신호 재정규화 구조상 문제 없음).
+      pass1 것을 재사용(추가 API 호출 없음).
     - 증분 방식은 min-max 집합 정규화와 충돌하므로 전체 재계산을 채택한다.
-    - 안전장치: 재계산 결과가 pass1보다 못하면(신규 후보가 기존 그룹을 브리지해
-      병합 개수가 줄어드는 등) 채택하지 않고 pass1 결과를 유지한다.
+    - 안전장치: 재계산 결과가 pass1보다 못하면 채택하지 않고 pass1 결과를 유지(rollback).
 
     반환: (top2, candidates2). 채택하지 않으면 (None, None).
     """
     try:
         aux_expanded = cand.derive_aux_keywords(
-            daum_ranked, cached_search_news,
+            daum_full, cached_search_news,
             top=cand.AUX_SEED_TOP_BACKFILL, aux_max=cand.AUX_MAX_BACKFILL,
         )
-        # pass1 aux는 top=5 기준으로 뽑힌 결과라 top=10 확장 결과(aux_expanded)의
-        # subset이 보장되지 않는다(Codex diff 리뷰 P1: aux_max 상한이 다르면 pass1
-        # 생존 이슈의 aux가 재추출에서 잘려나갈 수 있음). union으로 합쳐 pass1 후보를
-        # 보존한다.
+        # pass1 aux는 top=5 기준이라 top=10 확장 결과의 subset이 아니다 → union으로 보존.
         aux2 = list(dict.fromkeys((pass1_aux or []) + aux_expanded))
-        # pass1 생존 이슈(canonical + 흡수된 alias)와 유사한 phrase는 재발굴하지 않는다
-        # (어차피 same-issue merge로 흡수 — gate 탈락 seed의 phrase 확장형만이 새 기회).
+        # pass1 생존 이슈(canonical + alias)와 유사한 phrase는 재발굴하지 않는다.
         survived = []
         for t in pass1_top:
             survived.append(t["keyword"])
             survived.extend(t.get("related_keywords") or [])
         phrases = cand.derive_phrase_candidates(news_signals, survived)
-        if not aux_expanded and not phrases:
+        phrases = list(dict.fromkeys(phrases + _google_related_terms(google_cands)))
+        # 홈 seed Top20 확장분(pass1 Top10 대비 늘어난 후보)이 있는지도 새 후보로 본다.
+        seed_sources2 = _seed_sources_from(home_fulls, google_cands, HOME_PASS2_TOP)
+        seed_sources1 = _seed_sources_from(home_fulls, google_cands, HOME_PASS1_TOP)
+        home_expanded = any(
+            len(seed_sources2.get(f, [])) > len(seed_sources1.get(f, []))
+            for f in seed_sources2
+        )
+        if not aux_expanded and not phrases and not home_expanded:
             logger.info("[news] pass2: 신규 후보 없음 → pass1 결과 유지")
             return None, None
 
         candidates2 = cand.collect_candidates(
-            daum_ranked, danawa_ranked, google_cands, aux2,
-            limit=cand.BACKFILL_CANDIDATE_MAX, phrase_keywords=phrases,
+            seed_sources2, aux2,
+            phrase_keywords=phrases, limit=cand.BACKFILL_CANDIDATE_MAX,
         )
-        # 다양성 hard guard 재적용(phrase/aux는 Daum 파생으로 계산돼 우회 불가)
-        non_daum = cand.count_non_daum(candidates2)
-        if non_daum < cand.MIN_NON_DAUM_CANDIDATES:
-            logger.warning("[news] pass2: 다양성 부족(%d) → pass1 결과 유지", non_daum)
+        # 다양성 guard 재적용
+        families = cand.count_source_families(candidates2)
+        if families < cand.MIN_SOURCE_FAMILIES:
+            logger.warning("[news] pass2: source_diversity_failed(%d) → pass1 결과 유지", families)
             return None, None
 
         news_signals2 = cand.build_news_signals(candidates2, cached_search_news)
@@ -240,7 +292,6 @@ def _backfill_pass(
             "news": news_signals2,
             "datalab": datalab_signals,
             "google": google_signals,
-            "daum": {c["keyword"]: c["sources"].get("daum") for c in candidates2},
         }
         top2 = _rank_and_select(candidates2, signals2, "pass2(backfill)")
         improved = len(top2) > len(pass1_top) or (
@@ -262,34 +313,30 @@ def _backfill_pass(
 def run_news_briefing():
     """통합 랭킹으로 news_issue_cache(source='news_top') 갱신.
 
-    흐름: 후보수집(daum/danawa/google/보조후보) → News/DataLab/Google 신호 →
-          ranker score → Top10 → build_ranked_issues → upsert.
-    Daum 순서를 그대로 쓰지 않고 자체 score로 재정렬한다.
+    흐름: 홈/트렌드 seed(google_trends/daum_home/nate_home/bing_home) + 보조후보 수집 →
+          News/DataLab/Google 신호 → ranker 4축 score → Top10 → build → upsert.
+    seed 순서를 그대로 쓰지 않고 자체 score로 재정렬한다. 모든 후보는 Naver News
+    quality/fresh gate 통과 필수.
 
     2-pass backfill(품질 기준 유지형 최소 10개 확보):
-    - pass1(strict): 기존 후보 pool 그대로.
+    - pass1(strict): google_trends Top20 + daum/nate/bing Top10.
     - pass1 final이 TOP_N 미만이거나 최근성 가드에 미달하면 pass2(backfill):
-      aux 확장 + 뉴스 title 기반 phrase 후보를 더해 동일 gate/merge로 전체 재계산.
-      뉴스 fetch는 키워드 단위 메모이즈로 pass1 결과를 재사용(신규 후보만 실호출),
-      datalab/google 신호도 pass1 것을 재사용(추가 API 호출 없음).
-    - 그래도 부족하면 품질 기준을 낮추지 않고 부족 사유를 로그로 남긴 채 진행.
+      홈 seed Top20 + aux 확장 + phrase + Google related terms로 동일 gate/merge 재계산.
+      개선 없으면 pass1로 rollback.
+    - 그래도 부족하면 품질 기준을 낮추지 않고 부족 사유 로그만 남긴 채 진행(filler 미삽입).
 
-    upsert skip 가드(기존 캐시 보존):
-    - News 신호 전무(키 없음/전건 실패) → skip
-    - 다양성 부족(Daum 비단독 후보 < MIN_NON_DAUM_CANDIDATES) → skip
+    upsert skip 가드(last good snapshot 유지):
     - 후보 없음 → skip
-    - Top10 중 최근 기사 보유 키워드 < MIN_RECENT_KEYWORDS → skip
+    - source_diversity_failed(독립 family < MIN_SOURCE_FAMILIES) → skip
+    - no_news_evidence(News 신호 전무) → skip
+    - recent_guard_failed(Top10 중 최근 기사 보유 키워드 < MIN_RECENT_KEYWORDS) → skip
     실패해도 커뮤니티/키워드 수집 결과엔 영향 없도록 격리.
     """
     try:
-        # 1) 후보 수집
-        daum_ranked, daum_fresh = fetch_ranked_seed("daum")
-        danawa_ranked, _ = fetch_ranked_seed("danawa")
-        if not daum_fresh:
-            # daum stale → 후보/신호에서 제외 (seed 단독 후보면 다양성 가드에서 걸림)
-            logger.warning("[news] daum seed stale → daum 후보 제외")
-            daum_ranked = []
-        google_cands = google_adapter.fetch_candidates()
+        # 1) 홈/트렌드 seed 수집
+        home_fulls = _collect_home_seeds()  # {family: ranked(≤20)}
+        google_cands = google_adapter.fetch_candidates()  # 비활성/실패 시 [] (내부 로그)
+        daum_full = home_fulls.get("daum_home", [])  # aux 추출 원천
 
         # 뉴스 fetch 메모이즈 — pass2 backfill에서 같은 키워드 재호출 방지(쿼터 보호).
         news_fetch_cache = {}
@@ -299,51 +346,47 @@ def run_news_briefing():
                 news_fetch_cache[keyword] = search_news(keyword)
             return news_fetch_cache[keyword]
 
-        aux = cand.derive_aux_keywords(daum_ranked, cached_search_news)
-        candidates = cand.collect_candidates(daum_ranked, danawa_ranked, google_cands, aux)
+        aux = cand.derive_aux_keywords(daum_full, cached_search_news)
+        seed_sources = _seed_sources_from(home_fulls, google_cands, HOME_PASS1_TOP)
+        candidates = cand.collect_candidates(seed_sources, aux)
         if not candidates:
-            logger.warning("[news] 후보 없음 → news_top upsert skip (기존 캐시 보존)")
+            logger.warning("[news] 후보 없음 → news_top upsert skip (last good 유지)")
             return
 
-        # 다양성 hard guard
-        non_daum = cand.count_non_daum(candidates)
-        if non_daum < cand.MIN_NON_DAUM_CANDIDATES:
+        # 다양성 guard(source family)
+        families = cand.count_source_families(candidates)
+        if families < cand.MIN_SOURCE_FAMILIES:
             logger.warning(
-                "[news] 다양성 부족(Daum 비단독 후보 %d < %d) → skip (Daum 복제 방지)",
-                non_daum, cand.MIN_NON_DAUM_CANDIDATES,
+                "[news] source_diversity_failed(독립 family %d < %d) → skip (last good 유지)",
+                families, cand.MIN_SOURCE_FAMILIES,
             )
             return
 
-        # 2) 신호 산출
+        # 2) 신호 산출 (홈 rank demand는 ranker가 candidate.sources에서 직접 읽음)
         news_signals = cand.build_news_signals(candidates, cached_search_news)
         if not news_signals:
-            logger.warning("[news] News 신호 전무 → news_top upsert skip (기존 캐시 보존)")
+            logger.warning("[news] no_news_evidence(News 신호 전무) → skip (last good 유지)")
             return
         kw_list = [c["keyword"] for c in candidates]
         datalab_signals = datalab_adapter.fetch(kw_list)
         google_signals = google_adapter.fetch_signals(kw_list)
-        daum_signals = {c["keyword"]: c["sources"].get("daum") for c in candidates}
 
         signals = {
             "news": news_signals,
             "datalab": datalab_signals,
             "google": google_signals,
-            "daum": daum_signals,
         }
 
         # 3) pass1(strict): score → dedupe/same-issue merge → generic singleton 제외 → Top10
-        #    (dedupe/merge는 score 계산 후, Top10 확정 전에 적용 — 유사 키워드/같은 이슈가
-        #    각각 별도 순위를 차지하지 않도록. docs/news-ranking-quality-plan.md §7)
         top = _rank_and_select(candidates, signals, "pass1(strict)")
         if not top:
-            logger.warning("[news] 랭킹 결과 없음 → skip")
+            logger.warning("[news] 랭킹 결과 없음 → skip (last good 유지)")
             return
 
         # 3-1) pass2(backfill): final 부족 또는 최근성 가드 미달이면 후보 발굴 확장.
-        #      gate/merge 기준은 pass1과 완전히 동일(품질 기준 완화 없음) — 후보만 늘린다.
         if len(top) < ranker.TOP_N or _count_recent_keywords(top) < MIN_RECENT_KEYWORDS:
             top2, candidates2 = _backfill_pass(
-                top, aux, daum_ranked, danawa_ranked, google_cands,
+                top, aux, home_fulls, google_cands, daum_full,
                 cached_search_news, news_signals, datalab_signals, google_signals,
             )
             if top2 is not None:
@@ -353,24 +396,33 @@ def run_news_briefing():
         recent_kw = _count_recent_keywords(top)
         if recent_kw < MIN_RECENT_KEYWORDS:
             logger.warning(
-                "[news] 최근 기사 보유 키워드 부족(%d < %d) → skip (실시간성 부족)",
+                "[news] recent_guard_failed(최근 기사 보유 키워드 %d < %d) → skip (last good 유지)",
                 recent_kw, MIN_RECENT_KEYWORDS,
             )
             return
         if len(top) < ranker.TOP_N:
+            # publish 정책(사용자 확정 2026-07-04):
+            #  - hard guard 실패(no news / source diversity / recent guard)는 위에서 upsert skip +
+            #    last-good 유지로 이미 처리된다.
+            #  - 여기 도달했다는 건 recent guard(최근 기사 보유 키워드 >= MIN_RECENT_KEYWORDS=5)를
+            #    통과했다는 뜻이고, recent_kw <= len(top)이므로 발행분은 최소 5개이며 전부 quality/
+            #    fresh gate 통과분이다("빈 값 덮어쓰기" 구조적으로 불가).
+            #  - 따라서 Top10 미만이어도 저품질 filler를 넣지 않고 partial snapshot으로 publish한다.
+            #    오래된 last-good 10개를 유지하는 것보다 신선한 5~9개를 발행하는 쪽을 우선한다.
             logger.warning(
-                "[news] backfill 후에도 품질 통과 후보 부족 → %d개로 진행(품질 기준 유지, filler 미삽입)",
-                len(top),
+                "[news] partial snapshot publish: 품질 통과 후보 %d개(<%d) → filler 없이 발행"
+                "(신선한 부분 결과 우선, last-good 대체)",
+                len(top), ranker.TOP_N,
             )
 
-        # 4) build + data_sources
+        # 4) build + data_sources (실제 참여 family)
         data_sources = ["naver_news"]
         if datalab_signals:
             data_sources.append("datalab")
-        if google_signals:
-            data_sources.append("google")
-        if any(c["sources"].get("daum") is not None for c in candidates):
-            data_sources.append("daum")
+        participating = set()
+        for c in candidates:
+            participating |= set(c["sources"].keys()) & cand._INDEPENDENT_SEARCH_FAMILIES
+        data_sources.extend(sorted(participating))
         candidate_map = {c["keyword"]: c for c in candidates}
         issues = build_ranked_issues(top, candidate_map, data_sources)
 

@@ -96,10 +96,8 @@ def build_ranked_entry(
     representative_summary = news_meta.get("representative_summary")
     representative_title = news_meta.get("representative_title")
     breakdown = ranked_item.get("source_breakdown") or {}
-    used = set(ranked_item.get("used_signals") or [])
 
     sources = ranked_item.get("sources") or (candidate or {}).get("sources") or {}
-    daum_signal = sources.get("daum") is not None if sources else ("daum" in used)
 
     return {
         "rank": rank,
@@ -109,9 +107,11 @@ def build_ranked_entry(
         "signals": {
             "news": len(articles) > 0,
             "trend": False,  # 기존 호환
-            "daum": daum_signal,
-            "datalab": breakdown.get("datalab", 0) > 0,
-            "google": breakdown.get("google", 0) > 0,
+            "daum": sources.get("daum_home") is not None,
+            "google": sources.get("google_trends") is not None,
+            "nate": sources.get("nate_home") is not None,
+            "bing": sources.get("bing_home") is not None,
+            "search_demand": breakdown.get("search_demand", 0) > 0,
         },
         "trend": None,  # 기존 호환 (datalab 점수화 객체는 후속)
         "articles": articles,

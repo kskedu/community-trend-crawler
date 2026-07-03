@@ -24,7 +24,12 @@
 - merge된 item은 원본 후보의 sources를 그대로 실어 builder의 candidate_map lookup
   실패를 방어한다(§7-3).
 """
+import logging
 from typing import Dict, List, Optional
+
+from news.candidates import _INDEPENDENT_SEARCH_FAMILIES
+
+logger = logging.getLogger(__name__)
 
 # ── 유사 키워드 dedupe 설정 ──
 _DEDUPE_SUFFIXES = ("고등학교", "중학교", "초등학교", "대학교")
@@ -47,21 +52,31 @@ MERGE_ARTICLE_OVERLAP_THRESHOLD = 0.5
 REPRESENTATIVE_OVERLAP_MIN_SHARED_TOKENS = 2
 DISPLAY_KEYWORD_MAX_LEN = 18
 
-# 가중치 (사용자 승인값 2026-06-29)
+# 최상위 4축 가중치 (사용자 확정 2026-07-04)
+#   news_evidence   : Naver News 근거(recent/도메인 다양성/title relevance)
+#   search_demand   : 검색 수요(google trends → datalab → home rank 우선순위 coalesce)
+#   source_consensus: 독립 홈/트렌드 source family 합의 수
+#   freshness       : 최신 기사 신선도(top-level 승격)
 WEIGHTS = {
-    "news": 0.60,
-    "datalab": 0.20,
-    "google": 0.10,
-    "daum": 0.10,
+    "news": 0.45,
+    "search_demand": 0.30,
+    "source_consensus": 0.15,
+    "freshness": 0.10,
 }
 
-# News 내부 구성 가중 (recent_count / latest_freshness / domain_diversity / title_relevance)
+# News Evidence 내부 구성 가중 (freshness는 top-level 축으로 승격돼 제외).
 NEWS_SUBWEIGHTS = {
-    "recent_count": 0.40,
-    "latest_freshness": 0.30,
-    "domain_diversity": 0.15,
-    "title_relevance": 0.15,
+    "recent_count": 0.60,
+    "domain_diversity": 0.20,
+    "title_relevance": 0.20,
 }
+
+# search_demand 내부 우선순위(coalesce 순서). 앞선 source의 신호가 있으면 그 값을 채택한다.
+#   google trends volume/active > datalab recent_delta > naver_home rank > bing rank
+#   > daum rank > nate rank. (naver_home은 현재 수집 소스가 없어 실제로는 건너뜀)
+SEARCH_DEMAND_PRIORITY = (
+    "google", "datalab", "naver_home", "bing_home", "daum_home", "nate_home",
+)
 
 # penalty 계수 (초기 최소화: 2개만)
 LOW_RELEVANCE_THRESHOLD = 0.15
@@ -87,26 +102,32 @@ def _minmax_normalize(values: Dict[str, float]) -> Dict[str, float]:
 
 
 def _news_subscore(news: Dict) -> Optional[float]:
-    """단일 후보의 news 신호 dict → 0~1 합성 점수. 신호 없으면 None.
+    """단일 후보의 news 신호 dict → News Evidence 원자 신호. 신호 없으면 None.
 
     news = {recent_count, latest_age_hours, domain_diversity, title_relevance}
-    (정규화는 후보 집합 단위로 별도 수행하므로 여기선 원자 신호만 0~1로 환산)
+    (정규화는 후보 집합 단위로 별도 수행하므로 여기선 원자 신호만 보관.
+     freshness는 top-level 축으로 승격돼 이 서브스코어에 포함하지 않는다.)
     """
     if not news:
         return None
-    # latest_freshness: 최근일수록 1, RECENT_HOURS 초과면 0으로 선형 감소
-    age = news.get("latest_age_hours")
-    if age is None:
-        freshness = 0.0
-    else:
-        freshness = max(0.0, 1.0 - (age / RECENT_HOURS)) if RECENT_HOURS > 0 else 0.0
     # recent_count / domain_diversity 는 집합 정규화 대상이라 raw 보관
     return {
         "recent_count": float(news.get("recent_count", 0) or 0),
-        "latest_freshness": float(freshness),
         "domain_diversity": float(news.get("domain_diversity", 0) or 0),
         "title_relevance": float(news.get("title_relevance", 0) or 0),
     }
+
+
+def _freshness_val(news: Dict) -> float:
+    """단일 후보 news 신호 → 0~1 freshness(top-level 축). 최근일수록 1, RECENT_HOURS 초과 0."""
+    if not news:
+        return 0.0
+    age = news.get("latest_age_hours")
+    if age is None:
+        return 0.0
+    if RECENT_HOURS <= 0:
+        return 0.0
+    return max(0.0, 1.0 - (age / RECENT_HOURS))
 
 
 def _is_noise(keyword: str) -> bool:
@@ -118,18 +139,52 @@ def _is_noise(keyword: str) -> bool:
     return False
 
 
+def _quality_gate_reason(news_meta: Dict) -> Optional[str]:
+    """keyword-level quality gate 위반 사유. 통과면 None.
+
+    - 고관련 기사(candidates.HIGH_RELEVANCE_THRESHOLD 이상) 2건 미만 AND quality_cluster_size
+      2 미만이면 low_quality_news(관련 기사가 사실상 없음).
+    - 관련 기사는 있으나 전부 오래됨(FRESH_RELEVANCE_HOURS 이내 고관련 0건)이면 stale_only.
+    """
+    hrc = news_meta.get("high_relevance_count", 0)
+    qcs = news_meta.get("quality_cluster_size", 0)
+    if not (hrc >= 2 or qcs >= 2):
+        return "low_quality_news"
+    if news_meta.get("fresh_high_relevance_count", 0) < 1:
+        return "stale_only"
+    return None
+
+
+def _rank_demand_norm(candidates: List[Dict], family: str) -> Dict[str, float]:
+    """candidate.sources[family] rank → 역수 후 집합 min-max 정규화 map(search_demand용)."""
+    raw = {}
+    for c in candidates:
+        r = (c.get("sources") or {}).get(family)
+        # rank는 정수. aux/phrase의 True(bool)는 홈 family가 아니라 여기 대상이 아니다.
+        if isinstance(r, bool):
+            continue
+        if isinstance(r, (int, float)):
+            raw[c["keyword"]] = 1.0 / (1.0 + float(r))
+    return _minmax_normalize(raw)
+
+
 def compute_scores(candidates: List[Dict], signals: Dict[str, Dict]) -> List[Dict]:
     """후보 리스트 + 신호맵 → score 포함 ranked 리스트(내림차순).
 
-    candidates: [{keyword, sources:{daum:rank|None, danawa:rank|None, google:rank|None, aux:bool}}]
+    candidates: [{keyword, sources:{google_trends|daum_home|nate_home|bing_home: rank,
+                  naver_news_aux|naver_news_phrase: True}}]
     signals: {
-        "news":   {keyword: {recent_count, latest_age_hours, domain_diversity, title_relevance}},
-        "datalab":{keyword: {recent_delta}},
-        "google": {keyword: {rank|interest}},
-        "daum":   {keyword: daum_rank},
+        "news":    {keyword: {recent_count, latest_age_hours, domain_diversity, title_relevance, ...}},
+        "datalab": {keyword: {recent_delta}},
+        "google":  {keyword: {interest, ...}},
     }
-    반환: [{keyword, score, source_breakdown{news,datalab,google,daum}, rank_reason,
-            used_signals(set로 안 주고 list), news_meta}] score 내림차순.
+    (홈/트렌드 rank 기반 demand는 candidate.sources에서 직접 읽는다 — 별도 rank 신호맵 불필요)
+
+    반환: [{keyword, score, source_breakdown{news,search_demand,source_consensus,freshness},
+            rank_reason, used_signals(list), news_meta, sources}] score 내림차순.
+
+    최상위 4축(WEIGHTS): News Evidence / Search Demand / Source Consensus / Freshness.
+    가용 축만 weight 재정규화. penalty는 별도 차감.
     """
     keywords = [c["keyword"] for c in candidates]
     if not keywords:
@@ -138,64 +193,31 @@ def compute_scores(candidates: List[Dict], signals: Dict[str, Dict]) -> List[Dic
     news_map = signals.get("news") or {}
     datalab_map = signals.get("datalab") or {}
     google_map = signals.get("google") or {}
-    daum_map = signals.get("daum") or {}
 
-    # --- keyword-level quality gate (범위 한정: 이번에 새로 추가하는 gate 대상만 정규화
-    # 이전에 제외한다. "news 신호 자체가 없는 후보"가 rc_raw/delta_raw/g_raw/d_raw 등
-    # 정규화 입력에 섞였다가 메인 루프 사후 continue로만 걸러지는 기존 구조(290163d 이전
-    # 부터 존재)는 이번 스코프 밖으로 분리하고 후속 이슈로 남긴다 — compute_scores()
-    # 정규화 파이프라인 전체 재작성은 이번 작업 범위가 아니다(사용자 승인).
-    #
-    # quality gate 조건: 고관련 기사(candidates.HIGH_RELEVANCE_THRESHOLD 이상)가 2건 미만
-    # 이고 quality_cluster_size(고관련 기사만의 primary cluster 크기)도 2 미만이면, 그
-    # keyword는 관련 기사가 사실상 없는 것으로 보고 후보에서 완전히 제외한다(감점이 아니라
-    # hard exclude — 감점만으로는 score가 높은 다른 신호 덕에 여전히 Top10에 남을 수 있음).
-    #
-    # news_available_before_gate를 quality gate 필터링 *이전*에 원본 keywords 기준으로
-    # 먼저 확정한다(Codex review-only P1: quality gate로 news 있는 후보가 전부 걸러지면
-    # available["news"] 판정 자체가 꺼져, 이후 news-required 최종 제외(메인 루프의
-    # "if 'news' in available and not news_map.get(k): continue")도 무력화되고 datalab/
-    # google/daum만으로 결과에 들어오는 새로운 회귀가 생긴다).
+    # news_available_before_gate를 quality gate 필터링 *이전*에 원본 keywords 기준으로 확정한다
+    # (Codex review-only P1: quality gate로 news 있는 후보가 전부 걸러지면 available["news"]
+    # 판정이 꺼져 news-required 최종 제외가 무력화되는 회귀 방지).
     news_available_before_gate = any(news_map.get(k) for k in keywords)
 
-    def _passes_keyword_quality_gate(news_meta: Dict) -> bool:
-        hrc = news_meta.get("high_relevance_count", 0)
-        qcs = news_meta.get("quality_cluster_size", 0)
-        if not (hrc >= 2 or qcs >= 2):
-            return False
-        # fresh relevance gate: 관련 기사가 있어도 전부 오래됐으면(제품 리뷰/도입기 등)
-        # Top10 자격에서 제외한다(candidates.FRESH_RELEVANCE_HOURS 이내 고관련 기사가
-        # 최소 1건 필요). Codex review-only 검토: latest_relevant_age_hours 조건은
-        # fresh_high_relevance_count>=1과 동치라 별도 OR 분기로 추가하지 않는다.
-        return news_meta.get("fresh_high_relevance_count", 0) >= 1
-
-    candidates = [
-        c for c in candidates
-        if news_map.get(c["keyword"]) is None or _passes_keyword_quality_gate(news_map.get(c["keyword"]))
-    ]
+    # keyword-level quality gate: news 신호는 있으나 저품질/stale 이면 정규화 이전에 제외.
+    gated = []
+    for c in candidates:
+        nm = news_map.get(c["keyword"])
+        if nm is None:
+            gated.append(c)  # news 없는 후보 → 아래 news-required에서 no_news_evidence 처리
+            continue
+        reason = _quality_gate_reason(nm)
+        if reason:
+            logger.info("[news] drop %s: %s", c["keyword"], reason)
+            continue
+        gated.append(c)
+    candidates = gated
     keywords = [c["keyword"] for c in candidates]
     if not keywords:
         return []
 
-    # --- 가용 신호 판정 (소스 단위) ---
-    available = {}
-    if news_available_before_gate:
-        available["news"] = WEIGHTS["news"]
-    if any(datalab_map.get(k) for k in keywords):
-        available["datalab"] = WEIGHTS["datalab"]
-    if any(google_map.get(k) for k in keywords):
-        available["google"] = WEIGHTS["google"]
-    if any(daum_map.get(k) is not None for k in keywords):
-        available["daum"] = WEIGHTS["daum"]
-
-    total = sum(available.values())
-    if total <= 0:
-        return []
-    renorm = {s: w / total for s, w in available.items()}
-
     # --- News 원자 신호 수집 후 집합 정규화 ---
     news_atoms = {k: _news_subscore(news_map.get(k)) for k in keywords}
-    # recent_count, domain_diversity 는 후보 집합 min-max 정규화
     rc_raw = {k: a["recent_count"] for k, a in news_atoms.items() if a}
     dd_raw = {k: a["domain_diversity"] for k, a in news_atoms.items() if a}
     rc_norm = _minmax_normalize(rc_raw)
@@ -207,56 +229,82 @@ def compute_scores(candidates: List[Dict], signals: Dict[str, Dict]) -> List[Dic
             return 0.0
         return (
             NEWS_SUBWEIGHTS["recent_count"] * rc_norm.get(k, 0.0)
-            + NEWS_SUBWEIGHTS["latest_freshness"] * a["latest_freshness"]
             + NEWS_SUBWEIGHTS["domain_diversity"] * dd_norm.get(k, 0.0)
             + NEWS_SUBWEIGHTS["title_relevance"] * a["title_relevance"]
         )
 
-    # --- DataLab: recent_delta 집합 정규화 ---
+    # --- Search Demand: 우선순위 coalesce용 source별 정규화 map ---
+    g_raw = {}
+    for k in keywords:
+        g = google_map.get(k)
+        if g and g.get("interest") is not None:
+            g_raw[k] = float(g["interest"])
     delta_raw = {}
     for k in keywords:
         d = datalab_map.get(k)
         if d and d.get("recent_delta") is not None:
             delta_raw[k] = float(d["recent_delta"])
-    delta_norm = _minmax_normalize(delta_raw)
+    demand_maps = {
+        "google": _minmax_normalize(g_raw),
+        "datalab": _minmax_normalize(delta_raw),
+        "naver_home": {},  # 수집 소스 없음(예약)
+        "bing_home": _rank_demand_norm(candidates, "bing_home"),
+        "daum_home": _rank_demand_norm(candidates, "daum_home"),
+        "nate_home": _rank_demand_norm(candidates, "nate_home"),
+    }
 
-    # --- Google: rank(작을수록 좋음) 또는 interest ---
-    g_raw = {}
-    for k in keywords:
-        g = google_map.get(k)
-        if not g:
-            continue
-        if g.get("interest") is not None:
-            g_raw[k] = float(g["interest"])
-        elif g.get("rank") is not None:
-            g_raw[k] = 1.0 / (1.0 + float(g["rank"]))  # rank 역수
-    g_norm = _minmax_normalize(g_raw)
+    def search_demand(k):
+        for src in SEARCH_DEMAND_PRIORITY:
+            m = demand_maps.get(src) or {}
+            if k in m:
+                return m[k]
+        return 0.0
 
-    # --- Daum: rank 역순 보정 ---
-    d_raw = {}
-    for k in keywords:
-        r = daum_map.get(k)
-        if r is not None:
-            d_raw[k] = 1.0 / (1.0 + float(r))
-    d_norm = _minmax_normalize(d_raw)
+    demand_available = any(
+        any(k in (demand_maps.get(s) or {}) for s in SEARCH_DEMAND_PRIORITY)
+        for k in keywords
+    )
+
+    # --- Source Consensus: 독립 홈/트렌드 family 종수 정규화 ---
+    consensus_raw = {}
+    for c in candidates:
+        fams = set((c.get("sources") or {}).keys()) & _INDEPENDENT_SEARCH_FAMILIES
+        if fams:
+            consensus_raw[c["keyword"]] = float(len(fams))
+    consensus_norm = _minmax_normalize(consensus_raw)
+    consensus_available = bool(consensus_raw)
+
+    # --- 가용 축 판정 + weight 재정규화 ---
+    available = {}
+    if news_available_before_gate:
+        available["news"] = WEIGHTS["news"]
+        available["freshness"] = WEIGHTS["freshness"]  # freshness는 news 근거에서 파생
+    if demand_available:
+        available["search_demand"] = WEIGHTS["search_demand"]
+    if consensus_available:
+        available["source_consensus"] = WEIGHTS["source_consensus"]
+
+    total = sum(available.values())
+    if total <= 0:
+        return []
+    renorm = {s: w / total for s, w in available.items()}
 
     ranked = []
     for c in candidates:
         k = c["keyword"]
         # News-required(키워드 단위): News 신호 없는 후보는 최종 랭킹에서 제외.
-        #   datalab/daum 점수만으로 뉴스 없는 키워드가 Top10에 오르는 것을 막는다.
-        #   (단 news 소스 자체가 unavailable인 경우는 위에서 이미 전체 처리됨)
         if "news" in available and not news_map.get(k):
+            logger.info("[news] drop %s: no_news_evidence", k)
             continue
         breakdown = {
             "news": round(news_norm(k), 4) if "news" in available else 0.0,
-            "datalab": round(delta_norm.get(k, 0.0), 4) if "datalab" in available else 0.0,
-            "google": round(g_norm.get(k, 0.0), 4) if "google" in available else 0.0,
-            "daum": round(d_norm.get(k, 0.0), 4) if "daum" in available else 0.0,
+            "search_demand": round(search_demand(k), 4) if "search_demand" in available else 0.0,
+            "source_consensus": round(consensus_norm.get(k, 0.0), 4) if "source_consensus" in available else 0.0,
+            "freshness": round(_freshness_val(news_map.get(k)), 4) if "freshness" in available else 0.0,
         }
         score = sum(renorm.get(s, 0.0) * breakdown[s] for s in renorm)
 
-        # penalty
+        # penalty (별도 차감)
         a = news_atoms.get(k)
         title_rel = a["title_relevance"] if a else 0.0
         if "news" in available and title_rel < LOW_RELEVANCE_THRESHOLD:
@@ -287,12 +335,12 @@ def _build_rank_reason(breakdown: Dict[str, float], available: Dict) -> str:
     parts = []
     if "news" in available and breakdown["news"] > 0:
         parts.append("최근 뉴스 다수")
-    if "datalab" in available and breakdown["datalab"] > 0:
-        parts.append("검색 관심 상승")
-    if "google" in available and breakdown["google"] > 0:
-        parts.append("구글 신호")
-    if "daum" in available and breakdown["daum"] > 0:
-        parts.append("실검 보정")
+    if "search_demand" in available and breakdown["search_demand"] > 0:
+        parts.append("검색 수요")
+    if "source_consensus" in available and breakdown["source_consensus"] > 0:
+        parts.append("복수 소스 합의")
+    if "freshness" in available and breakdown["freshness"] > 0:
+        parts.append("최신 기사")
     return " + ".join(parts) if parts else "신호 부족"
 
 
@@ -681,13 +729,12 @@ def _display_common_event_tokens(members: List[Dict]) -> set:
 
 
 def _seed_priority(member: Dict) -> int:
-    """seed 출처 우선순위 점수(클수록 우선). daum > danawa > aux/기타. tie-breaker 전용."""
-    sources = member.get("sources") or {}
-    if "daum" in sources:
+    """seed 출처 우선순위 점수(클수록 우선). 독립 홈/트렌드 family > naver_news_* 파생.
+    tie-breaker 전용."""
+    sources = set((member.get("sources") or {}).keys())
+    if sources & _INDEPENDENT_SEARCH_FAMILIES:
         return 3
-    if "danawa" in sources:
-        return 2
-    return 1  # aux/google 등 파생
+    return 1  # naver_news_aux/phrase 등 파생
 
 
 def _keyword_coverage(member: Dict, group_articles: List[Dict]) -> float:
