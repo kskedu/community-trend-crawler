@@ -18,7 +18,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from news import ranker, candidates as cand, datalab, google
+from news import ranker, candidates as cand, datalab, google, normalizer
 from news.builder import build_ranked_issues, build_ranked_entry
 from news.movement import apply_movement
 import main as main_module
@@ -741,6 +741,191 @@ class TestClusteringAndRepresentative(unittest.TestCase):
         self.assertIn("representative_title", sig)
         self.assertIn("topic_coherence", sig)
         self.assertNotIn("증정", sig["representative_title"] or "")
+
+
+class TestDescriptionHygiene(unittest.TestCase):
+    """description 이미지 캡션/사진 설명 문구 정제(2026-07-04).
+
+    문제: Naver News description에 "com AI로 생성된 이미지 [사진=챗GPT] ..."처럼 캡션이
+    섞여 키워드 소개글(representative_summary)에 그대로 노출됨.
+    """
+
+    def test_caption_prefix_removed_from_clean_description(self):
+        raw = "com AI로 생성된 이미지 [사진=챗GPT] 1년 넘게 계속된 협상 끝에 타결됐다"
+        clean, quality, drop_reason, usable = normalizer.clean_description(raw)
+        self.assertNotIn("AI로 생성된 이미지", clean)
+        self.assertNotIn("챗GPT", clean)
+        self.assertNotIn("[사진=", clean)
+        self.assertTrue(usable)
+        self.assertIsNone(drop_reason)
+        self.assertIn("협상", clean)
+
+    def test_caption_only_description_dropped(self):
+        raw = "[사진=연합뉴스] 자료사진"
+        clean, quality, drop_reason, usable = normalizer.clean_description(raw)
+        self.assertEqual(clean, "")
+        self.assertFalse(usable)
+        self.assertEqual(drop_reason, "caption_only")
+
+    def test_equals_free_bracket_tag_not_treated_as_caption(self):
+        # 캡션 마커 단어(사진/이미지/출처/캡처)가 없는 일반 기사 태그성 대괄호
+        # ([단독]/[속보]/[Q&A]/[AI 기본법])는 캡션이 아니므로 지우지 않는다
+        # (Codex review-only P2, 2026-07-04 — 과매칭 방지).
+        for raw in ("[단독] 정부, 내달 새 지원책 발표", "[속보] 국회 본회의 통과",
+                    "[Q&A] 새 정책 자주 묻는 질문", "[AI 기본법] 국회 통과"):
+            clean, quality, drop_reason, usable = normalizer.clean_description(raw)
+            self.assertEqual(clean, raw)
+            self.assertEqual(quality, 1.0)
+            self.assertTrue(usable)
+
+    def test_colon_or_no_delimiter_bracket_caption_still_removed(self):
+        # "=" 없이 콜론/공백으로 구분된 캡션 브래킷 변형도 캡션 마커 단어(사진/이미지/
+        # 출처/캡처) 기반 판정으로 잡아낸다(Codex review-only P2 2차, 2026-07-04).
+        for raw in (
+            "[사진 : 챗GPT] 1년 넘게 계속된 협상 끝에 타결됐다",
+            "[사진 제공 챗GPT] 1년 넘게 계속된 협상 끝에 타결됐다",
+        ):
+            clean, quality, drop_reason, usable = normalizer.clean_description(raw)
+            self.assertNotIn("사진", clean)
+            self.assertNotIn("챗GPT", clean)
+            self.assertIn("협상", clean)
+
+    def test_bracket_containing_caption_phrase_word_fully_removed_without_residue(self):
+        # "캡처"가 _CAPTION_PHRASES(전역 phrase)에도 있고 브래킷 마커 단어에도 겹치는
+        # 경우, 브래킷을 항상 통째로 먼저 제거해야 "챗GPT] 본문..."처럼 대괄호가 반쪽만
+        # 지워진 잔여물이 남지 않는다(Codex review-only P2 3차, 2026-07-04).
+        raw = "[캡처 챗GPT] 본문 내용이 이어진다"
+        clean, quality, drop_reason, usable = normalizer.clean_description(raw)
+        self.assertNotIn("]", clean)
+        self.assertNotIn("챗GPT", clean)
+        self.assertIn("본문 내용이 이어진다", clean)
+
+    def test_leading_fragment_cleanup_only_applies_when_caption_is_at_sentence_start(self):
+        # 캡션이 문장 중간/뒤에 있을 뿐인 정상 문장의 선행 단어("AI", "5G")는 도메인
+        # 파편이 아니므로 잘라먹지 않는다(Codex review-only P2 4차, 2026-07-04).
+        raw1 = "AI 기술 발전으로 [사진=챗GPT] 업계 변화가 예상된다"
+        clean1, *_ = normalizer.clean_description(raw1)
+        self.assertTrue(clean1.startswith("AI 기술 발전으로"))
+        self.assertNotIn("챗GPT", clean1)
+
+        raw2 = "5G 상용화 이후 [사진=챗GPT] 통신 시장이 재편됐다"
+        clean2, *_ = normalizer.clean_description(raw2)
+        self.assertTrue(clean2.startswith("5G 상용화 이후"))
+        self.assertNotIn("챗GPT", clean2)
+
+    def test_topic_word_immediately_followed_by_caption_bracket_not_stripped(self):
+        # 캡션 phrase 없이 브래킷만 선행 단어 바로 뒤에 오는 경우("AI [사진=...] ...")도
+        # "["라는 이유만으로 도메인 파편 취급해 잘라먹지 않는다(Codex review-only P2
+        # 5차, 2026-07-04 — lookahead를 "[" 단독 허용에서 알려진 phrase 문자열
+        # 매칭으로 좁힘).
+        raw1 = "AI [사진=챗GPT] 기술 발전으로 업계 변화가 예상된다"
+        clean1, *_ = normalizer.clean_description(raw1)
+        self.assertTrue(clean1.startswith("AI"))
+        self.assertNotIn("챗GPT", clean1)
+
+        raw2 = "5G [사진=챗GPT] 상용화 이후 통신 시장이 재편됐다"
+        clean2, *_ = normalizer.clean_description(raw2)
+        self.assertTrue(clean2.startswith("5G"))
+        self.assertNotIn("챗GPT", clean2)
+
+    def test_standalone_ai_topic_mention_not_treated_as_caption(self):
+        # 브래킷 밖의 "챗GPT"/"AI" 단독 언급은 정상 기사 주제일 수 있으므로 캡션으로
+        # 오판해 지우지 않는다(중점 검토 7번 — AI/챗GPT가 기사 주제인 경우 과잉 제거 방지).
+        raw = "챗GPT가 오류를 일으켰다는 지적이 잇따라 나오고 있다"
+        clean, quality, drop_reason, usable = normalizer.clean_description(raw)
+        self.assertEqual(clean, raw)
+        self.assertEqual(quality, 1.0)
+        self.assertTrue(usable)
+
+    def test_clean_description_without_pollution_passes_through(self):
+        raw = "정부가 내달부터 새 지원책을 시행한다고 밝혔다"
+        clean, quality, drop_reason, usable = normalizer.clean_description(raw)
+        self.assertEqual(clean, raw)
+        self.assertEqual(quality, 1.0)
+        self.assertTrue(usable)
+
+    def test_polluted_description_article_kept_as_evidence(self):
+        # title 정상 + description만 오염 → article evidence(articles 목록)에서는 유지.
+        raw = [{
+            "title": "홈플러스, 회생절차 1년 만에 정상화 협상 타결",
+            "originallink": "https://x.com/homeplus1",
+            "description": "com AI로 생성된 이미지 [사진=챗GPT] 1년 넘게 계속된 협상 끝에 타결됐다",
+            "pubDate": None,
+        }]
+        sig = cand.compute_news_signal("홈플러스", raw)
+        self.assertEqual(len(sig["articles"]), 1)
+        self.assertIn("홈플러스", sig["articles"][0]["title"])
+
+    def test_representative_summary_excludes_caption_even_when_description_polluted(self):
+        raw = [{
+            "title": "홈플러스, 회생절차 1년 만에 정상화 협상 타결",
+            "originallink": "https://x.com/homeplus1",
+            "description": "com AI로 생성된 이미지 [사진=챗GPT] 1년 넘게 계속된 협상 끝에 타결됐다",
+            "pubDate": None,
+        }]
+        sig = cand.compute_news_signal("홈플러스", raw)
+        summary = sig["representative_summary"] or ""
+        self.assertNotIn("[사진=", summary)
+        self.assertNotIn("AI로 생성된 이미지", summary)
+        self.assertNotIn("챗GPT", summary)
+
+    def test_representative_summary_falls_back_to_title_when_no_clean_description(self):
+        # description이 캡션뿐이라 clean_description이 전부 비어도 title 기반 소개글 생성.
+        raw = [{
+            "title": "홈플러스, 회생절차 1년 만에 정상화 협상 타결",
+            "originallink": "https://x.com/homeplus1",
+            "description": "[사진=연합뉴스] 자료사진",
+            "pubDate": None,
+        }]
+        sig = cand.compute_news_signal("홈플러스", raw)
+        self.assertEqual(sig["representative_summary"], "홈플러스, 회생절차 1년 만에 정상화 협상 타결")
+
+    def test_normalize_article_exposes_hygiene_fields(self):
+        art = normalizer.normalize_article({
+            "title": "홈플러스, 회생절차 1년 만에 정상화 협상 타결",
+            "originallink": "https://x.com/homeplus1",
+            "description": "com AI로 생성된 이미지 [사진=챗GPT] 1년 넘게 계속된 협상 끝에 타결됐다",
+        })
+        self.assertIn("clean_description", art)
+        self.assertIn("description_quality_score", art)
+        self.assertIn("description_drop_reason", art)
+        self.assertIn("is_description_usable_for_summary", art)
+        self.assertNotIn("챗GPT", art["clean_description"])
+
+    def test_representative_summary_excludes_below_min_relevance_fallback_articles(self):
+        # representative가 None(REPRESENTATIVE_MIN_RELEVANCE 미달)이면, 다중 title
+        # 합의 fallback도 동일 기준 미만 기사(예: object_side_mention 0.35)를 재료로
+        # 쓰지 않아야 한다 — 그렇지 않으면 대표 부적격 기사가 소개글에 우회 노출된다
+        # (Codex review-only P2 6차, 2026-07-04).
+        raw = [{
+            "title": "쿠팡, 국정원 조사 관련 노트북 회수까지 지시",
+            "originallink": "https://x.com/side1",
+            "description": "쿠팡이 직원 소지품 회수 조치를 내렸다",
+            "pubDate": None,
+        }]
+        sig = cand.compute_news_signal("노트북", raw)
+        self.assertIsNone(sig["representative_article"])
+        self.assertIsNone(sig["representative_summary"])
+
+    def test_built_entry_articles_carry_clean_description_to_frontend_json(self):
+        # 최종 build_ranked_entry() 산출물(프론트로 나가는 JSON)의 articles[]에
+        # clean_description이 실려 있는지 — 기사 카드 요약이 이 필드를 쓸 수 있어야
+        # 오염 방지가 실제로 화면까지 이어진다(Codex review-only P1, 2026-07-04).
+        raw = [{
+            "title": "홈플러스, 회생절차 1년 만에 정상화 협상 타결",
+            "originallink": "https://x.com/homeplus1",
+            "description": "com AI로 생성된 이미지 [사진=챗GPT] 1년 넘게 계속된 협상 끝에 타결됐다",
+            "pubDate": None,
+        }]
+        sig = cand.compute_news_signal("홈플러스", raw)
+        ranked_item = {
+            "keyword": "홈플러스", "score": 0.5, "source_breakdown": {"news": 0.5},
+            "rank_reason": "", "news_meta": sig, "used_signals": ["news"],
+        }
+        entry = build_ranked_entry(1, ranked_item)
+        self.assertIn("clean_description", entry["articles"][0])
+        self.assertNotIn("챗GPT", entry["articles"][0]["clean_description"])
+        self.assertTrue(entry["articles"][0]["is_description_usable_for_summary"])
 
 
 class TestKeywordDedupe(unittest.TestCase):

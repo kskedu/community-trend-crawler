@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional
 
 from news.normalizer import normalize_article
-from news.summarizer import _tokens  # 기존 토크나이저 재사용(신규 의존성 없음)
+from news.summarizer import _tokens, summarize  # 기존 토크나이저/요약 로직 재사용(신규 의존성 없음)
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +80,12 @@ FRESH_RELEVANCE_HOURS = 72
 
 # select_representative()가 대표로 인정하는 최소 relevance_score.
 REPRESENTATIVE_MIN_RELEVANCE = 0.5
+
+# select_representative()에서 description hygiene 가산점/감점 폭(2026-07-04).
+# relevance_score 자체(ranking/gate가 쓰는 값)는 건드리지 않고, 대표 기사 "선택" 시에만
+# clean_description 사용 가능 여부로 소폭 가감한다 — 오염된 description을 가진 기사가
+# 근소한 relevance 차이로 대표가 되는 것을 방지.
+_DESC_QUALITY_BONUS = 0.05
 
 # === PR/광고성 클러스터 판정 (실시간 이슈 품질 — 문제 B) ===
 # PR 마커는 title에서만 substring 판정한다. snippet까지 보면 경기 결과 기사의 후원 boilerplate가
@@ -467,7 +473,44 @@ def select_representative(primary_cluster: List[Dict]) -> Optional[Dict]:
     ]
     if not candidates_:
         return None
-    return max(candidates_, key=lambda a: a.get("relevance_score", 0.0))
+    return max(candidates_, key=_representative_sort_key)
+
+
+def _representative_sort_key(a: Dict) -> float:
+    """대표 기사 선택 전용 정렬 키 — relevance_score + description hygiene 가감(2026-07-04)."""
+    score = a.get("relevance_score", 0.0)
+    if a.get("is_description_usable_for_summary"):
+        score += _DESC_QUALITY_BONUS
+    elif a.get("description_drop_reason"):
+        score -= _DESC_QUALITY_BONUS
+    return score
+
+
+def build_representative_summary(primary_cluster: List[Dict], representative: Optional[Dict]) -> Optional[str]:
+    """대표 소개글(representative_summary) 산출 — description hygiene 정책(2026-07-04).
+
+    - 대표 기사의 clean_description이 있으면 사용(단일 기사 그대로 노출해도 안전).
+    - 없으면(캡션만 있어 제외됐거나 description 자체가 없으면) primary cluster의
+      여러 clean title 기반 공통 이슈 문장(summarizer.summarize 재사용)으로 대체 —
+      단일 기사의 raw description 복붙을 피한다(요구사항: clean title 여러 개 우선,
+      clean_description은 보조).
+    - 그마저 없으면 대표 기사 title.
+    """
+    if representative and representative.get("is_description_usable_for_summary") and representative.get("clean_description"):
+        return representative["clean_description"]
+    # select_representative()와 동일한 최소 relevance 기준을 적용한다 — 그렇지 않으면
+    # object_side_mention(0.35)처럼 대표 자격이 없는 기사(예: "노트북 회수까지 지시")가
+    # 다중 title 합의 재료로 섞여 들어가 대표 소개글에 우회 노출될 수 있다
+    # (Codex review-only P2 6차, 2026-07-04).
+    usable_articles = [
+        a for a in (primary_cluster or [])
+        if not a.get("is_incidental") and a.get("relevance_score", 0.0) >= REPRESENTATIVE_MIN_RELEVANCE
+    ]
+    if usable_articles:
+        text, _ = summarize("", usable_articles)
+        if text:
+            return text
+    return (representative or {}).get("title")
 
 
 def _norm_key(keyword: str) -> str:
@@ -661,10 +704,9 @@ def compute_news_signal(keyword: str, raw_items: List[dict], require_all_tokens:
     topic_coherence = compute_topic_coherence(clusters, len(scored_articles))
 
     representative_title = (representative or {}).get("title")
-    # representative_summary: 대표 기사의 snippet(있으면), 없으면 title로 대체
-    representative_summary = None
-    if representative:
-        representative_summary = representative.get("snippet") or representative.get("title")
+    # representative_summary: description hygiene 정책 적용(build_representative_summary,
+    # 2026-07-04) — 대표 기사 raw snippet을 그대로 쓰지 않는다(이미지 캡션 노출 방지).
+    representative_summary = build_representative_summary(primary, representative)
 
     # title_relevance: 기존 ranker penalty가 쓰는 집계 신호. relevance_score 평균으로 강화.
     title_relevance = (
