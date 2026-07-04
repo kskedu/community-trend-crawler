@@ -2724,5 +2724,105 @@ class TestGuardPredicates(unittest.TestCase):
         self.assertLess(main_module._count_recent_keywords(top), main_module.MIN_RECENT_KEYWORDS)
 
 
+class TestDisplayArticles(unittest.TestCase):
+    """display_articles(2026-07-04) — 상세 팝업 노출 전용 필터.
+
+    문제 사례: 키워드 "도깨비 10주년 여행 공유"에서 "공유"(share)라는 일반 단어만 겹치는
+    "성과 공유"/"국민배당" 기사가 상세 팝업 articles에 섞여 노출됨. articles(랭킹/게이트
+    근거)는 그대로 두고, display_articles로 사용자 노출만 별도로 정제한다.
+    """
+
+    KEYWORD = "도깨비 10주년 여행 공유"
+
+    def _build_articles(self):
+        raw = [
+            # 정상: 공유(배우) + 도깨비/김고은 등 실앵커 동반
+            {"title": "공유 김고은과 도깨비 명장면 재현", "originallink": "https://x.com/dk1",
+             "description": "배우 공유와 김고은이 tvN 도깨비 촬영 당시를 회상했다", "pubDate": None},
+            {"title": "공유·김고은, 나이차 12살인데 친구처럼 잘 지내", "originallink": "https://x.com/dk2",
+             "description": "도깨비에서 호흡을 맞춘 공유와 김고은의 브로맨스가 화제다", "pubDate": None},
+            {"title": "도깨비 10주년 기념 팬 여행 프로그램 공개", "originallink": "https://x.com/dk3",
+             "description": "tvN 도깨비 방영 10주년을 맞아 배우 공유와 김고은이 함께한 팬 여행 프로그램이 열린다", "pubDate": None},
+            # 오염: "공유"라는 일반 단어만 겹치는 무관 기사
+            {"title": "성과급 3,000%·국민배당까지... AI 반도체 호황, 누구 몫인가",
+             "originallink": "https://x.com/noise1",
+             "description": "반도체 기업들이 성과 공유 계획을 발표하며 국민배당 논의가 커지고 있다",
+             "pubDate": None},
+            {"title": "'전북 잡고 2위' 정경호 감독, 시즌 계획 공유",
+             "originallink": "https://x.com/noise2",
+             "description": "정경호 감독이 다음 시즌 운영 계획을 공유했다고 밝혔다", "pubDate": None},
+        ]
+        return raw
+
+    def test_actor_related_articles_survive_in_display_articles(self):
+        sig = cand.compute_news_signal(self.KEYWORD, self._build_articles())
+        articles = cand.filter_articles_for_display(sig["articles"], min_count=1)
+        display = cand.build_display_articles(self.KEYWORD, articles, sig["representative_article"])
+        display_titles = [a["title"] for a in display]
+        self.assertTrue(any("공유 김고은과 도깨비" in t for t in display_titles))
+        self.assertTrue(any("나이차 12살" in t for t in display_titles))
+        self.assertTrue(any("팬 여행 프로그램" in t for t in display_titles))
+
+    def test_generic_word_only_articles_excluded_from_display_articles(self):
+        sig = cand.compute_news_signal(self.KEYWORD, self._build_articles())
+        articles = cand.filter_articles_for_display(sig["articles"], min_count=1)
+        display = cand.build_display_articles(self.KEYWORD, articles, sig["representative_article"])
+        display_titles = [a["title"] for a in display]
+        self.assertFalse(any("국민배당" in t for t in display_titles))
+        self.assertFalse(any("정경호 감독" in t for t in display_titles))
+
+    def test_generic_plus_keyword_only_token_still_excluded(self):
+        # keyword 자체의 토큰이라도 "여행"처럼 그 자체로 흔한 단어 + "공유"(모호) 조합만으로는
+        # 대표 기사와 무관한 기사를 허용하지 않는다(Codex review-only P2, 2026-07-04 —
+        # "여행 계획 공유 앱 출시" 같은 무관 기사가 keyword 토큰 매칭만으로 새는 것 방지).
+        raw = [
+            {"title": "공유 김고은과 도깨비 명장면 재현", "originallink": "https://x.com/dk1",
+             "description": "배우 공유와 김고은이 tvN 도깨비 촬영 당시를 회상했다", "pubDate": None},
+            {"title": "여행 계획 공유 앱 출시", "originallink": "https://x.com/noise3",
+             "description": "새로운 여행 계획 공유 서비스가 출시됐다", "pubDate": None},
+        ]
+        sig = cand.compute_news_signal(self.KEYWORD, raw)
+        articles = cand.filter_articles_for_display(sig["articles"], min_count=1)
+        display = cand.build_display_articles(self.KEYWORD, articles, sig["representative_article"])
+        display_titles = [a["title"] for a in display]
+        self.assertFalse(any("여행 계획 공유 앱" in t for t in display_titles))
+
+    def test_articles_field_itself_unaffected_by_display_filter(self):
+        # display_articles를 만들어도 원본 articles(랭킹/게이트 근거)는 줄어들지 않는다.
+        sig = cand.compute_news_signal(self.KEYWORD, self._build_articles())
+        self.assertEqual(len(sig["articles"]), 5)
+
+    def test_build_ranked_entry_exposes_display_articles_without_shrinking_articles(self):
+        raw = self._build_articles()
+        sig = cand.compute_news_signal(self.KEYWORD, raw)
+        ranked_item = {
+            "keyword": self.KEYWORD, "score": 0.5, "source_breakdown": {"news": 0.5},
+            "rank_reason": "", "news_meta": sig, "used_signals": ["news"],
+            "display_keyword": self.KEYWORD,
+        }
+        entry = build_ranked_entry(1, ranked_item)
+        self.assertIn("display_articles", entry)
+        display_titles = [a["title"] for a in entry["display_articles"]]
+        self.assertFalse(any("국민배당" in t for t in display_titles))
+        self.assertTrue(any("도깨비" in t for t in display_titles))
+        # articles 원본은 display_articles보다 적지 않아야 한다(줄이지 않음 유지).
+        self.assertGreaterEqual(len(entry["articles"]), len(entry["display_articles"]))
+
+    def test_no_backfill_when_display_articles_below_min(self):
+        # display_articles가 3개 미만이어도 엉뚱한 기사로 채우지 않는다.
+        raw = [
+            {"title": "공유 김고은과 도깨비 명장면 재현", "originallink": "https://x.com/only1",
+             "description": "배우 공유와 김고은이 tvN 도깨비 촬영 당시를 회상했다", "pubDate": None},
+            {"title": "성과급 3,000%·국민배당까지... AI 반도체 호황, 누구 몫인가",
+             "originallink": "https://x.com/only2",
+             "description": "반도체 기업들이 성과 공유 계획을 발표했다", "pubDate": None},
+        ]
+        sig = cand.compute_news_signal(self.KEYWORD, raw)
+        articles = cand.filter_articles_for_display(sig["articles"], min_count=5)
+        display = cand.build_display_articles(self.KEYWORD, articles, sig["representative_article"])
+        self.assertEqual(len(display), 1)
+        self.assertIn("도깨비", display[0]["title"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

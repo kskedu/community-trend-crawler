@@ -8,7 +8,7 @@ P0: trend는 null 고정(데이터랩은 P1). thumbnail은 null(normalizer에서
 from datetime import datetime, timezone
 from typing import Callable, List, Optional
 
-from news.candidates import filter_articles_for_display
+from news.candidates import build_display_articles, filter_articles_for_display
 from news.dedup import dedup_articles
 from news.normalizer import normalize_article
 from news.summarizer import summarize
@@ -97,6 +97,14 @@ def build_ranked_entry(
     representative_title = news_meta.get("representative_title")
     breakdown = ranked_item.get("source_breakdown") or {}
 
+    # display_articles(2026-07-04): 상세 팝업 노출 전용 — articles(랭킹/게이트 근거)는 그대로
+    # 두고, display_keyword(merge 후 최종 표기) 기준으로 한 번 더 걸러낸다. 같은 keyword의
+    # 일반어 토큰(예: "공유")만 겹치는 무관 기사가 상세 팝업에 섞이는 것을 방지한다.
+    effective_keyword = ranked_item.get("display_keyword") or keyword
+    display_articles = build_display_articles(
+        effective_keyword, articles, news_meta.get("representative_article")
+    )
+
     sources = ranked_item.get("sources") or (candidate or {}).get("sources") or {}
 
     return {
@@ -115,6 +123,7 @@ def build_ranked_entry(
         },
         "trend": None,  # 기존 호환 (datalab 점수화 객체는 후속)
         "articles": articles,
+        "display_articles": display_articles,
         # ===== 신규 optional =====
         "score": ranked_item.get("score", 0.0),
         "rank_reason": ranked_item.get("rank_reason", ""),

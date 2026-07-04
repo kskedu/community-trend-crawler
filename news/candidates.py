@@ -513,6 +513,78 @@ def build_representative_summary(primary_cluster: List[Dict], representative: Op
     return (representative or {}).get("title")
 
 
+# === display_articles(2026-07-04) — 상세 팝업 노출 전용 필터 =================================
+# 문제: 여러 seed/aux 후보가 same-issue merge로 하나의 keyword로 묶이면, 그 keyword 문자열
+# 자체가 "도깨비 10주년 여행 공유"처럼 여러 단어의 조합이 된다. _has_keyword_token()은
+# keyword 토큰 "하나만" 겹쳐도 매칭으로 보므로("공유"라는 흔한 단어), 배우 "공유"와 무관한
+# "성과 공유"/"계획 공유" 기사가 relevance_score만 높게 나와 evidence용 articles에 섞여
+# 들어올 수 있다. display_articles는 이 articles(랭킹/게이트 근거, 변경 없음)를 사용자
+# 노출 직전에 한 번 더 걸러내는 별도 레이어다 — ranking/gate 로직 자체는 건드리지 않는다.
+_GENERIC_SINGLE_TOKENS = {
+    "공유", "조사", "수사", "계획", "지원", "성과", "호황", "반등", "논란", "관련", "발표",
+}
+
+
+def _matched_tokens(tokens: set, text: str, text_tokens: set) -> set:
+    """tokens 중 text에 실제 등장하는 것 — 정확 토큰 매칭 또는 substring 포함(조사/어미
+    결합 대응, 예: "도깨비에서"에 "도깨비"가 포함). 기존 _has_keyword_token과 동일한
+    substring 완화를 적용해, 정상 연관 기사가 조사 결합 때문에 억울하게 빠지지 않게 한다."""
+    text_low = (text or "").lower()
+    return {t for t in tokens if t in text_tokens or t.lower() in text_low}
+
+
+def _display_anchor_allowed(effective_keyword: str, article: Dict, representative: Optional[Dict]) -> bool:
+    """primary cluster에 속하지 않는 기사가 display_articles에 남을 수 있는 예외 조건.
+
+    - display_keyword 비-모호(non-generic) 토큰만으로 2개 이상 겹치면 허용.
+    - 비-모호 토큰 1개 + 모호 토큰 포함 전체 2개 이상 겹치는 경우("공유"+"도깨비")는,
+      대표 기사와도 비-모호 토큰을 1개 이상 공유할 때만 허용한다. 이 이중 확인이 없으면
+      "여행"처럼 keyword엔 있지만 그 자체로 매우 흔한 단어가 "공유"와 우연히 함께 등장하는
+      무관 기사("여행 계획 공유 앱 출시")까지 새어나간다(Codex review-only P2, 2026-07-04).
+    - 위 조건이 안 되면, 대표 기사 title과 비-모호 토큰을 2개 이상 공유하는지로 재확인.
+    - "공유"처럼 모호한 단일 토큰 하나만 겹치는 기사는 제외.
+    """
+    text = f"{article.get('title', '')} {article.get('clean_description') or article.get('snippet', '')}"
+    text_tokens = set(_tokens(text))
+
+    rep_title = (representative or {}).get("title") or ""
+    rep_tokens = set(_tokens(rep_title))
+    shared_with_rep_all = _matched_tokens(rep_tokens, text, text_tokens)
+    shared_with_rep = shared_with_rep_all - _GENERIC_SINGLE_TOKENS
+
+    kw_tokens = set(_tokens(effective_keyword))
+    matched_kw = _matched_tokens(kw_tokens, text, text_tokens)
+    non_generic_matched = matched_kw - _GENERIC_SINGLE_TOKENS
+    if len(non_generic_matched) >= 2:
+        return True
+    if len(non_generic_matched) >= 1 and len(matched_kw) >= 2 and len(shared_with_rep) >= 1:
+        return True
+
+    if len(shared_with_rep) >= 2:
+        return True
+    return False
+
+
+def build_display_articles(
+    effective_keyword: str, articles: List[Dict], representative: Optional[Dict] = None
+) -> List[Dict]:
+    """상세 팝업 노출 전용 목록 — articles(랭킹/게이트 근거)는 그대로 두고 별도로 생성한다.
+
+    - 대표 기사와 같은 primary cluster 기사는 우선 포함(compute_news_signal이 미리 표시한
+      is_primary_cluster 사용).
+    - 그 외는 _display_anchor_allowed()로 키워드/대표 title과의 실질적 연관성을 재확인한다.
+    - 부족해도 엉뚱한 기사로 채우지 않는다(하한 backfill 없음 — 사용자 정책).
+    """
+    out = []
+    for a in articles or []:
+        if a.get("is_primary_cluster"):
+            out.append(a)
+            continue
+        if _display_anchor_allowed(effective_keyword, a, representative):
+            out.append(a)
+    return out
+
+
 def _norm_key(keyword: str) -> str:
     return (keyword or "").strip().lower()
 
@@ -702,6 +774,13 @@ def compute_news_signal(keyword: str, raw_items: List[dict], require_all_tokens:
     primary = select_primary_cluster(clusters)
     representative = select_representative(primary)
     topic_coherence = compute_topic_coherence(clusters, len(scored_articles))
+
+    # display_articles(2026-07-04) 판정용 — 대표 이슈와 같은 primary cluster에 속하는지
+    # 기사별로 표시해둔다. dedup/filter 단계가 같은 dict 참조를 그대로 넘기므로 이 필드는
+    # builder까지 보존된다(build_display_articles 참고).
+    primary_ids = {id(a) for a in primary}
+    for a in scored_articles:
+        a["is_primary_cluster"] = id(a) in primary_ids
 
     representative_title = (representative or {}).get("title")
     # representative_summary: description hygiene 정책 적용(build_representative_summary,
