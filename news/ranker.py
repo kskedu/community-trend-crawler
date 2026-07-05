@@ -139,13 +139,62 @@ def _is_noise(keyword: str) -> bool:
     return False
 
 
-def _quality_gate_reason(news_meta: Dict) -> Optional[str]:
+# === 반복형/evergreen 콘텐츠(운세류) 제외(2026-07-05) ===
+# "오늘의 운세"/"띠별 운세" 같은 콘텐츠는 매일 반복 발행되고 기사 수·freshness가 항상
+# 높아 기존 quality/fresh gate를 그대로 통과한다 — 하지만 "실시간 이슈"가 아니라 정기
+# 콘텐츠이므로 별도 신호(패턴 매칭)로 걸러야 한다. 날짜 접미사("-7월 5일", "2026년 7월 6일")가
+# 붙어도 패턴 자체(부분 문자열)는 그대로 포함되므로 별도 날짜 정규식이 필요 없다.
+#
+# "사주"/"타로" 단독은 패턴에 넣지 않는다(Codex review-only P1, 2026-07-05): "청부 사주"/
+# "언론사 사주"/"댓글 사주 의혹"처럼 사건성 키워드에도 등장하는 짧은 단독어라, 단독으로
+# 넣으면 keyword 즉시매칭 경로에서 정상 이슈까지 운세로 오탐 제외된다. 운세 맥락이 명확한
+# phrase("오늘의 사주"/"사주풀이"/"오늘의 타로"/"타로 운세")로만 좁혀 잡는다.
+_HOROSCOPE_PATTERNS = (
+    "오늘의 운세", "띠별 운세", "별자리 운세", "별자리별 운세",
+    "주간 운세", "월간 운세", "꿈해몽", "로또운세",
+    "오늘의 사주", "사주풀이", "무료 사주", "신년 사주", "사주 운세",
+    "오늘의 타로", "타로 운세", "타로운세", "타로카드 운세",
+)
+# 기사 title 다수가 운세류일 때만 "기사 묶음 자체가 운세 콘텐츠"로 판단하는 비율 기준.
+# 절반 이하(0.5 포함)는 "운세성 제목이 한두 건 섞인 일반 묶음"으로 보아 제외하지 않는다
+# (Codex review-only P2, 2026-07-05: >=0.5는 2건 중 1건만 걸려도 제외되는 문제가 있어
+# 과반 "초과"로 좁힘 — 최소 과반 이상이 운세 콘텐츠일 때만 반복 콘텐츠로 본다).
+_HOROSCOPE_ARTICLE_RATIO = 0.5
+
+
+def _is_horoscope_text(text: str) -> bool:
+    t = text or ""
+    return any(p in t for p in _HOROSCOPE_PATTERNS)
+
+
+def _is_horoscope_candidate(keyword: str, news_meta: Dict) -> bool:
+    """keyword/display 표기 자체가 운세 패턴을 포함하거나, 기사 title 과반이 운세류인지.
+
+    - keyword 자체가 운세 패턴이면(예: "운세 오늘의 운세") 즉시 True(강한 신호).
+    - 그렇지 않으면 articles(정규화·relevance 반영된 원본) title 중 운세 패턴 비율이
+      _HOROSCOPE_ARTICLE_RATIO 초과일 때만 True — "운세"가 다른 주제 기사에 한두 건
+      섞인 정도(정확히 절반 포함)로는 과도하게 제외하지 않는다.
+    """
+    if _is_horoscope_text(keyword):
+        return True
+    articles = news_meta.get("articles") or []
+    if not articles:
+        return False
+    hits = sum(1 for a in articles if _is_horoscope_text(a.get("title")))
+    return (hits / len(articles)) > _HOROSCOPE_ARTICLE_RATIO
+
+
+def _quality_gate_reason(keyword: str, news_meta: Dict) -> Optional[str]:
     """keyword-level quality gate 위반 사유. 통과면 None.
 
     - 고관련 기사(candidates.HIGH_RELEVANCE_THRESHOLD 이상) 2건 미만 AND quality_cluster_size
       2 미만이면 low_quality_news(관련 기사가 사실상 없음).
     - 관련 기사는 있으나 전부 오래됨(FRESH_RELEVANCE_HOURS 이내 고관련 0건)이면 stale_only.
+    - keyword/기사 다수가 오늘의 운세류 반복 콘텐츠면 horoscope_content(2026-07-05) —
+      기사 수/freshness가 충분해도 실시간 이슈가 아니므로 위 두 조건보다 먼저 판정한다.
     """
+    if _is_horoscope_candidate(keyword, news_meta):
+        return "horoscope_content"
     hrc = news_meta.get("high_relevance_count", 0)
     qcs = news_meta.get("quality_cluster_size", 0)
     if not (hrc >= 2 or qcs >= 2):
@@ -206,7 +255,7 @@ def compute_scores(candidates: List[Dict], signals: Dict[str, Dict]) -> List[Dic
         if nm is None:
             gated.append(c)  # news 없는 후보 → 아래 news-required에서 no_news_evidence 처리
             continue
-        reason = _quality_gate_reason(nm)
+        reason = _quality_gate_reason(c["keyword"], nm)
         if reason:
             logger.info("[news] drop %s: %s", c["keyword"], reason)
             continue

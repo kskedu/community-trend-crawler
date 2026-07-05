@@ -2976,5 +2976,134 @@ class TestDisplayArticlesMinGate(unittest.TestCase):
         self.assertEqual(issues["keywords"][0]["rank"], 1)
 
 
+class TestHoroscopeContentGate(unittest.TestCase):
+    """반복형/evergreen 콘텐츠(운세류) quality gate 제외(2026-07-05, 별도 작업).
+
+    "오늘의 운세"/"띠별 운세" 등은 매일 반복 발행돼 기사 수·freshness가 항상 충분해
+    기존 quality/fresh gate를 통과하지만, 실시간 이슈가 아니므로 keyword/기사 패턴
+    기반으로 별도 제외한다. display_articles 부족 gate/source family/ranking gate는
+    건드리지 않는다.
+    """
+
+    def _horoscope_articles(self):
+        return [
+            _article("[오늘의 운세] 2026년 7월 6일", "https://x.com/h1",
+                     "오늘의 운세를 확인해보세요. 별자리별 운세도 함께 알려드립니다.",
+                     published_at=_recent_iso()),
+            _article("띠별 운세-7월 5일", "https://x.com/h2",
+                     "띠별로 오늘의 운세를 정리했다.", published_at=_recent_iso()),
+            _article("별자리별 운세 7월 5일", "https://x.com/h3",
+                     "별자리별 오늘의 운세를 알아본다.", published_at=_recent_iso()),
+        ]
+
+    def test_keyword_itself_horoscope_excluded_from_top10(self):
+        # keyword="운세 오늘의 운세" 자체가 강한 신호 → quality gate 이전에 제외.
+        sig = cand.compute_news_signal("운세 오늘의 운세", self._horoscope_articles())
+        candidates = [{"keyword": "운세 오늘의 운세", "sources": {"bing_home": 1}}]
+        signals = {
+            "news": {"운세 오늘의 운세": sig}, "datalab": {}, "google": {},
+            "bing_home": {"운세 오늘의 운세": 1},
+        }
+        ranked = ranker.compute_scores(candidates, signals)
+        self.assertEqual(ranked, [])
+
+    def test_dated_horoscope_article_bundle_excluded(self):
+        # "[오늘의 운세] 2026년 7월 6일"처럼 날짜가 붙어도 패턴 포함으로 그대로 잡힌다.
+        sig = cand.compute_news_signal("오늘의 운세 7월", self._horoscope_articles())
+        reason = ranker._quality_gate_reason("오늘의 운세 7월", sig)
+        self.assertEqual(reason, "horoscope_content")
+
+    def test_ttiband_and_constellation_bundle_excluded(self):
+        # keyword 자체는 운세 패턴이 아니지만, 기사 title 전부가 띠별/별자리 운세류.
+        articles = [
+            _article("띠별 운세 총정리", "https://x.com/t1", published_at=_recent_iso()),
+            _article("별자리별 운세 모음", "https://x.com/t2", published_at=_recent_iso()),
+        ]
+        sig = cand.compute_news_signal("오늘 운세 모음", articles)
+        reason = ranker._quality_gate_reason("오늘 운세 모음", sig)
+        self.assertEqual(reason, "horoscope_content")
+
+    def test_unrelated_news_mentioning_horoscope_once_not_excluded(self):
+        # "운세"가 한 기사에만 우연히 언급된 정도로는 과도하게 제외하지 않는다.
+        articles = [
+            _article("증권가 신년 운세 이벤트 대신 실적 발표 집중", "https://x.com/u1",
+                     "증권사들이 신년 운세 이벤트보다 실적 발표에 집중한다.",
+                     published_at=_recent_iso()),
+            _article("반도체 업체 실적 전망 상향", "https://x.com/u2",
+                     "반도체 기업들의 실적 전망이 상향 조정됐다.", published_at=_recent_iso()),
+        ]
+        sig = cand.compute_news_signal("반도체 실적", articles)
+        reason = ranker._quality_gate_reason("반도체 실적", sig)
+        self.assertNotEqual(reason, "horoscope_content")
+
+    def test_drop_reason_recorded_as_horoscope_content(self):
+        sig = cand.compute_news_signal("운세 오늘의 운세", self._horoscope_articles())
+        reason = ranker._quality_gate_reason("운세 오늘의 운세", sig)
+        self.assertEqual(reason, "horoscope_content")
+
+    def test_incident_keyword_containing_sazu_word_not_excluded(self):
+        # "청부 사주"/"언론사 사주"처럼 "사주"가 들어간 사건성 키워드는 운세와 무관하므로
+        # 오탐 제외되면 안 된다(Codex review-only P1, 2026-07-05).
+        articles = [
+            _article("검찰, 청부 사주 의혹 수사 착수", "https://x.com/s1",
+                     "검찰이 청부 사주 의혹에 대한 수사에 착수했다.", published_at=_recent_iso()),
+            _article("언론사 사주 구속 기소", "https://x.com/s2",
+                     "언론사 사주가 배임 혐의로 구속 기소됐다.", published_at=_recent_iso()),
+        ]
+        sig = cand.compute_news_signal("청부 사주 의혹", articles)
+        reason = ranker._quality_gate_reason("청부 사주 의혹", sig)
+        self.assertNotEqual(reason, "horoscope_content")
+
+    def test_exactly_half_horoscope_articles_not_excluded(self):
+        # 기사 2건 중 1건만 운세 패턴이면(정확히 절반) 제외하지 않는다 — "다수"가 아니다
+        # (Codex review-only P2, 2026-07-05: >=0.5는 이 경계에서 오제외됨).
+        articles = [
+            _article("오늘의 운세 함께 보기", "https://x.com/half1", published_at=_recent_iso()),
+            _article("반도체 업체 실적 전망 상향", "https://x.com/half2",
+                     "반도체 기업들의 실적 전망이 상향 조정됐다.", published_at=_recent_iso()),
+        ]
+        sig = cand.compute_news_signal("반도체 전망", articles)
+        reason = ranker._quality_gate_reason("반도체 전망", sig)
+        self.assertNotEqual(reason, "horoscope_content")
+
+    def test_display_articles_min_gate_unaffected(self):
+        # 운세 gate 추가가 기존 display_articles 부족 gate 동작을 깨지 않는다.
+        sig = cand.compute_news_signal(
+            "도깨비 10주년 여행 공유",
+            [
+                {"title": "공유 김고은과 도깨비 명장면 재현", "originallink": "https://x.com/dg1",
+                 "description": "배우 공유와 김고은이 tvN 도깨비 촬영을 회상했다", "pubDate": None},
+                {"title": "성과급 국민배당 AI 반도체 호황", "originallink": "https://x.com/dg2",
+                 "description": "기업이 성과 공유 계획을 발표했다", "pubDate": None},
+            ],
+        )
+        item = {
+            "keyword": "도깨비 10주년 여행 공유", "score": 0.5, "source_breakdown": {"news": 0.5},
+            "rank_reason": "", "news_meta": sig, "used_signals": ["news"],
+            "display_keyword": "도깨비 10주년 여행 공유",
+        }
+        kept, excluded = ranker.exclude_insufficient_display_articles([item])
+        self.assertEqual(len(kept), 0)
+        self.assertIn("도깨비 10주년 여행 공유", excluded)
+
+    def test_source_family_candidates_unaffected_by_horoscope_gate(self):
+        # 운세와 무관한 후보의 source family 판정(google/nate/bing/daum)은 그대로 유지된다.
+        good_articles = [
+            _article("AI 노트북 시장 성장", "https://x.com/g1", published_at=_recent_iso()),
+            _article("신형 노트북 출시", "https://x.com/g2", published_at=_recent_iso()),
+        ]
+        sig = cand.compute_news_signal("노트북", good_articles)
+        candidates = [
+            {"keyword": "노트북", "sources": {"google_trends": 1, "nate_home": 2, "bing_home": 3, "daum_home": 4}},
+        ]
+        signals = {"news": {"노트북": sig}, "datalab": {}, "google": {}}
+        ranked = ranker.compute_scores(candidates, signals)
+        self.assertEqual(len(ranked), 1)
+        self.assertEqual(
+            set(ranked[0]["sources"].keys()),
+            {"google_trends", "nate_home", "bing_home", "daum_home"},
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
