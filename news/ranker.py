@@ -1178,3 +1178,49 @@ def select_top(ranked: List[Dict], top_n: int = TOP_N) -> List[Dict]:
     후보를 그룹에 포함시키지 않은 나머지 항목이 순서대로 이어져 자연스럽게 backfill됨).
     """
     return ranked[:top_n]
+
+
+# display_articles 최소 노출 기준(2026-07-05): 상세 팝업에 기사가 1건뿐인 후보는
+# Top10 실시간 이슈로 신뢰도가 낮아 최종 후보에서 제외한다(2건은 허용, 감점 없음).
+DISPLAY_ARTICLES_MIN = 2
+
+
+def exclude_insufficient_display_articles(items: List[Dict]) -> tuple:
+    """display_articles(사용자 노출 전용)가 DISPLAY_ARTICLES_MIN 미만(<=1)인 후보를 제외.
+
+    builder가 issues를 조립할 때 계산하는 display_articles와 동일한 입력
+    (news_meta.articles → dedup → filter_articles_for_display → build_display_articles)으로
+    노출 개수를 미리 산출해, build 이전에 제외한다. build 이전에 적용해야 run_news_briefing의
+    recent guard / partial publish 판단과 저장 로그가 실제 발행 개수와 정합한다
+    (Codex review-only P2, 2026-07-05: builder 단계에서 줄이면 이미 끝난 recent guard/
+    로그와 어긋남). articles 원본/ranking gate/quality·fresh·PR gate는 건드리지 않는다 —
+    이 gate는 "사용자 노출 품질" 방어용이며, 제외로 개수가 줄어도 filler는 넣지 않는다.
+
+    dedupe_and_merge()/generic·PR gate/enforce_display_article_consistency 이후,
+    select_top() 이후에 적용한다(최종 노출 후보 확정 단계).
+    반환: (kept, excluded_keywords).
+    """
+    from news.dedup import dedup_articles
+    from news.builder import ARTICLES_MIN, ARTICLES_MAX
+    from news.candidates import build_display_articles, filter_articles_for_display
+
+    kept: List[Dict] = []
+    excluded: List[str] = []
+    for item in items:
+        news_meta = item.get("news_meta") or {}
+        articles = filter_articles_for_display(
+            dedup_articles(news_meta.get("articles") or []), min_count=ARTICLES_MIN
+        )[:ARTICLES_MAX]
+        effective_keyword = item.get("display_keyword") or item.get("keyword")
+        display = build_display_articles(
+            effective_keyword, articles, news_meta.get("representative_article")
+        )
+        if len(display) < DISPLAY_ARTICLES_MIN:
+            logger.warning(
+                "[news] drop %s: insufficient_display_articles(%d<%d)",
+                effective_keyword, len(display), DISPLAY_ARTICLES_MIN,
+            )
+            excluded.append(item.get("keyword", ""))
+            continue
+        kept.append(item)
+    return kept, excluded

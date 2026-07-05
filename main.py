@@ -177,10 +177,16 @@ def _rank_and_select(candidates, signals, pass_name):
     if generic_excluded:
         logger.warning("[news] %s: generic singleton 제외 %s", pass_name, generic_excluded)
     top = ranker.select_top(kept)
+    # display_articles <= 1 후보 제외(2026-07-05) — build 이전에 적용해 recent guard/
+    # partial publish 판단과 저장 로그가 실제 발행 개수와 정합하게 한다.
+    top, display_excluded = ranker.exclude_insufficient_display_articles(top)
+    if display_excluded:
+        logger.warning("[news] %s: display_articles 부족 제외 %s", pass_name, display_excluded)
     logger.info(
-        "[news] %s: candidates=%d gate통과=%d PR제외=%d merge후=%d generic제외=%d final=%d",
+        "[news] %s: candidates=%d gate통과=%d PR제외=%d merge후=%d generic제외=%d "
+        "display부족제외=%d final=%d",
         pass_name, len(candidates), gate_passed, len(pr_excluded), len(merged),
-        len(generic_excluded), len(top),
+        len(generic_excluded), len(display_excluded), len(top),
     )
     return top
 

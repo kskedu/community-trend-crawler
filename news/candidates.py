@@ -542,6 +542,14 @@ def _display_anchor_allowed(effective_keyword: str, article: Dict, representativ
       "여행"처럼 keyword엔 있지만 그 자체로 매우 흔한 단어가 "공유"와 우연히 함께 등장하는
       무관 기사("여행 계획 공유 앱 출시")까지 새어나간다(Codex review-only P2, 2026-07-04).
     - 위 조건이 안 되면, 대표 기사 title과 비-모호 토큰을 2개 이상 공유하는지로 재확인.
+    - 단일 토큰 예외(2026-07-05): effective_keyword가 비-모호 토큰 "하나"뿐인
+      고유명(인물명 등)일 때는, 위 다-토큰 조건들이 구조적으로 성립할 수 없다(토큰이
+      2개 이상 겹칠 수가 없음). 이 경우 그 앵커 토큰이 기사 title 주제이고
+      (relevance_reason == keyword_main_topic, is_incidental=False) 그 토큰이 실제로
+      겹치면 허용한다 — "장동건"/"박소영"처럼 단일 인물명 키워드의 고관련 기사가
+      primary cluster 밖이라는 이유만으로 display에서 대량 탈락하는 문제를 막는다.
+      "공유"/"성과" 같은 generic 단일 토큰은 _GENERIC_SINGLE_TOKENS에서 이미 걸러지므로
+      이 예외를 타지 못한다(오염 방어 유지).
     - "공유"처럼 모호한 단일 토큰 하나만 겹치는 기사는 제외.
     """
     text = f"{article.get('title', '')} {article.get('clean_description') or article.get('snippet', '')}"
@@ -561,6 +569,20 @@ def _display_anchor_allowed(effective_keyword: str, article: Dict, representativ
         return True
 
     if len(shared_with_rep) >= 2:
+        return True
+
+    # 단일 non-generic 토큰(고유명/인물명) 키워드 예외 — title 주제 기사만 허용.
+    # "키워드 자체가 토큰 1개"일 때만 적용한다(Codex review-only P1, 2026-07-05):
+    # len(kw_non_generic)==1만 보면 "여행 공유"/"지원 발표"처럼 generic을 뺀 뒤 1개만
+    # 남는 다토큰 키워드까지 anchor 검증 없이 예외를 타 오염이 다시 샌다. 원래 키워드가
+    # 단일 토큰("장동건")이고 그 토큰이 generic이 아닐 때로 좁힌다.
+    if (
+        len(kw_tokens) == 1
+        and not (kw_tokens & _GENERIC_SINGLE_TOKENS)
+        and non_generic_matched
+        and not article.get("is_incidental")
+        and article.get("relevance_reason") == "keyword_main_topic"
+    ):
         return True
     return False
 

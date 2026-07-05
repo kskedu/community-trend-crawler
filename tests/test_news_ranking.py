@@ -2824,5 +2824,157 @@ class TestDisplayArticles(unittest.TestCase):
         self.assertIn("도깨비", display[0]["title"])
 
 
+class TestSingleTokenDisplayArticles(unittest.TestCase):
+    """단일 non-generic 토큰(인물명 등) 키워드 display 필터 완화(A, 2026-07-05).
+
+    문제 사례: 키워드 "장동건"에서 articles 6건 전부 keyword_main_topic(0.9)인데도
+    primary cluster가 2건뿐이라 display_articles가 2건으로 잘림. 단일 토큰이라 기존
+    anchor 예외(토큰 2개 이상 조건)를 구조적으로 통과할 수 없던 것이 원인.
+    """
+
+    KEYWORD = "장동건"
+
+    def _person_articles(self):
+        # 같은 인물의 서로 다른 각도 기사 — Jaccard clustering이 여러 클러스터로 쪼갬.
+        return [
+            {"title": "노화 고백한 장동건, 급 '탱탱' 동안됐다", "originallink": "https://x.com/j1",
+             "description": "배우 장동건이 한층 어려진 비주얼로 등장했다", "pubDate": None},
+            {"title": "못 알아볼 뻔…장동건, 공식석상서 포착된 달라진 이미지", "originallink": "https://x.com/j2",
+             "description": "장동건이 공식 행사에서 달라진 모습을 보였다", "pubDate": None},
+            {"title": "54세 장동건, 못 알아볼 뻔한 바뀐 얼굴", "originallink": "https://x.com/j3",
+             "description": "장동건의 외모 변화가 화제다", "pubDate": None},
+            {"title": "중년 배우들 회춘…볼살 통통해진 장동건", "originallink": "https://x.com/j4",
+             "description": "황정민과 장동건 등 중년 배우들의 외모 변화가 눈길을 끈다", "pubDate": None},
+        ]
+
+    def test_single_person_name_main_topic_articles_survive(self):
+        # 단일 인물명 키워드의 keyword_main_topic 기사는 primary cluster 밖이라도 살아남는다.
+        sig = cand.compute_news_signal(self.KEYWORD, self._person_articles())
+        articles = cand.filter_articles_for_display(sig["articles"], min_count=1)
+        display = cand.build_display_articles(self.KEYWORD, articles, sig["representative_article"])
+        # 4건 모두 장동건이 title 주제 → display에 대부분 생존(최소 3건 이상).
+        self.assertGreaterEqual(len(display), 3)
+        self.assertTrue(all("장동건" in a["title"] for a in display))
+
+    def test_single_generic_token_still_excluded(self):
+        # 단일 토큰이라도 그것이 generic("공유")이면 예외를 타지 못한다(오염 방어 유지).
+        raw = [
+            {"title": "삼성전자 성과 공유", "originallink": "https://x.com/g1",
+             "description": "기업이 성과 공유 계획을 발표했다", "pubDate": None},
+            {"title": "정경호 감독 시즌 계획 공유", "originallink": "https://x.com/g2",
+             "description": "정경호 감독이 계획을 공유했다", "pubDate": None},
+        ]
+        sig = cand.compute_news_signal("공유", raw)
+        articles = cand.filter_articles_for_display(sig["articles"], min_count=1)
+        # 대표 없이도(또는 대표가 있어도) generic 단독 토큰은 primary 외 기사를 살리지 않는다.
+        rep = sig["representative_article"]
+        non_primary = [a for a in articles if not a.get("is_primary_cluster")]
+        for a in non_primary:
+            self.assertFalse(
+                cand._display_anchor_allowed("공유", a, rep),
+                msg=f"generic 단독 토큰이 예외를 타면 안 됨: {a['title']}",
+            )
+
+    def test_multitoken_keyword_reduced_to_one_nongeneric_not_exempted(self):
+        # "여행 공유"처럼 generic("공유")을 뺀 뒤 non-generic이 1개("여행")만 남는 다토큰
+        # 키워드는 단일토큰 예외를 타면 안 된다(Codex review-only P1, 2026-07-05). "여행"만
+        # 겹치는 무관 기사가 anchor 검증 없이 새는 것을 막는다.
+        rep = {"title": "여행 공유 앱 대표 인터뷰", "snippet": "여행 공유 서비스"}
+        article = {
+            "title": "제주 여행 코스 추천", "snippet": "가족 여행 코스를 추천한다",
+            "relevance_reason": "keyword_main_topic", "is_incidental": False,
+            "is_primary_cluster": False,
+        }
+        self.assertFalse(cand._display_anchor_allowed("여행 공유", article, rep))
+
+    def test_single_token_incidental_article_not_survived(self):
+        # 단일 인물명 키워드라도 incidental/side-mention(주제가 아님) 기사는 예외를 못 탄다.
+        raw = [
+            {"title": "장동건, 신작 영화 제작발표회 참석", "originallink": "https://x.com/p1",
+             "description": "장동건이 신작 제작발표회에 참석했다", "pubDate": None},
+            {"title": "영화 시사회 경품 증정 이벤트, 장동건 친필 사인 지급", "originallink": "https://x.com/p2",
+             "description": "경품으로 장동건 친필 사인을 증정한다", "pubDate": None},
+        ]
+        sig = cand.compute_news_signal(self.KEYWORD, raw)
+        articles = cand.filter_articles_for_display(sig["articles"], min_count=1)
+        display = cand.build_display_articles(self.KEYWORD, articles, sig["representative_article"])
+        # 경품 증정(incidental) 기사는 display에 노출되지 않는다.
+        self.assertFalse(any("경품 증정" in a["title"] for a in display))
+
+
+class TestDisplayArticlesMinGate(unittest.TestCase):
+    """display_articles <= 1 Top10 제외 gate(B, 2026-07-05, ranker.exclude_insufficient_display_articles).
+
+    gate는 build 이전(select_top 이후)에 적용된다 — recent guard/partial publish 판단과
+    저장 로그가 실제 발행 개수와 정합하도록(Codex review-only P2).
+    """
+
+    def _ranked_item(self, keyword, raw, display_keyword=None):
+        sig = cand.compute_news_signal(keyword, raw)
+        return {
+            "keyword": keyword, "score": 0.5, "source_breakdown": {"news": 0.5},
+            "rank_reason": "", "news_meta": sig, "used_signals": ["news"],
+            "display_keyword": display_keyword or keyword,
+        }
+
+    def test_keyword_with_single_display_article_excluded(self):
+        # display_articles가 1건뿐인 후보는 gate에서 제외된다.
+        single = self._ranked_item(
+            "도깨비 10주년 여행 공유",
+            [
+                {"title": "공유 김고은과 도깨비 명장면 재현", "originallink": "https://x.com/s1",
+                 "description": "배우 공유와 김고은이 tvN 도깨비 촬영을 회상했다", "pubDate": None},
+                {"title": "성과급 국민배당 AI 반도체 호황", "originallink": "https://x.com/s2",
+                 "description": "기업이 성과 공유 계획을 발표했다", "pubDate": None},
+            ],
+        )
+        kept, excluded = ranker.exclude_insufficient_display_articles([single])
+        self.assertEqual(len(kept), 0)
+        self.assertIn("도깨비 10주년 여행 공유", excluded)
+
+    def test_keyword_with_enough_display_articles_kept(self):
+        # display >= 2 후보는 유지되고, 부족 후보만 제외된다.
+        drop = self._ranked_item(
+            "도깨비 10주년 여행 공유",
+            [
+                {"title": "공유 김고은과 도깨비 명장면 재현", "originallink": "https://x.com/d1",
+                 "description": "배우 공유와 김고은이 도깨비 촬영을 회상했다", "pubDate": None},
+                {"title": "성과급 국민배당 반도체 호황", "originallink": "https://x.com/d2",
+                 "description": "성과 공유 계획 발표", "pubDate": None},
+            ],
+        )
+        keep = self._ranked_item(
+            "장동건",
+            [
+                {"title": "노화 고백한 장동건, 동안됐다", "originallink": "https://x.com/k1",
+                 "description": "배우 장동건이 어려진 비주얼로 등장했다", "pubDate": None},
+                {"title": "54세 장동건, 바뀐 얼굴 화제", "originallink": "https://x.com/k2",
+                 "description": "장동건의 외모 변화가 화제다", "pubDate": None},
+                {"title": "장동건, 공식석상서 달라진 이미지", "originallink": "https://x.com/k3",
+                 "description": "장동건이 공식 행사에서 달라진 모습을 보였다", "pubDate": None},
+            ],
+        )
+        kept, excluded = ranker.exclude_insufficient_display_articles([drop, keep])
+        kept_keywords = [k["keyword"] for k in kept]
+        self.assertIn("장동건", kept_keywords)
+        self.assertNotIn("도깨비 10주년 여행 공유", kept_keywords)
+        self.assertIn("도깨비 10주년 여행 공유", excluded)
+
+    def test_build_ranked_issues_reranks_kept_from_one(self):
+        # gate로 걸러진 top이 build로 넘어오면 issues의 rank는 1부터 순서대로 매겨진다.
+        keep = self._ranked_item(
+            "장동건",
+            [
+                {"title": "노화 고백한 장동건, 동안됐다", "originallink": "https://x.com/r1",
+                 "description": "배우 장동건이 어려진 비주얼로 등장했다", "pubDate": None},
+                {"title": "54세 장동건, 바뀐 얼굴 화제", "originallink": "https://x.com/r2",
+                 "description": "장동건의 외모 변화가 화제다", "pubDate": None},
+            ],
+        )
+        kept, _ = ranker.exclude_insufficient_display_articles([keep])
+        issues = build_ranked_issues(kept, {}, ["naver_news"])
+        self.assertEqual(issues["keywords"][0]["rank"], 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

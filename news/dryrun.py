@@ -141,6 +141,8 @@ def run_ranking(verbose: bool = True) -> dict:
     merged = ranker.enforce_display_article_consistency(merged)
     kept, _generic_excluded = ranker.exclude_generic_singletons(merged)
     top = ranker.select_top(kept)
+    # 운영 _rank_and_select와 동일하게 display_articles <= 1 후보 제외(2026-07-05).
+    top, _display_excluded = ranker.exclude_insufficient_display_articles(top)
     candidate_map = {c["keyword"]: c for c in candidates}
     data_sources = ["naver_news"]
     if datalab_signals:
