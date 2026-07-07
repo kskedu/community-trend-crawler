@@ -117,7 +117,32 @@ def run():
     saved = upsert_posts(all_posts)
     logger.info(f"저장 완료: {saved}건")
 
-    # 검색엔진 키워드 수집
+    # 검색엔진 키워드 수집(포털·서비스별 keyword_cache 갱신)
+    _collect_keyword_caches(source_status)
+
+    # source별 최종 상태 리포트 — optional/degraded 실패가 전체 실패처럼 보이지 않도록
+    # active(ok/failed)와 skipped를 분리 표시. 판단 자체는 개별 except에서 이미 격리됨.
+    ok = [s for s, v in source_status.items() if v == "ok"]
+    failed = [s for s, v in source_status.items() if v == "failed"]
+    skipped = [s for s, v in source_status.items() if v == "skipped"]
+    logger.info(
+        f"[source 상태] ok={len(ok)} failed={len(failed)} skipped={len(skipped)} "
+        f"| failed={failed} skipped={skipped}"
+    )
+
+    # 실시간 이슈 브리핑 (P0-2) — 실패해도 위 커뮤니티/키워드 수집 결과에 영향 없도록 격리
+    run_news_briefing()
+
+
+def _collect_keyword_caches(source_status):
+    """검색엔진 실시간 키워드(danawa/daum/daangn/nate/msn) 수집 → keyword_cache upsert.
+
+    full(run())과 news_top_only(__main__ 분기) 양쪽에서 재사용한다. news_top_only는
+    커뮤니티 스크래퍼를 생략하고 이 함수만 호출해 포털·서비스별 keyword_cache를
+    news_top/news_issue_cache 생성 이전에 갱신한다(2026-07 실행 주기 개선).
+    source_status(dict)는 caller가 최종 리포트용으로 전달 — news_top_only에서는
+    빈 dict({})를 넘겨도 무방(리포트 미사용).
+    """
     for ks in KEYWORD_SCRAPERS:
         if not ks.active:
             logger.info(f"[{ks.source}] 비활성(skipped) — upstream 없음, 크롤링 생략")
@@ -135,19 +160,6 @@ def run():
         except Exception as e:
             logger.error(f"[{ks.source}] 키워드 실패: {e}")
             source_status[ks.source] = "failed"
-
-    # source별 최종 상태 리포트 — optional/degraded 실패가 전체 실패처럼 보이지 않도록
-    # active(ok/failed)와 skipped를 분리 표시. 판단 자체는 개별 except에서 이미 격리됨.
-    ok = [s for s, v in source_status.items() if v == "ok"]
-    failed = [s for s, v in source_status.items() if v == "failed"]
-    skipped = [s for s, v in source_status.items() if v == "skipped"]
-    logger.info(
-        f"[source 상태] ok={len(ok)} failed={len(failed)} skipped={len(skipped)} "
-        f"| failed={failed} skipped={skipped}"
-    )
-
-    # 실시간 이슈 브리핑 (P0-2) — 실패해도 위 커뮤니티/키워드 수집 결과에 영향 없도록 격리
-    run_news_briefing()
 
 
 # 통합 랭킹 가드 임계 (docs/news-ranking-plan.md §10)
@@ -494,14 +506,18 @@ def run_news_briefing():
 
 if __name__ == "__main__":
     # 실행 모드 분기 (cron 분리용):
-    #   full           : 커뮤니티 + 검색엔진 키워드 + news_top (매시 17분)
-    #   news_top_only  : 실시간 이슈 news_top 만 (매시 47분, 커뮤니티/키워드 미실행)
+    #   full           : 커뮤니티 + 포털·서비스별 keyword_cache + news_top (매시 17분)
+    #   news_top_only  : 커뮤니티 생략, 포털·서비스별 keyword_cache + news_top (매시 47분)
+    #     2026-07 개선: keyword_cache가 정각/17분 full에서만 갱신돼 news_top(30분 주기)
+    #     체감과 어긋나던 문제 해결 — news_top_only 에도 keyword_cache 갱신을 포함해
+    #     "포털 키워드 수집 → keyword_cache upsert → news_top 생성" 순서를 동일하게 맞춘다.
     # 기본값 full. 알 수 없는 모드는 fallback 없이 즉시 실패.
     mode = sys.argv[1] if len(sys.argv) > 1 else "full"
     if mode == "full":
         run()
     elif mode == "news_top_only":
-        logger.info("[mode] news_top_only — 커뮤니티/키워드 수집 생략, news_top 만 갱신")
+        logger.info("[mode] news_top_only — 커뮤니티 수집 생략, 포털 키워드+news_top 갱신")
+        _collect_keyword_caches({})
         run_news_briefing()
     else:
         raise SystemExit(f"Unknown mode: {mode!r} (allowed: full, news_top_only)")

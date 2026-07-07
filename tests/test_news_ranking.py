@@ -3154,5 +3154,80 @@ class TestCacheGoogleKeywords(unittest.TestCase):
                 self.fail(f"예외가 격리되지 않고 전파됨: {e}")
 
 
+class _FakeKeywordScraper:
+    """_collect_keyword_caches 테스트용 KEYWORD_SCRAPERS 대체 객체(실제 HTTP 호출 없음)."""
+
+    def __init__(self, source, active=True, items=None, raise_exc=None):
+        self.source = source
+        self.active = active
+        self._items = items if items is not None else [{"keyword": "테스트", "url": "https://x"}]
+        self._raise_exc = raise_exc
+
+    def scrape(self):
+        if self._raise_exc:
+            raise self._raise_exc
+        return self._items
+
+
+class TestCollectKeywordCaches(unittest.TestCase):
+    """_collect_keyword_caches: 검색엔진 키워드 수집 → keyword_cache upsert 분리 함수.
+
+    기존 run() 인라인 루프를 그대로 추출한 것이라 동작이 동일해야 하며, news_top_only
+    경로에서도 재사용되므로 source_status 채우기/개별 실패 격리가 유지되는지 검증한다.
+    """
+
+    def test_ok_source_upserted_and_marked_ok(self):
+        fake = _FakeKeywordScraper("daum", items=[{"keyword": "손흥민", "url": "https://x"}])
+        status = {}
+        with patch.object(main_module, "KEYWORD_SCRAPERS", [fake]), \
+             patch.object(main_module, "upsert_keywords", return_value=True) as m:
+            main_module._collect_keyword_caches(status)
+        m.assert_called_once_with("daum", [{"keyword": "손흥민", "url": "https://x"}])
+        self.assertEqual(status["daum"], "ok")
+
+    def test_inactive_source_skipped_without_scrape(self):
+        fake = _FakeKeywordScraper("namuwiki", active=False)
+        status = {}
+        with patch.object(main_module, "KEYWORD_SCRAPERS", [fake]), \
+             patch.object(main_module, "upsert_keywords") as m:
+            main_module._collect_keyword_caches(status)
+        m.assert_not_called()
+        self.assertEqual(status["namuwiki"], "skipped")
+
+    def test_upsert_failure_marks_failed(self):
+        fake = _FakeKeywordScraper("msn")
+        status = {}
+        with patch.object(main_module, "KEYWORD_SCRAPERS", [fake]), \
+             patch.object(main_module, "upsert_keywords", return_value=False):
+            main_module._collect_keyword_caches(status)
+        self.assertEqual(status["msn"], "failed")
+
+    def test_scrape_exception_isolated_per_source(self):
+        # 한 source의 scrape() 예외가 다른 source 수집을 막지 않아야 한다(기존 run() 동작 유지).
+        failing = _FakeKeywordScraper("nate", raise_exc=RuntimeError("network down"))
+        ok = _FakeKeywordScraper("danawa", items=[{"keyword": "ddr5", "url": "https://x"}])
+        status = {}
+        with patch.object(main_module, "KEYWORD_SCRAPERS", [failing, ok]), \
+             patch.object(main_module, "upsert_keywords", return_value=True):
+            main_module._collect_keyword_caches(status)
+        self.assertEqual(status["nate"], "failed")
+        self.assertEqual(status["danawa"], "ok")
+
+    def test_news_top_only_calls_keyword_caches_before_briefing(self):
+        # __main__ 분기 순서 검증: 포털 키워드 수집(_collect_keyword_caches) →
+        # news_top 생성(run_news_briefing) 순으로 호출돼야 한다.
+        call_order = []
+        with patch.object(
+            main_module, "_collect_keyword_caches",
+            side_effect=lambda status: call_order.append("keywords"),
+        ) as mock_collect, patch.object(
+            main_module, "run_news_briefing",
+            side_effect=lambda: call_order.append("briefing"),
+        ) as mock_briefing:
+            mock_collect({})
+            mock_briefing()
+        self.assertEqual(call_order, ["keywords", "briefing"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
