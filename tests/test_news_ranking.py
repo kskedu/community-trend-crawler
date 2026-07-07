@@ -15,6 +15,7 @@
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -3103,6 +3104,54 @@ class TestHoroscopeContentGate(unittest.TestCase):
             set(ranked[0]["sources"].keys()),
             {"google_trends", "nate_home", "bing_home", "daum_home"},
         )
+
+
+class TestCacheGoogleKeywords(unittest.TestCase):
+    """_cache_google_keywords: google_trends 원천 후보 → keyword_cache 저장 변환.
+
+    출처별 보기 팝업이 keyword_cache를 읽으므로, google 후보를 {keyword, url} 형태로
+    upsert한다. 랭킹 로직과 무관하며 저장 실패는 news_top pipeline에 영향 없어야 한다.
+    """
+
+    def test_google_cands_upserted_as_keyword_url_items(self):
+        cands = [
+            {"keyword": "손흥민", "rank": 1, "active": True},
+            {"keyword": "월드컵 예선", "rank": 2},
+        ]
+        with patch.object(main_module, "upsert_keywords", return_value=True) as m:
+            main_module._cache_google_keywords(cands)
+        m.assert_called_once()
+        source, items = m.call_args[0]
+        self.assertEqual(source, "google_trends")
+        self.assertEqual(len(items), 2)
+        # {keyword, url} 형태 + Google 검색 URL(https) + keyword 원문 보존
+        self.assertEqual(items[0]["keyword"], "손흥민")
+        self.assertTrue(items[0]["url"].startswith("https://www.google.com/search?q="))
+        # 공백 키워드는 url-encode 되어 안전 URL 규약(http/https) 통과
+        self.assertIn("url", items[1])
+        self.assertTrue(items[1]["url"].startswith("https://"))
+
+    def test_empty_google_cands_no_upsert(self):
+        # 비활성/실패 시 google_cands=[] → keyword_cache 미저장(빈 값으로 last-good 덮지 않음)
+        with patch.object(main_module, "upsert_keywords", return_value=True) as m:
+            main_module._cache_google_keywords([])
+        m.assert_not_called()
+
+    def test_blank_keyword_items_skipped(self):
+        cands = [{"keyword": "  ", "rank": 1}, {"rank": 2}]
+        with patch.object(main_module, "upsert_keywords", return_value=True) as m:
+            main_module._cache_google_keywords(cands)
+        # 유효 keyword 0개 → upsert 호출 안 함
+        m.assert_not_called()
+
+    def test_upsert_exception_isolated(self):
+        # keyword_cache 저장 예외가 상위(news_top)로 전파되지 않아야 함
+        cands = [{"keyword": "테스트", "rank": 1}]
+        with patch.object(main_module, "upsert_keywords", side_effect=RuntimeError("db down")):
+            try:
+                main_module._cache_google_keywords(cands)
+            except Exception as e:  # noqa: BLE001
+                self.fail(f"예외가 격리되지 않고 전파됨: {e}")
 
 
 if __name__ == "__main__":

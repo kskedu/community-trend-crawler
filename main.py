@@ -4,6 +4,7 @@ GitHub Actions에서 주기적으로 실행됨
 """
 import logging
 import sys
+from urllib.parse import quote_plus
 from scrapers.clien import ClienScraper
 from scrapers.ruliweb import RuliwebScraper
 from scrapers.ppomppu import PpomppuScraper
@@ -241,6 +242,39 @@ def _google_related_terms(google_cands):
     return list(dict.fromkeys(terms))
 
 
+def _cache_google_keywords(google_cands):
+    """Google Trends 원천 후보를 keyword_cache(source='google_trends')에 저장.
+
+    StartHub "출처별 보기" 팝업이 keyword_cache를 직접 읽어 source별 Top10을 노출하는데,
+    google_trends는 news_top pipeline seed로만 쓰이고 keyword_cache엔 없어 팝업에서 빠졌다.
+    이미 fetch한 google_cands를 다른 source(daum/nate 등)와 동일한 {keyword, url} 형태로
+    upsert한다. url은 keyword_cache 공통 규약(검색 결과 URL)에 맞춰 Google 검색 URL을 생성.
+
+    - 랭킹 로직과 무관(seed_sources 전달은 그대로 유지). 저장 실패는 news_top에 영향 없게 격리.
+    - google 비활성/실패 시 google_cands=[] → upsert 안 함(빈 값으로 last-good 덮지 않음).
+    """
+    if not google_cands:
+        return
+    items = []
+    for c in google_cands:
+        kw = (c.get("keyword") or "").strip()
+        if not kw:
+            continue
+        items.append({
+            "keyword": kw,
+            "url": "https://www.google.com/search?q=" + quote_plus(kw),
+        })
+    if not items:
+        return
+    try:
+        if upsert_keywords("google_trends", items):
+            logger.info("[news] google_trends 키워드 %d개 keyword_cache 저장", len(items))
+        else:
+            logger.warning("[news] google_trends keyword_cache 저장 실패")
+    except Exception as e:
+        logger.warning("[news] google_trends keyword_cache 저장 예외(무시): %s", e)
+
+
 def _backfill_pass(
     pass1_top, pass1_aux, home_fulls, google_cands, daum_full,
     cached_search_news, news_signals, datalab_signals, google_signals,
@@ -342,6 +376,8 @@ def run_news_briefing():
         # 1) 홈/트렌드 seed 수집
         home_fulls = _collect_home_seeds()  # {family: ranked(≤20)}
         google_cands = google_adapter.fetch_candidates()  # 비활성/실패 시 [] (내부 로그)
+        # google_trends 원천 Top을 출처별 보기(keyword_cache)에도 노출 — 랭킹과 무관, 저장만.
+        _cache_google_keywords(google_cands)
         daum_full = home_fulls.get("daum_home", [])  # aux 추출 원천
 
         # 뉴스 fetch 메모이즈 — pass2 backfill에서 같은 키워드 재호출 방지(쿼터 보호).
