@@ -138,6 +138,7 @@ def run_ranking(verbose: bool = True) -> dict:
     ranked = ranker.compute_scores(candidates, signals)
     ranked, _pr_excluded = ranker.exclude_pr_clusters(ranked)
     merged = ranker.dedupe_and_merge(ranked)
+    merged = ranker.resolve_singleton_displays(merged)
     merged = ranker.enforce_display_article_consistency(merged)
     kept, _generic_excluded = ranker.exclude_generic_singletons(merged)
     top = ranker.select_top(kept)

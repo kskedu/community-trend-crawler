@@ -752,6 +752,30 @@ def _all_display_generic() -> set:
     return _GENERIC_EVENT_PREDICATE_WORDS | _DISPLAY_GENERIC_WORDS
 
 
+# === 검색의도 suffix display 방어(2026-07) ===
+# "위홀 뜻"처럼 keyword 마지막 토큰이 검색 의도(뜻/의미/누구 등)를 나타내면, 그
+# keyword 자체가 사용자에게 자연스러운 display가 아니다("이효리 조언"/"위홀 커플
+# 조언"이 더 자연스러움). 토큰 "정확 일치"만 본다(substring 아님) — "이나이 대표"
+# 처럼 suffix 문자열이 다른 토큰 일부로 우연히 섞인 경우까지 오탐 배제하면 안 된다
+# (Codex review-only 지적).
+_SEARCH_INTENT_SUFFIXES = {
+    "뜻", "의미", "누구", "프로필", "나이", "인스타", "결혼", "근황", "학력", "직업",
+}
+
+
+def _ends_with_search_intent_suffix(keyword: str) -> bool:
+    """keyword의 마지막 공백 구분 어절이 검색의도 suffix와 정확히 일치하는지.
+
+    summarizer._tokens(정규식 `[가-힣A-Za-z0-9]{2,}`)는 "뜻"처럼 1글자 토큰을
+    아예 만들지 않아 "위홀 뜻"의 suffix를 놓친다. 어절(공백) 분리 기준으로
+    정확 일치만 보면 1글자 suffix도 포착하면서, "이나이 대표"처럼 suffix
+    문자열이 다른 단어 일부로 섞인 경우는 별개 어절이 아니라 여전히 오탐하지
+    않는다(Codex review-only 지적: substring 아닌 정확 일치 유지).
+    """
+    words = (keyword or "").split()
+    return bool(words) and words[-1] in _SEARCH_INTENT_SUFFIXES
+
+
 def _display_common_event_tokens(members: List[Dict]) -> set:
     """display_keyword 대표성 판정 전용 — merge group 전체 기사에서 분포율이
     DISPLAY_TOKEN_MIN_COVERAGE 이상인 "사건 핵심 토큰" 집합. 일반 서술어
@@ -766,7 +790,14 @@ def _display_common_event_tokens(members: List[Dict]) -> set:
     유효 기사가 2건 미만이면(반복 관측 불가) 빈 set(zero-confidence)을 반환해
     seed/구체성 tie-breaker 경로로 넘긴다.
     """
-    articles = _display_group_articles(members)
+    return _common_event_tokens_from_articles(_display_group_articles(members))
+
+
+def _common_event_tokens_from_articles(articles: List[Dict]) -> set:
+    """_display_common_event_tokens의 저수준 버전 — merge group(members) 대신 articles
+    리스트를 직접 받는다. singleton(merge 안 된 단독 keyword) display 보정에서 재사용
+    (Codex review-only 지적: members 기반 헬퍼를 singleton에 그대로 씌우지 말고 articles
+    인자를 받는 형태로 일반화)."""
     if len(articles) < 2:
         return set()
     coverage = _token_article_coverage(articles)
@@ -831,15 +862,20 @@ def _representative_score(member: Dict, common_tokens: set, group_articles: List
        서술어(신임/임명/발표 등) 토큰만으로 구성되면 -1. "홍석기 치안감" 그룹에서
        "신임"이 대표로 뽑히던 회귀를 막는다. 어떤 coverage/common_hits보다 앞서
        무조건 최하위로 민다.
-    2. keyword coverage 감점 — keyword 자체가 그룹 기사 절반 미만에만 등장하면(지엽
+    2. 검색의도 suffix 페널티(2026-07) — keyword 마지막 토큰이 뜻/의미/누구 등
+       검색의도 suffix면 -1. "위홀 뜻"이 대표로 뽑혀 사용자에게 부자연스러운
+       display가 노출되던 문제를 막는다. generic-only 다음으로 먼저 걸러야 하는
+       결함이라 2번에 둔다("위홀"이라는 고유 토큰이 있어 generic-only는 아니므로
+       별도 축 필요).
+    3. keyword coverage 감점 — keyword 자체가 그룹 기사 절반 미만에만 등장하면(지엽
        엔티티) -1. "보스니아 헤르체고비나"처럼 일부 기사에만 나오는 다어절 엔티티를
        하드코딩 없이 데이터로 감점(Codex diff 리뷰 P2: 공통토큰 수보다 앞).
-    3. 공통 사건토큰 포함 수 — coverage가 대등한 후보들 사이에서, 그룹 기사 절반
+    4. 공통 사건토큰 포함 수 — coverage가 대등한 후보들 사이에서, 그룹 기사 절반
        이상에 걸쳐 등장하는 핵심어(common_tokens)를 많이 담을수록 대표성↑.
-    4. broad 단독어 페널티(-1) — _TOO_BROAD_SINGLE_WORDS 단독 후보 감점.
-    5. seed priority(daum>danawa>aux) — 대표성 동률일 때 원 seed 우선(tie-breaker).
-    6. 구체성(keyword 토큰 수) — 그래도 동률이면 더 구체적인 표현 우선.
-    7. 원 score — 최종 tie-breaker(신호 강도).
+    5. broad 단독어 페널티(-1) — _TOO_BROAD_SINGLE_WORDS 단독 후보 감점.
+    6. seed priority(daum>danawa>aux) — 대표성 동률일 때 원 seed 우선(tie-breaker).
+    7. 구체성(keyword 토큰 수) — 그래도 동률이면 더 구체적인 표현 우선.
+    8. 원 score — 최종 tie-breaker(신호 강도).
     """
     from news.summarizer import _tokens
 
@@ -847,10 +883,12 @@ def _representative_score(member: Dict, common_tokens: set, group_articles: List
     kw_toks = set(_tokens(kw))
     common_hits = len(kw_toks & common_tokens)
     generic_penalty = -1 if _is_generic_only_display(kw) else 0
+    suffix_penalty = -1 if _ends_with_search_intent_suffix(kw) else 0
     coverage_penalty = -1 if _keyword_coverage(member, group_articles) < DISPLAY_TOKEN_MIN_COVERAGE else 0
     broad_penalty = -1 if kw.strip() in _TOO_BROAD_SINGLE_WORDS else 0
     return (
         generic_penalty,
+        suffix_penalty,
         coverage_penalty,
         common_hits,
         broad_penalty,
@@ -934,6 +972,9 @@ def _build_display_keyword(members: List[Dict]) -> str:
         # generic-only 후보(신임/임명 등)는 보완 표기로도 붙이지 않는다(hotfix 2026-07-03).
         if _is_generic_only_display(k):
             return False
+        # 검색의도 suffix 후보(뜻/의미/누구 등)도 보완 표기로 붙이지 않는다(2026-07).
+        if _ends_with_search_intent_suffix(k):
+            return False
         if not low_coverage_group and _keyword_coverage(m, group_articles) < DISPLAY_TOKEN_MIN_COVERAGE:
             return False
         return True
@@ -969,11 +1010,11 @@ def _build_display_keyword(members: List[Dict]) -> str:
 
 
 def _display_or_canonical(display: str, canonical: str) -> str:
-    """최종 display 후보가 generic-only(신임/임명 등)면 canonical로 대체한다.
-    canonical 자체가 generic-only인 극단 케이스에는 그대로 canonical을 쓴다(그 이상
-    나은 선택지가 없음). DISPLAY_KEYWORD_MAX_LEN 상한 적용.
+    """최종 display 후보가 generic-only(신임/임명 등)거나 검색의도 suffix(뜻/의미 등)로
+    끝나면 canonical로 대체한다. canonical 자체가 같은 문제를 가진 극단 케이스에는
+    그대로 canonical을 쓴다(그 이상 나은 선택지가 없음). DISPLAY_KEYWORD_MAX_LEN 상한 적용.
     """
-    if _is_generic_only_display(display):
+    if _is_generic_only_display(display) or _ends_with_search_intent_suffix(display):
         return canonical[:DISPLAY_KEYWORD_MAX_LEN]
     return display[:DISPLAY_KEYWORD_MAX_LEN]
 
@@ -1069,6 +1110,86 @@ def dedupe_and_merge(ranked: List[Dict]) -> List[Dict]:
         merged["merge_reason"] = "same_article_cluster" if article_merge_count > 0 else "similar_keyword"
         result.append(merged)
 
+    return result
+
+
+# === singleton sense-mixing display 보정(2026-07) ===
+# dedupe_and_merge()의 단독(merge group size 1) 경로는 display_keyword=keyword를
+# 그대로 유지한다(길이 절단 방지 — 위 주석 참고). 하지만 "위홀 뜻"처럼 merge가 아예
+# 안 일어난 단독 keyword도 검색의도 suffix + 표시 기사와의 의미 불일치 문제를 그대로
+# 가질 수 있어, dedupe_and_merge() 이후 별도 함수로 좁게 보정한다(merge group 로직
+# 자체는 건드리지 않음 — Codex review-only: singleton 전용 좁은 예외로 제한).
+def _resolve_singleton_display(item: Dict) -> Dict:
+    """단독(merge 안 된) item의 display_keyword를 sense-mixing 관점에서 재검토한다.
+
+    아래 조건을 모두 만족할 때만 표시 기사 공통 토큰 기반으로 재구성한다(그 외에는
+    기존 keyword 그대로 유지 — 정상 singleton 회귀 없음):
+    1. keyword 마지막 토큰이 검색의도 suffix(뜻/의미/누구 등)와 정확히 일치.
+    2. suffix를 제외한 keyword의 non-generic 토큰이 최소 1개 이상 존재하고
+       (Codex review-only P1: 빈 집합이면 vacuous true가 되어 "뜻"/"의미" 단독
+       키워드까지 재구성 대상이 될 위험이 있어 반드시 1개 이상을 요구한다),
+       그 토큰들이 모두 표시 기사에 최소 1회 등장.
+    3. 표시 기사(news_meta.articles)의 공통 토큰(coverage>=0.5)으로 대체 표기를
+       구성할 수 있음(대체 후보가 없으면 원래 keyword 유지 — 억지 대체 없음).
+    """
+    from news.summarizer import _tokens
+
+    kw = item.get("keyword", "")
+    if "display_keyword" not in item:
+        item = dict(item)
+        item["display_keyword"] = kw
+    if not _ends_with_search_intent_suffix(kw):
+        return item
+
+    # suffix 어절(마지막 공백 구분 단어)을 제외한 나머지 문자열을 토큰화한다.
+    # summarizer._tokens는 1글자 토큰("뜻")을 만들지 않으므로 kw 전체를 토큰화한
+    # 뒤 마지막 원소를 자르면(kw_toks[:-1]) suffix가 애초에 토큰에 없을 때 stem이
+    # 통째로 사라진다("위홀 뜻" → ["위홀"] → [:-1] → [] 버그) — 반드시 suffix 어절을
+    # 문자열에서 제거한 나머지로 stem을 계산해야 한다.
+    stem_text = " ".join(kw.split()[:-1])
+    stem_toks = set(_tokens(stem_text)) - _all_display_generic()
+    if not stem_toks:
+        return item  # suffix 제외 나머지가 없음(예: "뜻" 단독) → 재구성 대상 아님
+
+    news_meta = item.get("news_meta") or {}
+    articles = news_meta.get("articles") or []
+    article_texts = [f"{a.get('title', '')} {a.get('snippet', '')}" for a in articles]
+    article_token_sets = [set(_tokens(t)) for t in article_texts]
+
+    # stem 토큰이 전부 표시 기사에 최소 1회 등장해야 함(근거 없는 재구성 방지).
+    if not all(any(st in toks for toks in article_token_sets) for st in stem_toks):
+        return item
+
+    common_tokens = _common_event_tokens_from_articles(articles)
+    if not common_tokens:
+        return item
+
+    representative = news_meta.get("representative_article") or {}
+    rep_title = representative.get("title") or ""
+    rep_toks = [t for t in _tokens(rep_title) if t in common_tokens]
+    if not rep_toks:
+        return item
+
+    candidate = " ".join(dict.fromkeys(rep_toks))[:DISPLAY_KEYWORD_MAX_LEN]
+    if not candidate or _ends_with_search_intent_suffix(candidate) or _is_generic_only_display(candidate):
+        return item
+
+    item = dict(item)
+    item["display_keyword"] = candidate
+    return item
+
+
+def resolve_singleton_displays(items: List[Dict]) -> List[Dict]:
+    """merge group size 1(단독 후보)에만 _resolve_singleton_display를 적용한다.
+    merge된 group(related_keywords 존재)은 대상이 아니다(_build_display_keyword가
+    이미 처리) — dedupe_and_merge() 직후, enforce_display_article_consistency() 직전에
+    호출한다."""
+    result = []
+    for item in items:
+        if item.get("related_keywords"):
+            result.append(item)
+            continue
+        result.append(_resolve_singleton_display(item))
     return result
 
 
