@@ -191,10 +191,10 @@ def _rank_and_select(candidates, signals, pass_name):
     kept, generic_excluded = ranker.exclude_generic_singletons(merged)
     if generic_excluded:
         logger.warning("[news] %s: generic singleton 제외 %s", pass_name, generic_excluded)
-    top = ranker.select_top(kept)
+    selected_pre_display = ranker.select_top(kept)
     # display_articles <= 1 후보 제외(2026-07-05) — build 이전에 적용해 recent guard/
     # partial publish 판단과 저장 로그가 실제 발행 개수와 정합하게 한다.
-    top, display_excluded = ranker.exclude_insufficient_display_articles(top)
+    top, display_excluded = ranker.exclude_insufficient_display_articles(selected_pre_display)
     if display_excluded:
         logger.warning("[news] %s: display_articles 부족 제외 %s", pass_name, display_excluded)
     logger.info(
@@ -203,7 +203,38 @@ def _rank_and_select(candidates, signals, pass_name):
         pass_name, len(candidates), gate_passed, len(pr_excluded), len(merged),
         len(generic_excluded), len(display_excluded), len(top),
     )
+    # source family diversity 관찰 로깅(2026-07, 순수 관찰 — ranking 결과에 영향 없음).
+    # 각 단계에서 어느 source family가 후보를 만들고 어느 단계에서 사라지는지 추적한다.
+    # category 분류기는 이번 범위에 없어 "미분류"로 고정한다(사전/룰셋 신규 추가 없음).
+    _log_source_family_diversity(
+        pass_name, candidates, ranked, merged, selected_pre_display, top,
+    )
     return top
+
+
+def _log_source_family_diversity(pass_name, candidates, gate_ranked, merged,
+                                 selected_pre_display, final_after_display):
+    """_rank_and_select 각 단계의 source family 분포를 로깅한다(관찰 전용).
+
+    단계: initial(candidates) → gate통과+PR제외후(gate_ranked) → merge후(merged)
+          → selected_pre_display(select_top 직후) → final_after_display(display 제외 이후).
+    gate_ranked는 compute_scores(quality/fresh/relevance gate) + exclude_pr_clusters를
+    통과한 뒤의 리스트라, gate/PR 두 관문 통과분을 함께 관측한다.
+    category는 분류기 부재로 "미분류(unknown)"만 남긴다(이번 범위 정책).
+    """
+    stages = (
+        ("initial", candidates),
+        ("gate+pr", gate_ranked),
+        ("merged", merged),
+        ("selected_pre_display", selected_pre_display),
+        ("final_after_display", final_after_display),
+    )
+    for stage_name, items in stages:
+        dist = cand.source_family_distribution(items)
+        logger.info(
+            "[news] %s source_family[%s]: %s (category=미분류)",
+            pass_name, stage_name, dict(sorted(dist.items())),
+        )
 
 
 # 홈/트렌드 seed 확장 단계 상한: pass1은 홈 Top10, pass2(backfill)는 홈 Top20.
@@ -298,9 +329,20 @@ def _backfill_pass(
     - 신규 후보 3경로: 홈 seed Top20 확장 + aux 확장(daum_home 전체 기반, 상한 12)
       + 뉴스 title 기반 phrase 후보 + Google related terms(있으면).
     - 신규 후보만 뉴스 실호출(cached_search_news 메모이즈), datalab/google 신호는
-      pass1 것을 재사용(추가 API 호출 없음).
+      pass1 것을 재사용(추가 API 호출은 신규 phrase 키워드 캐시 미스 시에만).
     - 증분 방식은 min-max 집합 정규화와 충돌하므로 전체 재계산을 채택한다.
     - 안전장치: 재계산 결과가 pass1보다 못하면 채택하지 않고 pass1 결과를 유지(rollback).
+
+    phrase 원천 확장(2026-07, Codex 계획 리뷰 반영): 기존엔 phrase를 pass1 news_signals
+    에서만 뽑아 pass1 후보 집합 바깥의 이슈를 놓쳤다. pass2에서 새로 발굴된 aux2/
+    Google related terms 키워드의 기사까지 phrase 원천으로 쓰기 위해, 아래 5단계로
+    순환 의존(phrase→candidates2→news_signals2)을 끊는다:
+      1) phrase 없이 pre-candidates(seed Top20 + aux2 + related_terms) 조립
+      2) pre-candidates로 pre-signals fetch(cached_search_news 경유, 대부분 캐시 히트)
+      3) pass1 news_signals ∪ pre-signals 를 원천으로 phrase 재추출
+      4) phrase까지 합쳐 최종 candidates2 재조립
+      5) 최종 news_signals2 fetch 후 rank/select
+    diversity/improved/rollback guard는 전부 최종 candidates2 조립 이후에 둔다(위치 불변).
 
     반환: (top2, candidates2). 채택하지 않으면 (None, None).
     """
@@ -311,13 +353,8 @@ def _backfill_pass(
         )
         # pass1 aux는 top=5 기준이라 top=10 확장 결과의 subset이 아니다 → union으로 보존.
         aux2 = list(dict.fromkeys((pass1_aux or []) + aux_expanded))
-        # pass1 생존 이슈(canonical + alias)와 유사한 phrase는 재발굴하지 않는다.
-        survived = []
-        for t in pass1_top:
-            survived.append(t["keyword"])
-            survived.extend(t.get("related_keywords") or [])
-        phrases = cand.derive_phrase_candidates(news_signals, survived)
-        phrases = list(dict.fromkeys(phrases + _google_related_terms(google_cands)))
+        related_terms = _google_related_terms(google_cands)
+
         # 홈 seed Top20 확장분(pass1 Top10 대비 늘어난 후보)이 있는지도 새 후보로 본다.
         seed_sources2 = _seed_sources_from(home_fulls, google_cands, HOME_PASS2_TOP)
         seed_sources1 = _seed_sources_from(home_fulls, google_cands, HOME_PASS1_TOP)
@@ -325,20 +362,57 @@ def _backfill_pass(
             len(seed_sources2.get(f, [])) > len(seed_sources1.get(f, []))
             for f in seed_sources2
         )
+
+        # --- (1) phrase 없이 pre-candidates 조립: seed Top20 + aux2 + related_terms.
+        #     related_terms는 pass1 후보 집합엔 없던 신규 키워드일 수 있어 여기서 seed의
+        #     aux(비독립 family)로 합류시켜 pre-signals 원천을 pass1 바깥까지 넓힌다.
+        aux2_pre = list(dict.fromkeys(aux2 + related_terms))
+        candidates2_pre = cand.collect_candidates(
+            seed_sources2, aux2_pre, limit=cand.BACKFILL_CANDIDATE_MAX,
+        )
+
+        # --- (2) pre-candidates로 pre-signals fetch(캐시 경유 — 대부분 pass1에서 이미 fetch됨).
+        news_signals2_pre = cand.build_news_signals(candidates2_pre, cached_search_news)
+
+        # --- (3) phrase 재추출: pass1 news_signals ∪ pre-signals 를 원천으로.
+        #     pass1 생존 이슈(canonical + alias)와 유사한 phrase는 재발굴하지 않는다.
+        survived = []
+        for t in pass1_top:
+            survived.append(t["keyword"])
+            survived.extend(t.get("related_keywords") or [])
+        phrase_source_signals = dict(news_signals or {})
+        phrase_source_signals.update(news_signals2_pre or {})
+        phrase_source_article_count = sum(
+            len(sig.get("articles") or []) for sig in phrase_source_signals.values()
+        )
+        phrases = cand.derive_phrase_candidates(phrase_source_signals, survived)
+        # related_terms는 phrase 후보로도 직접 합류(기존 동작 유지).
+        phrases = list(dict.fromkeys(phrases + related_terms))
+        logger.info(
+            "[news] pass2 phrase: source_articles=%d raw_candidates=%d",
+            phrase_source_article_count, len(phrases),
+        )
+
         if not aux_expanded and not phrases and not home_expanded:
             logger.info("[news] pass2: 신규 후보 없음 → pass1 결과 유지")
             return None, None
 
+        # --- (4) 최종 candidates2 조립: seed Top20 + aux2 + phrase.
+        #     phrase_reserve: seed가 상한(BACKFILL_CANDIDATE_MAX)을 가득 채워도 순수 phrase
+        #     후보가 통째로 잘리지 않도록 최소 예약분을 둔다(Codex diff 리뷰 P1). 4안의
+        #     phrase 원천 확장 효과가 seed 포화 상황에서 무력화되는 것을 막는다.
         candidates2 = cand.collect_candidates(
             seed_sources2, aux2,
             phrase_keywords=phrases, limit=cand.BACKFILL_CANDIDATE_MAX,
+            phrase_reserve=cand.PHRASE_RESERVE_BACKFILL,
         )
-        # 다양성 guard 재적용
+        # 다양성 guard 재적용(최종 candidates2 기준 — pre가 아니라 최종에서 판정).
         families = cand.count_source_families(candidates2)
         if families < cand.MIN_SOURCE_FAMILIES:
             logger.warning("[news] pass2: source_diversity_failed(%d) → pass1 결과 유지", families)
             return None, None
 
+        # --- (5) 최종 news_signals2 fetch(신규 phrase 키워드는 캐시 미스 시 여기서 검색 호출).
         news_signals2 = cand.build_news_signals(candidates2, cached_search_news)
         if not news_signals2:
             return None, None
@@ -348,6 +422,20 @@ def _backfill_pass(
             "google": google_signals,
         }
         top2 = _rank_and_select(candidates2, signals2, "pass2(backfill)")
+        # phrase 후보가 최종 Top에 몇 개 생존했는지(diversity 관찰용) — canonical sources에
+        # naver_news_phrase 키가 있는 항목 수.
+        # 한계(Codex diff 리뷰 P2, 관측 로그 전용이라 기록만): phrase 후보가 non-phrase
+        # canonical에 same-issue merge로 흡수되면 canonical의 sources만 실려(§7-3)
+        # related_keywords로만 남으므로 이 카운트에서 빠진다 → 실제 phrase 기여의 하한이다.
+        # ranking 결과에는 영향 없고, 과소집계는 "phrase 효과를 낮게 보는" 안전한 방향이라
+        # 관측 목적(원천 확장이 실제로 독립 그룹을 늘리는가)에는 하한만으로도 충분하다.
+        phrase_final_survivors = sum(
+            1 for t in top2 if (t.get("sources") or {}).get("naver_news_phrase")
+        )
+        logger.info(
+            "[news] pass2 phrase: selected=%d final_survivors=%d",
+            len(phrases), phrase_final_survivors,
+        )
         improved = len(top2) > len(pass1_top) or (
             len(top2) == len(pass1_top)
             and _count_recent_keywords(top2) > _count_recent_keywords(pass1_top)

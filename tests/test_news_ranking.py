@@ -2224,6 +2224,94 @@ class TestPhraseCandidates(unittest.TestCase):
         self.assertLessEqual(len(phrases), 3)
 
 
+class TestPhraseSourceExpansion(unittest.TestCase):
+    """phrase 원천 확장(2026-07): pass1 news_signals ∪ pass2 pre-signals 를 원천으로
+    쓰면 pass1 후보 집합 "바깥"(aux2/related_terms 전용 키워드) 기사에서도 phrase가
+    발굴되는지 검증. main._backfill_pass가 두 signals dict를 병합해 넘기는 동작을
+    derive_phrase_candidates 단위로 확인한다(Codex 계획 리뷰 P0/P1 반영)."""
+
+    def test_phrase_from_pass2_only_signal_not_in_pass1(self):
+        # pass1 signals에는 없는 키워드(예: related_terms로 새로 fetch된 "정근우")의
+        # 기사에서만 나오는 n-gram이 phrase 후보가 되어야 한다.
+        pass1_signals = {
+            "손흥민": _phrase_news_signal("손흥민", [
+                _phrase_article("손흥민 부상 소식 전해져", "https://n.com/s1"),
+                _phrase_article("손흥민 부상 회복 중", "https://n.com/s2"),
+            ]),
+        }
+        pass2_pre_signals = {
+            "정근우": _phrase_news_signal("정근우", [
+                _phrase_article("정근우 은퇴식 개최 확정", "https://n.com/p1"),
+                _phrase_article("정근우 은퇴식 팬들 참석", "https://n.com/p2"),
+            ]),
+        }
+        # main._backfill_pass와 동일하게 pass1을 base로 pre로 갱신해 병합.
+        merged_signals = dict(pass1_signals)
+        merged_signals.update(pass2_pre_signals)
+
+        # pass1 단독으로는 "정근우 은퇴식" phrase가 나올 수 없다(원천에 없음).
+        pass1_only = cand.derive_phrase_candidates(pass1_signals, existing_keywords=[])
+        self.assertFalse(any("정근우" in p for p in pass1_only))
+
+        # 병합 원천에서는 pass2-only 키워드 기사의 phrase가 발굴돼야 한다.
+        merged_phrases = cand.derive_phrase_candidates(merged_signals, existing_keywords=[])
+        self.assertTrue(any("정근우" in p and "은퇴식" in p for p in merged_phrases))
+
+    def test_pass2_only_phrase_still_respects_existing_keyword_dedupe(self):
+        # pass2-only 원천에서 나온 phrase라도 pass1 생존 이슈와 유사하면 재발굴 배제.
+        pass2_pre_signals = {
+            "정근우": _phrase_news_signal("정근우", [
+                _phrase_article("정근우 은퇴식 개최 확정", "https://n.com/p1"),
+                _phrase_article("정근우 은퇴식 팬들 참석", "https://n.com/p2"),
+            ]),
+        }
+        phrases = cand.derive_phrase_candidates(
+            pass2_pre_signals, existing_keywords=["정근우 은퇴식"]
+        )
+        self.assertEqual(phrases, [])
+
+    def test_pass2_only_incidental_source_still_filtered(self):
+        # pass2-only 원천이어도 incidental 기사는 phrase 원천에서 제외(방어 유지).
+        pass2_pre_signals = {
+            "정근우": _phrase_news_signal("정근우", [
+                _phrase_article("정근우 은퇴 기념 굿즈 증정 이벤트", "https://n.com/p1",
+                                relevance_reason="incidental_giveaway_mention"),
+                _phrase_article("정근우 은퇴 기념 굿즈 증정 공지", "https://n.com/p2",
+                                relevance_reason="incidental_giveaway_mention"),
+            ]),
+        }
+        phrases = cand.derive_phrase_candidates(pass2_pre_signals, existing_keywords=[])
+        self.assertEqual(phrases, [])
+
+
+class TestSourceFamilyDistributionLogging(unittest.TestCase):
+    """source family diversity 관찰 로깅(2026-07) — 순수 집계, ranking 영향 없음."""
+
+    def test_distribution_counts_all_families_including_derived(self):
+        items = [
+            {"keyword": "a", "sources": {"daum_home": 1, "nate_home": 2}},
+            {"keyword": "b", "sources": {"naver_news_phrase": True}},
+            {"keyword": "c", "sources": {"naver_news_aux": True, "bing_home": 3}},
+        ]
+        dist = cand.source_family_distribution(items)
+        self.assertEqual(dist["daum_home"], 1)
+        self.assertEqual(dist["nate_home"], 1)
+        self.assertEqual(dist["bing_home"], 1)
+        self.assertEqual(dist["naver_news_phrase"], 1)
+        self.assertEqual(dist["naver_news_aux"], 1)
+
+    def test_distribution_empty_input(self):
+        self.assertEqual(cand.source_family_distribution([]), {})
+        self.assertEqual(cand.source_family_distribution(None), {})
+
+    def test_distribution_is_pure_no_mutation(self):
+        # 집계 함수가 입력 items를 변형하지 않아야 한다(순수 관찰).
+        items = [{"keyword": "a", "sources": {"daum_home": 1}}]
+        snapshot = [dict(it) for it in items]
+        cand.source_family_distribution(items)
+        self.assertEqual(items, snapshot)
+
+
 class TestPhraseStrictRelevance(unittest.TestCase):
     """phrase 후보 전용 require_all_tokens strict relevance(Codex 계획 리뷰 P1/P2)."""
 
@@ -2268,6 +2356,49 @@ class TestPhraseCandidateDiversitySource(unittest.TestCase):
         kws = [c["keyword"] for c in result]
         self.assertIn("신규 이슈 phrase", kws)
         self.assertEqual(result[0]["sources"].get("naver_news_phrase"), True)
+
+    def test_phrase_reserve_protects_phrase_from_truncation(self):
+        # seed가 limit을 가득 채워도 phrase_reserve만큼 순수 phrase 후보가 보존돼야 한다
+        # (Codex diff 리뷰 P1). rank 있는 seed는 정렬상 앞이라 reserve 없으면 phrase가 잘림.
+        seed = {"daum_home": [{"keyword": f"seed{i}", "rank": i + 1} for i in range(10)]}
+        phrases = [f"이슈 phrase {i}" for i in range(5)]
+        # limit=10이면 seed 10개가 가득 채워 phrase는 전부 잘린다(reserve=0).
+        no_reserve = cand.collect_candidates(seed, [], phrase_keywords=phrases, limit=10)
+        phrase_kept_0 = [c for c in no_reserve if c["sources"] == {"naver_news_phrase": True}]
+        self.assertEqual(len(phrase_kept_0), 0)
+        # reserve=3이면 phrase 3개는 보존되고 전체 개수는 limit(10) 유지.
+        with_reserve = cand.collect_candidates(
+            seed, [], phrase_keywords=phrases, limit=10, phrase_reserve=3
+        )
+        phrase_kept_3 = [c for c in with_reserve if c["sources"] == {"naver_news_phrase": True}]
+        self.assertEqual(len(phrase_kept_3), 3)
+        self.assertEqual(len(with_reserve), 10)
+
+    def test_phrase_reserve_noop_when_under_limit(self):
+        # 후보 총수가 limit 이하면 reserve와 무관하게 전부 보존(기존 동작 불변).
+        seed = {"daum_home": [{"keyword": "seed1", "rank": 1}]}
+        result = cand.collect_candidates(
+            seed, [], phrase_keywords=["phrase A"], limit=30, phrase_reserve=10
+        )
+        self.assertEqual(len(result), 2)
+
+    def test_phrase_reserve_larger_than_limit_clamped(self):
+        # phrase_reserve > limit이어도 전체 상한(limit)을 초과하지 않아야 한다(Codex P3 clamp).
+        seed = {"daum_home": [{"keyword": f"seed{i}", "rank": i + 1} for i in range(10)]}
+        phrases = [f"이슈 phrase {i}" for i in range(8)]
+        result = cand.collect_candidates(
+            seed, [], phrase_keywords=phrases, limit=5, phrase_reserve=99
+        )
+        self.assertEqual(len(result), 5)
+
+    def test_phrase_reserve_zero_matches_legacy_slice(self):
+        # phrase_reserve 기본값 0은 정렬 후 단순 [:limit]과 완전히 동일해야 한다(회귀 방지).
+        seed = {"daum_home": [{"keyword": f"seed{i}", "rank": i + 1} for i in range(10)]}
+        phrases = [f"이슈 phrase {i}" for i in range(5)]
+        legacy = cand.collect_candidates(seed, [], phrase_keywords=phrases, limit=8)
+        self.assertEqual(len(legacy), 8)
+        # seed(rank 있음)가 앞쪽을 채우므로 8개 전부 seed여야 한다.
+        self.assertTrue(all("naver_news_phrase" not in c["sources"] for c in legacy))
 
 
 class TestBackfillPassSelection(unittest.TestCase):
@@ -2329,6 +2460,49 @@ class TestBackfillPassSelection(unittest.TestCase):
         ranked = ranker.compute_scores(cands, signals)
         merged = ranker.dedupe_and_merge(ranked)
         self.assertEqual(len(merged), 1)
+
+
+class TestRankAndSelectDiversityLogging(unittest.TestCase):
+    """main._rank_and_select의 source family diversity 로깅이 결과에 영향 없는지(2026-07).
+
+    로깅은 함수 말미에 순수 관찰용으로 추가됐다. top 반환값이 로깅과 무관하게 결정적이고,
+    로깅 경로(_log_source_family_diversity)가 예외 없이 완주하는지 통합 경로로 검증한다."""
+
+    def _cands(self):
+        return [
+            {"keyword": "금리 인상", "sources": {"daum_home": 1}},
+            {"keyword": "반도체 수출", "sources": {"nate_home": 1, "naver_news_phrase": True}},
+        ]
+
+    def _signals(self):
+        # display_articles >= DISPLAY_ARTICLES_MIN(2)를 만족하도록 각 키워드에 기사 2건씩.
+        return {
+            "news": {
+                "금리 인상": _news(3, 1, 2, 0.9, articles=[
+                    _article("금리 인상 전망 확산", "https://x.com/a1"),
+                    _article("금리 인상 폭 관심 집중", "https://x.com/a2"),
+                ]),
+                "반도체 수출": _news(3, 1, 2, 0.9, articles=[
+                    _article("반도체 수출 증가 발표", "https://x.com/b1"),
+                    _article("반도체 수출 호조 지속", "https://x.com/b2"),
+                ]),
+            },
+            "datalab": {}, "google": {},
+        }
+
+    def test_rank_and_select_returns_top_and_logging_has_no_side_effect(self):
+        cands, signals = self._cands(), self._signals()
+        top = main_module._rank_and_select(cands, signals, "test")
+        kws = [t["keyword"] for t in top]
+        self.assertIn("금리 인상", kws)
+        self.assertIn("반도체 수출", kws)
+        # 같은 입력으로 두 번 호출해도 결과가 결정적(로깅이 상태를 안 바꿈).
+        top2 = main_module._rank_and_select(self._cands(), self._signals(), "test")
+        self.assertEqual([t["keyword"] for t in top], [t["keyword"] for t in top2])
+
+    def test_log_helper_runs_without_error_on_empty_stages(self):
+        # 각 단계가 비어 있어도 로깅 헬퍼가 예외 없이 완주해야 한다(방어).
+        main_module._log_source_family_diversity("test", [], [], [], [], [])
 
 
 class TestBackfillPassIntegration(unittest.TestCase):

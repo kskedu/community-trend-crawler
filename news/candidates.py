@@ -33,10 +33,18 @@ MIN_SOURCE_FAMILIES = 2   # 독립 홈/트렌드 source family 최소 종수(다
 BACKFILL_CANDIDATE_MAX = 45   # pass2 병합 pool 상한(daum10+danawa10+aux12+phrase10 수용)
 AUX_SEED_TOP_BACKFILL = 10    # pass2 aux 확장: daum 전체(Top10)에서 보조후보 추출
 AUX_MAX_BACKFILL = 12
-PHRASE_MAX = 10               # phrase 후보 상한(신규 API fetch 증가 억제)
+PHRASE_MAX = 20               # phrase 후보 상한(2026-07 상향 10→20: pass2 원천 확장 대응.
+                              # Codex 계획 리뷰 권고로 보수적 상향 — 원천이 pass1 signals ∪
+                              # pass2 pre-signals로 넓어져 유효 phrase 후보가 더 많이 뽑히므로
+                              # 상한을 20으로 올려 그 확장분을 담는다. 신규 phrase 키워드는
+                              # 기존과 동일하게 cached_search_news 경유 fetch라 캐시 미스 시에만
+                              # 검색 호출이 늘 수 있다(기존 phrase 메커니즘과 동일 리스크 유형).
 PHRASE_NGRAM_MIN = 2
 PHRASE_NGRAM_MAX = 4
 PHRASE_MIN_DF = 2             # phrase가 서로 다른 기사 몇 건에 등장해야 후보로 인정하는가
+PHRASE_RESERVE_BACKFILL = 10  # pass2 최종 candidates2에서 순수 phrase 후보 truncation 보호
+                              # 예약분(Codex diff 리뷰 P1). seed가 상한을 가득 채워도 최소
+                              # 이만큼의 phrase는 보존해 4안 원천 확장 효과를 유지한다.
 
 # incidental mention(부수적 언급) 판정 문맥 마커 — 경품/판촉/부가 물품 문맥.
 # "제공"/"지급"처럼 일반 기사에도 흔한 단어는 keyword 근접(proximity) 조건과
@@ -722,6 +730,7 @@ def collect_candidates(
     aux_keywords: List[str],
     phrase_keywords: Optional[List[str]] = None,
     limit: int = CANDIDATE_MAX,
+    phrase_reserve: int = 0,
 ) -> List[dict]:
     """홈/트렌드 seed + 보조후보를 병합/dedup → [{keyword, sources:{...}}] (상한 적용).
 
@@ -729,6 +738,15 @@ def collect_candidates(
       (google_trends/daum_home/nate_home/bing_home 등). aux/phrase는 naver_news_* 로 표기.
     phrase_keywords: backfill pass 전용 phrase 후보(derive_phrase_candidates 결과).
     strict pass(pass1) 호출부는 phrase_keywords를 생략하면 기존과 동일하게 동작한다.
+
+    phrase_reserve: phrase 후보(naver_news_phrase 전용, seed/aux와 겹치지 않는 순수 phrase)
+      중 truncation 상한과 무관하게 최소 이만큼은 보존한다(2026-07, Codex diff 리뷰 P1).
+      기본값 0이면 기존 동작(정렬 후 단순 [:limit])과 완전히 동일하다. rank 없는 phrase 후보는
+      _best_family_rank=9999로 정렬상 맨 뒤에 밀려, seed가 limit을 가득 채우면 phrase가 통째로
+      잘려 4안(phrase 원천 확장)이 무력화될 수 있다. 이를 막기 위해 상한 초과 시 rank 있는 seed
+      쪽에서 limit-phrase_reserve 개를 채우고, 남은 자리에 순수 phrase 후보를 우선 채운다.
+      다양성 guard/consensus는 여전히 독립 family만 세므로(phrase는 비독립) 이 보존이 guard를
+      우회시키지 않는다.
     """
     pool: Dict[str, dict] = {}
     for family, ranked in (seed_sources or {}).items():
@@ -746,7 +764,43 @@ def collect_candidates(
     # 상위 후보가 고르게 생존하도록 한다. 동률이면 family priority → keyword로 안정 정렬.
     # 이 정렬은 어디까지나 truncation 방지용이고, 최종 순위는 ranker가 다시 계산한다.
     candidates.sort(key=lambda c: (_best_family_rank(c), _best_family_priority(c), c["keyword"]))
-    return candidates[:limit]
+
+    if len(candidates) <= limit:
+        return candidates
+
+    # phrase_reserve가 limit을 넘으면 상한 초과가 될 수 있어 clamp(함수 계약 "전체 limit
+    # 유지" 방어, Codex diff 리뷰 P3). 현재 호출(10<45)에선 무해하지만 계약상 보장한다.
+    phrase_reserve = min(phrase_reserve, limit)
+    if phrase_reserve <= 0:
+        return candidates[:limit]
+
+    # phrase truncation 보호: 순수 phrase 후보(sources가 naver_news_phrase 뿐 — seed/aux와
+    # 겹치지 않아 정렬상 뒤로 밀려 잘리는 후보)를 최대 phrase_reserve개 우선 보존한다.
+    def _is_pure_phrase(c: dict) -> bool:
+        srcs = set((c.get("sources") or {}).keys())
+        return srcs == {"naver_news_phrase"}
+
+    head = candidates[:limit]
+    tail = candidates[limit:]
+    head_phrase = sum(1 for c in head if _is_pure_phrase(c))
+    need = phrase_reserve - head_phrase
+    if need <= 0:
+        return head  # 이미 상한 안에 충분한 phrase가 들어옴
+
+    tail_phrases = [c for c in tail if _is_pure_phrase(c)][:need]
+    if not tail_phrases:
+        return head
+    # 상한을 유지하기 위해, head의 non-phrase 후보를 뒤에서부터 tail_phrases 수만큼 덜어낸다
+    # (rank가 낮은 seed부터 빠지도록 — head는 이미 rank 오름차순 정렬).
+    keep = []
+    drop_budget = len(tail_phrases)
+    for c in reversed(head):
+        if drop_budget > 0 and not _is_pure_phrase(c):
+            drop_budget -= 1
+            continue
+        keep.append(c)
+    keep.reverse()
+    return keep + tail_phrases
 
 
 # 독립 홈/트렌드 source family — 다양성 guard / source consensus는 이 집합만 센다.
@@ -798,6 +852,24 @@ def count_source_families(candidates: List[dict]) -> int:
     for c in candidates:
         families |= set(c["sources"].keys()) & _INDEPENDENT_SEARCH_FAMILIES
     return len(families)
+
+
+def source_family_distribution(items: List[dict]) -> Dict[str, int]:
+    """items(candidate/ranked/merged 등 sources를 가진 항목) 전체에서 source family별
+    등장 항목 수 분포(다양성 관찰 로깅 전용, 2026-07).
+
+    - count_source_families()와 달리 독립 family(_INDEPENDENT_SEARCH_FAMILIES)뿐 아니라
+      naver_news_aux/naver_news_phrase까지 "등장한 모든 family"를 센다. 한 항목이 여러
+      family에 걸쳐 있으면 각 family에 1씩 가산한다(항목 수 합계 != len(items) 가능).
+    - ranking/merge/select 결과에 영향을 주지 않는 순수 집계 함수(로그 출력용).
+    - merge된 항목은 canonical의 sources를 그대로 실어 나르므로(dedupe_and_merge §7-3),
+      merge 후 단계에서도 원 후보의 family가 관측된다.
+    """
+    dist: Dict[str, int] = {}
+    for it in items or []:
+        for fam in (it.get("sources") or {}).keys():
+            dist[fam] = dist.get(fam, 0) + 1
+    return dist
 
 
 def derive_aux_keywords(
