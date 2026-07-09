@@ -143,11 +143,29 @@ sense-mixing 문제.
   P0/P1 전부 해소. gate/merge threshold/PR hard exclude/sense-mixing/generic 방어 불변.
 - 커밋: `fix: 짧은 일반 생활명사 단독 display를 기사 공통 수식어로 보강`.
 
-### 후속 과제 — broad category(업종/분야) generic singleton 방어 (미해결, 분리)
+### 후속 과제 — broad category(업종/분야) generic singleton 방어 (1차 탐지 착수, 2026-07-09)
+
+**상태: 1차 = logging first(탐지·로그만) 구현. hard exclude/강등은 후속 PR로 분리.**
 
 §0-4 hotfix는 "짧은 단일 생활명사 + 앞 영문/숫자 수식어 반복"만 다룬다. 이와 별개로,
 **순수 한글 업종/분야어("건설" 등)가 서로 다른 주체의 기사를 하나로 묶어 단독 display로
-노출되는 문제**가 관측됐다. 이번 안경 작업 범위에 섞지 않고 후속 과제로만 기록한다.
+노출되는 문제**가 관측됐다. 이번 안경 작업 범위에 섞지 않고 후속 과제로만 기록했다가,
+1차로 **탐지·관찰 로그만** 추가했다.
+
+- 1차 구현(news/ranker.py, main.py): `_BROAD_CATEGORY_WORDS` 상수 +
+  `detect_broad_category_singletons(items)` 신규. singleton(merge X)·단일 토큰·사전 포함·
+  `display_keyword==keyword`(§0-4 보강분 제외)인 후보를 잡아, 표시 기사(dedup→filter→
+  [:ARTICLES_MAX]) 기준 **subject dispersion(주체 분산)을 shadow로 계산**해
+  `logger.warning`으로만 남긴다(keyword/display/기사 수/주체 분포/shadow_dispersed).
+  `_rank_and_select`에서 final(top) 확정 뒤 호출 — **제외/강등/순위/저장 개수 전부 불변**.
+- 1차에서 제외/강등하지 않는 이유(Codex 계획 review-only P1): "title 첫 토큰 = 주체"
+  추출이 [속보]/인용/날짜/기관어 접두 등에 취약해 hard exclude 오탐 위험이 큼. 운영
+  1~2회 로그로 dispersion 판정이 실제로 "건설/게임"을 잡고 "태풍/금리"를 안 건드리는지
+  검증한 뒤, 제외/강등 기준을 후속 PR에서 확정한다(false positive가 false negative보다 위험).
+- 후속 PR(미착수): shadow dispersion 로그 검증 → 제외/강등 기준 확정, dominant phrase
+  fallback(고도화). 아래 원 문제 정의/개선 방향은 후속 PR 설계 근거로 보존한다.
+
+#### 원 문제 정의(보존)
 
 - 문제 사례(2026-07-09 운영 관찰):
   - display/canonical="건설", 상세 기사:
