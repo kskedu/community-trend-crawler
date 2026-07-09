@@ -726,6 +726,11 @@ def _token_article_coverage(articles: List[Dict]) -> Dict[str, float]:
 # display 공통토큰으로 인정할 최소 기사 분포율(그룹 기사 절반 이상에 등장).
 DISPLAY_TOKEN_MIN_COVERAGE = 0.5
 
+# 짧은 일반 생활명사 단독(singleton) display 보강 대상의 최대 글자 수(2026-07 운영
+# 관찰: "안경" 단독 display가 실제 기사에서는 "AI 안경"으로 반복됨). length는 1차 후보
+# 축소용일 뿐이고 실제 보강 여부는 prev-token modifier 반복률(coverage)이 결정한다.
+SHORT_GENERIC_SINGLETON_MAX_LEN = 3
+
 # display_keyword 전용 일반 서술어 블랙리스트 — 사용자에게 의미 없는 수식어가 대표
 # 표시명이 되는 것을 막는다(운영 회귀 hotfix 2026-07-03: "홍석기 치안감" 그룹에서
 # "신임"이 대표로 노출됨). _GENERIC_EVENT_PREDICATE_WORDS와 분리하는 이유: 후자는
@@ -1119,6 +1124,119 @@ def dedupe_and_merge(ranked: List[Dict]) -> List[Dict]:
 # 안 일어난 단독 keyword도 검색의도 suffix + 표시 기사와의 의미 불일치 문제를 그대로
 # 가질 수 있어, dedupe_and_merge() 이후 별도 함수로 좁게 보정한다(merge group 로직
 # 자체는 건드리지 않음 — Codex review-only: singleton 전용 좁은 예외로 제한).
+def _boost_short_generic_singleton_display(item: Dict, kw: str) -> Dict:
+    """짧은 일반 생활명사 단독(singleton) keyword의 display를 표시 기사에서 keyword
+    바로 앞에 반복 등장하는 영문/숫자 modifier로 보강한다(2026-07 운영 관찰: "안경"
+    단독 display가 기사에서는 "AI 안경"으로 반복). 보강 대상이 아니면 item 원형 반환.
+
+    canonical keyword(movement 비교 기준)는 건드리지 않고 display_keyword만 바꾼다.
+    검색의도 suffix 경로(_resolve_singleton_display)에서 suffix가 아닌 keyword에만
+    호출된다. 아래를 모두 만족할 때만 보강한다:
+    1. keyword가 단일 토큰이고 글자 수 <= SHORT_GENERIC_SINGLETON_MAX_LEN(짧음).
+    2. keyword가 generic-only(신임/수사 등)가 아님 — 그건 exclude_generic_singletons가
+       별도 처리하므로 여기서 중복 개입하지 않는다.
+    3. keyword 토큰이 표시 기사 절반 이상(coverage>=DISPLAY_TOKEN_MIN_COVERAGE)에 등장.
+    4. keyword 토큰 "바로 앞 위치"에 오는 modifier가, keyword 등장 기사 중 절반 이상에서
+       동일하게 반복(prev-token 반복률). "태풍 북상"류 뒤 서술어는 안 잡히고, "AI 안경"
+       처럼 앞 수식어만 잡힌다. tie는 대표 기사 title 등장 순서로 고정.
+    5. modifier에 [A-Za-z0-9]가 최소 1개 포함(사용자 확정): "제주 태풍"/"은행 금리"
+       같은 순수 한글 문맥어 과구체화를 이번 범위에서 차단. modifier가 generic-only/
+       검색의도 suffix거나 keyword를 문자로 포함(중복형 "오픈AI AI")하면 제외.
+
+    보강 결과는 "{modifier} {keyword}" 한 조합뿐이다(뒤 사건어 "체험/몰카"는 붙이지
+    않음 — 혼합 cluster 과구체화 방지). 18자 초과면 원형 유지(토큰 중간 절단 방지).
+
+    prev-token은 실제 화면에 노출되는 표시 기사(dedup → filter_articles_for_display →
+    [:ARTICLES_MAX], builder/invariant와 동일 집합) 기준으로 집계한다(Codex diff P1:
+    news_meta.articles 원본을 쓰면 중복/미표시 기사가 majority를 왜곡할 수 있음).
+    """
+    from news.summarizer import _tokens
+    from news.dedup import dedup_articles
+    from news.candidates import filter_articles_for_display
+    from news.builder import ARTICLES_MIN, ARTICLES_MAX
+
+    kw = (kw or "").strip()
+    kw_toks = _tokens(kw)
+    # 1. 단일 토큰 + 짧은 keyword만 대상.
+    if len(kw_toks) != 1 or len(kw) > SHORT_GENERIC_SINGLETON_MAX_LEN:
+        return item
+    kw_tok = kw_toks[0]
+    # 2. generic-only는 별도 방어(exclude_generic_singletons)가 처리 — 개입 안 함.
+    if _is_generic_only_display(kw):
+        return item
+
+    news_meta = item.get("news_meta") or {}
+    displayed = filter_articles_for_display(
+        dedup_articles(news_meta.get("articles") or []), min_count=ARTICLES_MIN
+    )[:ARTICLES_MAX]
+    articles = displayed
+    # 기사별 title 토큰열(순서 유지) — prev-token 위치 판정에 순서가 필요하다.
+    title_token_lists = [_tokens(a.get("title", "") or "") for a in articles]
+    kw_article_toks = [toks for toks in title_token_lists if kw_tok in toks]
+    # 3. keyword가 표시 기사 절반 이상에 등장해야 근거가 된다.
+    if not articles or (len(kw_article_toks) / len(articles)) < DISPLAY_TOKEN_MIN_COVERAGE:
+        return item
+
+    # 4. keyword 토큰 바로 앞(prev) modifier를 기사 단위로 집계한다(발생 횟수가 아니라
+    #    기사 hit 수 — 한 기사가 modifier 하나에 최대 1표). 한 기사에 keyword가 여러 번
+    #    나와도 title 첫 등장의 prev만 본다(의도적 단순화, Codex diff P2): title은 짧아
+    #    핵심 표기가 앞에 오는 게 일반적이고, 첫 등장 prev가 대표 수식어일 확률이 높다.
+    #    "안경 시장, AI 안경 공개"처럼 첫 등장에 수식어가 없으면 근거 부족으로 보강하지
+    #    않는(보수적) 방향이라 오보강보다 안전하다.
+    prev_hits: Dict[str, int] = {}
+    prev_order: Dict[str, int] = {}
+    order_seq = 0
+    for toks in kw_article_toks:
+        idx = toks.index(kw_tok)
+        if idx == 0:
+            continue  # 맨 앞 → 앞 수식어 없음.
+        prev = toks[idx - 1]
+        prev_hits[prev] = prev_hits.get(prev, 0) + 1
+        if prev not in prev_order:
+            prev_order[prev] = order_seq
+            order_seq += 1
+
+    if not prev_hits:
+        return item
+
+    threshold = len(kw_article_toks) * DISPLAY_TOKEN_MIN_COVERAGE
+
+    def _modifier_ok(mod: str) -> bool:
+        # 5. 영문/숫자 포함 필수 + generic/suffix/중복형 제외.
+        if not any(ch.isascii() and ch.isalnum() for ch in mod):
+            return False
+        if _is_generic_only_display(mod) or _ends_with_search_intent_suffix(mod):
+            return False
+        # "오픈AI"+"AI" 같은 중복형 차단. 영문 case 무시(Codex diff P3: "Openai AI"류).
+        if kw_tok.casefold() in mod.casefold():
+            return False
+        return True
+
+    # modifier 채택 조건: (1) 반복률 threshold(keyword 등장 기사의 절반 이상)와 함께
+    # (2) 절대 hit 수 >= DISPLAY_ARTICLES_MIN(Codex diff 재리뷰 P1). 절대 근거가 얕으면
+    # 보강 후 exclude_insufficient_display_articles(display_articles<2 drop)에 걸려 원래
+    # "안경"이면 살아남았을 후보가 탈락해 Top10 개수를 깎을 수 있다. modifier가 표시
+    # 기사 최소 DISPLAY_ARTICLES_MIN건에 등장하면 보강된 "{modifier} {keyword}"도 그만큼의
+    # 표시 기사에 정합해 drop되지 않는다.
+    min_support = max(threshold, DISPLAY_ARTICLES_MIN)
+    # 반복률(기사 hit 수) 내림차순, tie는 대표 title 등장 순서(prev_order) 오름차순.
+    candidates = sorted(
+        (m for m, h in prev_hits.items() if h >= min_support and _modifier_ok(m)),
+        key=lambda m: (-prev_hits[m], prev_order[m]),
+    )
+    if not candidates:
+        return item
+    modifier = candidates[0]
+
+    boosted = f"{modifier} {kw}"
+    if len(boosted) > DISPLAY_KEYWORD_MAX_LEN:
+        return item  # 상한 초과 → 원형 유지(토큰 중간 절단 방지).
+
+    item = dict(item)
+    item["display_keyword"] = boosted
+    return item
+
+
 def _resolve_singleton_display(item: Dict) -> Dict:
     """단독(merge 안 된) item의 display_keyword를 sense-mixing 관점에서 재검토한다.
 
@@ -1139,7 +1257,9 @@ def _resolve_singleton_display(item: Dict) -> Dict:
         item = dict(item)
         item["display_keyword"] = kw
     if not _ends_with_search_intent_suffix(kw):
-        return item
+        # 검색의도 suffix가 아니면 "짧은 일반 생활명사 단독" 보강 경로를 시도한다
+        # (2026-07: "안경" 단독 → "AI 안경"). 대상이 아니면 원형 그대로 반환.
+        return _boost_short_generic_singleton_display(item, kw)
 
     # suffix 어절(마지막 공백 구분 단어)을 제외한 나머지 문자열을 토큰화한다.
     # summarizer._tokens는 1글자 토큰("뜻")을 만들지 않으므로 kw 전체를 토큰화한
