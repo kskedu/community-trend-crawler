@@ -124,6 +124,54 @@ sense-mixing 문제.
 - 이상 징후가 지속되면 issue #2의 "근본 해결 방향" 섹션에 관찰 내용을 추가하고, 코드 수정이
   필요한지는 별도 계획으로 판단한다. 지금은 코드 수정 없이 운영 모니터링만 진행한다.
 
+## 0-4. 후속 개선 4차 — 짧은 일반 생활명사 단독 display 보강 (완료, 2026-07-09)
+
+§0-3 운영 반영 이후 실제 화면에서 확인된 잔여 이슈: rank 8에 display/canonical="안경"
+단독이 노출됐는데, 실제 표시 기사는 "AI 안경 체험"/"AI 안경 시스템"처럼 더 구체적인 phrase로
+반복됐다. singleton display 재구성(`_resolve_singleton_display`)이 검색의도 suffix(뜻/의미/
+누구) 케이스만 다뤄, "안경" 같은 짧은 일반 생활명사 단독은 보강 사각지대였다.
+
+- 처리: `_boost_short_generic_singleton_display` 신규(news/ranker.py). singleton keyword가
+  단일 토큰·3자 이하·non-generic이고, 표시 기사(dedup→filter_articles_for_display→
+  [:ARTICLES_MAX]) title에서 keyword 바로 앞에 오는 **영문/숫자 포함 modifier**가 keyword
+  등장 기사 절반 이상 **AND 최소 DISPLAY_ARTICLES_MIN(2)건**에서 반복되면 display를
+  "{modifier} {keyword}"로 보강한다("안경"→"AI 안경").
+- 방어: canonical keyword 불변(display_keyword만 변경), 뒤 사건어 미부착("AI 안경"까지만),
+  순수 한글 문맥어("제주 태풍"/"은행 금리") 제외, 중복형("오픈AI AI", casefold) 차단,
+  18자 초과 원형 유지, 절대 근거 부족 시 미보강(Top10 개수 감소 방지). 기존 suffix 경로 보존.
+- 검증: 전체 316개 테스트 통과(신규 23개). Codex 계획 리뷰 3라운드 + diff 리뷰 3라운드에서
+  P0/P1 전부 해소. gate/merge threshold/PR hard exclude/sense-mixing/generic 방어 불변.
+- 커밋: `fix: 짧은 일반 생활명사 단독 display를 기사 공통 수식어로 보강`.
+
+### 후속 과제 — broad category(업종/분야) generic singleton 방어 (미해결, 분리)
+
+§0-4 hotfix는 "짧은 단일 생활명사 + 앞 영문/숫자 수식어 반복"만 다룬다. 이와 별개로,
+**순수 한글 업종/분야어("건설" 등)가 서로 다른 주체의 기사를 하나로 묶어 단독 display로
+노출되는 문제**가 관측됐다. 이번 안경 작업 범위에 섞지 않고 후속 과제로만 기록한다.
+
+- 문제 사례(2026-07-09 운영 관찰):
+  - display/canonical="건설", 상세 기사:
+    - "현대건설, 건설안전 스타트업 12개사와 협업 성과 공유"
+    - "대우건설, 이라크 국가전략사업서 빛난 대우건설, 가덕도로 이어진다"
+  - 두 기사의 공통점은 "건설"뿐 — 동일 이슈가 아니라 서로 다른 건설사의 별개 사건 묶음.
+- 현재 상태: "건설"은 §0-4 대상 아님(순수 한글이라 영문/숫자 modifier 없음 → 보강 안 됨),
+  `_DISPLAY_GENERIC_WORDS`/`exclude_generic_singletons`에도 없어(행위·인사 서술어 위주)
+  final에 그대로 노출될 수 있다.
+- 후속 개선 방향(설계 단계, 이번 미구현):
+  1. 업종/분야 generic singleton 방어 검토.
+  2. "건설/금융/은행/병원/기업/산업/사업/정책/시장/기술" 같은 넓은 분야어가 단독 display로
+     final에 들어오면 감점 또는 제외.
+  3. 단, "태풍"/"주담대"/"하이닉스 주가"처럼 단독·조합으로 명확한 이슈는 유지(오탐 방지 우선).
+  4. 기사들이 동일 회사/동일 사건/동일 phrase로 묶이지 않으면 broad category singleton으로
+     보고 제외.
+  5. 더 구체적인 dominant phrase가 있으면 display fallback(건설 → "현대건설 안전기술" /
+     "대우건설 이라크 사업").
+  6. dominant phrase도 없고 서로 다른 기사면 final에서 제외.
+- 제약(설계 단계부터 고정): gate/merge threshold 완화 금지, filler로 10개 채우기 금지,
+  "태풍/주담대"류 정상 단독어 오제외 금지(false positive가 false negative보다 위험).
+  broad 분야어를 고정 사전으로 관리할지, 기사 주체 분산도(서로 다른 회사명 비율) 같은
+  데이터 기반 신호로 판정할지는 계획 단계에서 별도 결정한다.
+
 ## 1. 배경
 
 통합 랭킹(News/DataLab/Google/Daum 신호 합성) 적용 후에도 화면 품질 이슈가 남아 있다.

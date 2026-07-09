@@ -3547,5 +3547,216 @@ class TestSenseMixingDisplay(unittest.TestCase):
         self.assertTrue(ranker._ends_with_search_intent_suffix("아이유 프로필"))
 
 
+class TestShortGenericSingletonDisplayBoost(unittest.TestCase):
+    """짧은 일반 생활명사 단독(singleton) display 보강 — "안경" → "AI 안경".
+
+    표시 기사에서 keyword 바로 앞에 반복되는 영문/숫자 modifier가 있을 때만 보강한다.
+    canonical keyword는 불변, display_keyword만 바뀐다. 순수 한글 문맥어(제주/은행 등)와
+    뒤 서술어(북상/규제)는 이번 범위에서 보강하지 않는다(원형 유지).
+    """
+
+    @staticmethod
+    def _item(keyword, titles):
+        return {
+            "keyword": keyword,
+            "news_meta": {
+                "articles": [
+                    {"title": t, "url": f"https://x.com/{i}", "snippet": ""}
+                    for i, t in enumerate(titles)
+                ],
+                "representative_article": {"title": titles[0]} if titles else {},
+            },
+        }
+
+    def _display(self, keyword, titles):
+        resolved = ranker.resolve_singleton_displays([self._item(keyword, titles)])
+        return resolved[0]["display_keyword"]
+
+    def test_ai_glasses_boosted(self):
+        # "안경" 단독 + 기사 다수 "AI 안경 ..." → display "AI 안경"(단독 "안경"이면 실패).
+        display = self._display("안경", [
+            "AI 안경 체험존 오픈", "AI 안경 시스템 체험", "AI 안경 신제품 공개",
+        ])
+        self.assertEqual(display, "AI 안경")
+
+    def test_trailing_event_word_not_appended(self):
+        # 뒤 사건어("체험"/"몰카")는 붙지 않는다 — "AI 안경"까지만(과구체화 방지).
+        display = self._display("안경", [
+            "AI 안경 체험 인기", "AI 안경 몰카 수사", "AI 안경 시스템 공개",
+        ])
+        self.assertEqual(display, "AI 안경")
+
+    def test_canonical_keyword_unchanged(self):
+        # canonical keyword(movement 비교용)는 그대로 "안경" 유지, display만 보강.
+        item = self._item("안경", ["AI 안경 체험", "AI 안경 시스템", "AI 안경 공개"])
+        resolved = ranker.resolve_singleton_displays([item])
+        self.assertEqual(resolved[0]["keyword"], "안경")
+        self.assertEqual(resolved[0]["display_keyword"], "AI 안경")
+
+    def test_typhoon_trailing_predicate_not_boosted(self):
+        # "태풍 북상"/"태풍 전망"은 뒤 서술어라 prev-token에 안 잡힘 → 원형 유지.
+        display = self._display("태풍", [
+            "태풍 북상 제주 강풍", "태풍 전망 남부 영향", "태풍 경로 예측",
+        ])
+        self.assertEqual(display, "태풍")
+
+    def test_typhoon_korean_context_word_not_boosted(self):
+        # "제주 태풍"처럼 앞 한글 문맥어는 영문/숫자 없음 → 이번 범위 제외(원형 유지).
+        display = self._display("태풍", [
+            "제주 태풍 피해 속출", "제주 태풍 대비 비상", "제주 태풍 영향권",
+        ])
+        self.assertEqual(display, "태풍")
+
+    def test_interest_rate_korean_context_word_not_boosted(self):
+        # "은행 금리"도 순수 한글 문맥어 → 원형 유지.
+        display = self._display("금리", [
+            "은행 금리 인하 발표", "은행 금리 비교 서비스", "은행 금리 상승 전환",
+        ])
+        self.assertEqual(display, "금리")
+
+    def test_judamdae_alone_unchanged(self):
+        # "주담대 규제"/"주담대 금리"는 뒤 서술어 → 원형 유지.
+        display = self._display("주담대", [
+            "주담대 규제 강화", "주담대 금리 상승", "주담대 한도 축소",
+        ])
+        self.assertEqual(display, "주담대")
+
+    def test_modifier_must_repeat_across_majority(self):
+        # prev-token이 소수 기사에만 반복(일관성 없음) → 원형 유지.
+        display = self._display("안경", [
+            "AI 안경 체험", "삼성 안경 출시", "LG 안경 공개", "코오롱 안경 신제품",
+        ])
+        self.assertEqual(display, "안경")
+
+    def test_duplicate_form_modifier_rejected(self):
+        # 중복형("오픈AI" + "AI") 차단 — modifier가 keyword를 문자로 포함.
+        display = self._display("AI", [
+            "오픈AI AI 모델 공개", "오픈AI AI 전략 발표", "오픈AI AI 신기술",
+        ])
+        self.assertEqual(display, "AI")
+
+    def test_english_short_keyword_without_modifier_unchanged(self):
+        # keyword="AI" 앞에 반복 modifier가 없으면 원형 유지(영문 2자 오탐 방어).
+        display = self._display("AI", [
+            "AI 반도체 급등", "AI 스타트업 투자", "AI 규제 논의",
+        ])
+        self.assertEqual(display, "AI")
+
+    def test_multiword_keyword_not_target(self):
+        # 다어절 keyword는 이미 구체적 → 보강 대상 아님(원형 유지).
+        display = self._display("스마트 안경", [
+            "AI 스마트 안경 체험", "AI 스마트 안경 공개",
+        ])
+        self.assertEqual(display, "스마트 안경")
+
+    def test_generic_only_keyword_not_boosted(self):
+        # generic-only("수사")는 exclude_generic_singletons가 별도 처리 → 여기서 개입 안 함.
+        display = self._display("수사", [
+            "AI 수사 기법 도입", "AI 수사 시스템 확대", "AI 수사 협력",
+        ])
+        self.assertEqual(display, "수사")
+
+    def test_long_keyword_over_length_gate_not_target(self):
+        # SHORT_GENERIC_SINGLETON_MAX_LEN(3자) 초과 단일 토큰은 대상 아님.
+        display = self._display("헤르체고비나", [
+            "AI 헤르체고비나 협력", "AI 헤르체고비나 교류",
+        ])
+        self.assertEqual(display, "헤르체고비나")
+
+    def test_boosted_over_maxlen_keeps_original(self):
+        # "{modifier} {keyword}"가 18자 초과면 원형 유지(토큰 중간 절단 방지).
+        long_modifier = "SUPERLONGBRANDNAME2026"  # 22자 영문
+        display = self._display("이어폰", [
+            f"{long_modifier} 이어폰 출시", f"{long_modifier} 이어폰 공개",
+            f"{long_modifier} 이어폰 예약",
+        ])
+        self.assertEqual(display, "이어폰")
+
+    def test_keyword_at_title_start_no_prev_token(self):
+        # keyword가 title 맨 앞이라 앞 토큰이 없으면 보강 근거 없음 → 원형 유지.
+        display = self._display("안경", [
+            "안경 신제품 출시", "안경 브랜드 협업", "안경 시장 성장",
+        ])
+        self.assertEqual(display, "안경")
+
+    def test_keyword_low_coverage_not_boosted(self):
+        # keyword 토큰이 표시 기사 절반 미만에만 등장 → 보강 안 함.
+        display = self._display("안경", [
+            "AI 안경 체험", "무관한 사회 기사", "무관한 경제 기사", "무관한 스포츠 기사",
+        ])
+        self.assertEqual(display, "안경")
+
+    def test_merged_group_not_boosted(self):
+        # related_keywords 있는(merge된) item은 singleton 보강 대상 아님.
+        item = self._item("안경", ["AI 안경 체험", "AI 안경 공개"])
+        item["related_keywords"] = ["스마트 안경"]
+        item["display_keyword"] = "안경 스마트"
+        resolved = ranker.resolve_singleton_displays([item])
+        self.assertEqual(resolved[0]["display_keyword"], "안경 스마트")
+
+    def test_numeric_modifier_allowed(self):
+        # 숫자 포함 modifier("5G")도 허용. keyword는 _tokens가 토큰화하는 2자 이상.
+        display = self._display("공유기", [
+            "5G 공유기 신제품", "5G 공유기 출시 임박", "5G 공유기 예약 판매",
+        ])
+        self.assertEqual(display, "5G 공유기")
+
+    def test_modifier_exact_half_boosted(self):
+        # 경계 고정(Codex diff P3): keyword 등장 4기사 중 정확히 2건(절반)이 "AI 안경"
+        # → threshold(>= 절반)를 만족하므로 보강돼야 한다.
+        display = self._display("안경", [
+            "AI 안경 체험 오픈", "AI 안경 시스템 공개",  # 2/4 = 0.5
+            "삼성 안경 신제품", "코오롱 안경 출시",
+        ])
+        self.assertEqual(display, "AI 안경")
+
+    def test_only_first_occurrence_prev_counted(self):
+        # 의도 고정(Codex diff P2): 한 title에 keyword가 여러 번 나오면 첫 등장 prev만
+        # 센다. "안경 시장, AI 안경 공개"는 첫 등장("안경")에 앞 토큰이 없어(맨 앞) prev
+        # 없음 처리 → majority 미달로 원형 유지.
+        display = self._display("안경", [
+            "안경 시장 확대 AI 안경 공개", "안경 트렌드 AI 안경 경쟁", "안경 수요 AI 안경 성장",
+        ])
+        self.assertEqual(display, "안경")
+
+    def test_duplicate_form_modifier_rejected_case_insensitive(self):
+        # 중복형 차단은 영문 case 무시(Codex diff P3): "Openai" + "AI"도 차단.
+        display = self._display("AI", [
+            "Openai AI 모델 공개", "Openai AI 전략 발표", "Openai AI 신기술",
+        ])
+        self.assertEqual(display, "AI")
+
+    def test_display_articles_basis_dedup_not_raw(self):
+        # 표시 기사 기준 집계(Codex diff P1): 원본에 같은 URL 중복 기사가 있어도 dedup
+        # 후 집계하므로 중복이 majority를 왜곡하지 않는다. dedup_articles는 URL 기준이라
+        # 같은 URL을 여러 번 넣어 실제 dedup 경로를 태운다. dedup 후 3건 모두 "AI 안경"
+        # 이므로 정상 보강.
+        dup = {"title": "AI 안경 체험존", "url": "https://x.com/dup", "snippet": ""}
+        item = {
+            "keyword": "안경",
+            "news_meta": {
+                "articles": [
+                    dup, dict(dup),  # 동일 URL 중복(dedup 대상)
+                    {"title": "AI 안경 시스템", "url": "https://x.com/1", "snippet": ""},
+                    {"title": "AI 안경 공개", "url": "https://x.com/2", "snippet": ""},
+                ],
+                "representative_article": {"title": "AI 안경 체험존"},
+            },
+        }
+        resolved = ranker.resolve_singleton_displays([item])
+        self.assertEqual(resolved[0]["display_keyword"], "AI 안경")
+
+    def test_modifier_min_absolute_support_required(self):
+        # 절대 근거 방어(Codex diff 재리뷰 P1): modifier가 표시 기사 절반 이상 비율은
+        # 만족해도 절대 hit이 DISPLAY_ARTICLES_MIN(2) 미만이면 보강하지 않는다. 보강 후
+        # exclude_insufficient_display_articles에 걸려 원래 "안경"이면 살아남았을 후보가
+        # 탈락하는 것을 막기 위함. 아래는 keyword 등장 2기사 중 "AI 안경" 1건(비율 0.5는
+        # 넘지만 절대 1건 < 2) → 원형 유지.
+        display = self._display("안경", [
+            "AI 안경 체험", "메타 안경 공개",
+        ])
+        self.assertEqual(display, "안경")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
