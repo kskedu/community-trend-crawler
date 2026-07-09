@@ -209,6 +209,15 @@ def _rank_and_select(candidates, signals, pass_name):
     _log_source_family_diversity(
         pass_name, candidates, ranked, merged, selected_pre_display, top,
     )
+    # broad category generic singleton 탐지(2026-07-09, 1차: logging first — 순수 관찰).
+    # final(top)에 진입한 "건설"/"게임"류 순수 한글 업종/분야어 단독 후보를 shadow로
+    # 탐지해 로그만 남긴다. 제외/강등/순위 변경 없음 — 반환값 top은 그대로 유지한다.
+    # 운영 1~2회 로그로 dispersion 판정을 검증한 뒤 제외/강등 기준을 별도 PR에서 확정한다.
+    broad_diags = ranker.detect_broad_category_singletons(top)
+    if broad_diags:
+        logger.warning(
+            "[news] %s: broad category singleton 관찰(제외 아님) %s", pass_name, broad_diags
+        )
     return top
 
 

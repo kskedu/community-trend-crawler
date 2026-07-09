@@ -3758,5 +3758,194 @@ class TestShortGenericSingletonDisplayBoost(unittest.TestCase):
         self.assertEqual(display, "안경")
 
 
+class TestBroadCategorySingletonDetect(unittest.TestCase):
+    """broad category(업종/분야) generic singleton 탐지 — 1차 logging first.
+
+    detect_broad_category_singletons는 탐지·진단만 반환하고 final 결과를 바꾸지 않는다.
+    "건설"/"게임"류 순수 한글 업종/분야어 단독 후보를 shadow dispersion과 함께 잡고,
+    "태풍"/"주담대"/"금리" 이슈 단독어와 §0-4 보강분("AI 안경")·merge group은 제외한다.
+    """
+
+    @staticmethod
+    def _item(keyword, titles, display=None, related=None):
+        # 표시 기사 산출이 build_display_articles(anchor 재확인)를 통과해야 하므로,
+        # 실기사처럼 keyword_main_topic/non-incidental 메타를 부여한다(단일 broad 토큰
+        # 키워드는 _display_anchor_allowed의 단일 토큰 예외 경로로 표시에 남는다).
+        item = {
+            "keyword": keyword,
+            "display_keyword": display if display is not None else keyword,
+            "news_meta": {
+                "articles": [
+                    {
+                        "title": t,
+                        "url": f"https://x.com/{i}",
+                        "snippet": "",
+                        "relevance_reason": "keyword_main_topic",
+                        "is_incidental": False,
+                    }
+                    for i, t in enumerate(titles)
+                ],
+            },
+        }
+        if related:
+            item["related_keywords"] = related
+        return item
+
+    def _diag(self, keyword, titles, display=None, related=None):
+        diags = ranker.detect_broad_category_singletons(
+            [self._item(keyword, titles, display=display, related=related)]
+        )
+        return diags
+
+    # ── positive: broad category singleton 탐지 ──
+    def test_construction_dispersed_detected(self):
+        # "건설" + 서로 다른 건설사 기사 → 탐지 + shadow dispersed True.
+        diags = self._diag("건설", [
+            "현대건설 안전 스타트업 협업 성과",
+            "대우건설 이라크 국가전략사업 수주",
+            "삼성물산 건설 부문 실적 발표",
+        ])
+        self.assertEqual(len(diags), 1)
+        self.assertEqual(diags[0]["keyword"], "건설")
+        self.assertTrue(diags[0]["shadow_dispersed"])
+
+    def test_game_multiple_companies_detected(self):
+        # "게임" + 여러 회사/작품 혼재 → 탐지 + dispersed True.
+        diags = self._diag("게임", [
+            "넷마블 신작 게임 출시 예고",
+            "엔씨소프트 게임 매출 반등",
+            "크래프톤 게임 글로벌 흥행",
+        ])
+        self.assertEqual(len(diags), 1)
+        self.assertTrue(diags[0]["shadow_dispersed"])
+
+    def test_game_same_subject_not_dispersed(self):
+        # "게임" + 동일 주체(넷마블) 과반 반복 → 탐지되지만 dispersed False(유지 후보).
+        diags = self._diag("게임", [
+            "넷마블 게임 신작 공개",
+            "넷마블 게임 사전예약 시작",
+            "넷마블 게임 매출 신기록",
+        ])
+        self.assertEqual(len(diags), 1)
+        self.assertFalse(diags[0]["shadow_dispersed"])
+
+    # ── negative: 이슈 단독어 미탐지(사전 미포함) ──
+    def test_typhoon_not_detected(self):
+        diags = self._diag("태풍", [
+            "태풍 북상 제주 강타", "태풍 전국 강풍 특보", "태풍 피해 복구 총력",
+        ])
+        self.assertEqual(diags, [])
+
+    def test_judamdae_not_detected(self):
+        diags = self._diag("주담대", [
+            "주담대 금리 상단 7% 근접", "주담대 규제 강화 검토",
+        ])
+        self.assertEqual(diags, [])
+
+    def test_interest_rate_not_detected(self):
+        diags = self._diag("금리", [
+            "금리 인하 기대감 확산", "금리 동결 전망 우세",
+        ])
+        self.assertEqual(diags, [])
+
+    # ── negative: §0-4 보강분 / merge group 제외 ──
+    def test_display_boosted_not_detected(self):
+        # display_keyword != keyword(§0-4 "AI 안경"류)면 관찰 대상 아님.
+        diags = self._diag("게임", [
+            "AI 게임 신작 공개", "AI 게임 플랫폼 출시",
+        ], display="AI 게임")
+        self.assertEqual(diags, [])
+
+    def test_merge_group_not_detected(self):
+        # related_keywords 존재(merge group) → 대상 아님.
+        diags = self._diag("건설", [
+            "현대건설 협업", "대우건설 수주",
+        ], related=["현대건설"])
+        self.assertEqual(diags, [])
+
+    # ── 안전 동작: 데이터 부족 / 비주체 접두 ──
+    def test_single_article_dispersion_none(self):
+        # 표시 기사 2건 미만 → dispersed None(판정 불가, 보수적). 탐지 자체는 됨.
+        diags = self._diag("건설", ["현대건설 단독 기사"])
+        self.assertEqual(len(diags), 1)
+        self.assertIsNone(diags[0]["shadow_dispersed"])
+
+    def test_noise_prefix_skipped_in_subject(self):
+        # [속보]/정부/업계 등 접두 노이즈는 주체에서 건너뛰고 다음 토큰을 본다.
+        # _tokens가 "[속보]" 기호를 제거하므로 "속보" 토큰만 남고, 그마저 스킵된다.
+        diags = self._diag("건설", [
+            "속보 현대건설 대형 수주 성공",
+            "정부 대우건설 이라크 지원 확대",
+            "업계 삼성물산 건설 신사업 진출",
+        ])
+        self.assertEqual(len(diags), 1)
+        dist = diags[0]["subject_dist"]
+        # 접두 노이즈가 주체로 잡히지 않았는지 확인.
+        self.assertNotIn("속보", dist)
+        self.assertNotIn("정부", dist)
+        self.assertNotIn("업계", dist)
+        self.assertIn("현대건설", dist)
+
+    def test_keyword_first_token_uses_next(self):
+        # 첫 토큰이 keyword 자신이면 다음 토큰을 주체로 본다.
+        diags = self._diag("건설", [
+            "건설 현대건설 안전 협업",
+            "건설 대우건설 해외 수주",
+        ])
+        dist = diags[0]["subject_dist"]
+        self.assertIn("현대건설", dist)
+        self.assertIn("대우건설", dist)
+        self.assertNotIn("건설", dist)
+
+    def test_non_broad_singleton_not_detected(self):
+        # 사전에 없는 일반 단독어("손예진")는 미탐지.
+        diags = self._diag("손예진", [
+            "손예진 신작 드라마 확정", "손예진 화보 공개",
+        ])
+        self.assertEqual(diags, [])
+
+    def test_final_result_unchanged_detection_only(self):
+        # detect는 입력 items를 변형하지 않는다(순수 관찰).
+        item = self._item("건설", ["현대건설 협업", "대우건설 수주"])
+        before = dict(item)
+        ranker.detect_broad_category_singletons([item])
+        self.assertEqual(item["keyword"], before["keyword"])
+        self.assertEqual(item["display_keyword"], before["display_keyword"])
+
+    def test_rank_and_select_top_identical_with_and_without_detect(self):
+        # call-site 불변식(Codex diff P3): _rank_and_select의 detect 호출은 로그 전용이라
+        # top(순서/개수/keyword/display)이 detect 유무와 무관하게 동일해야 한다. detect를
+        # 무력화(no-op)한 결과와 정상 결과를 직접 비교해 "logging first = final 불변"을 고정.
+        cands = [
+            {"keyword": "게임", "sources": {"daum_home": 1}},
+            {"keyword": "반도체 수출", "sources": {"nate_home": 1}},
+        ]
+
+        def _signals():
+            return {
+                "news": {
+                    "게임": _news(3, 1, 2, 0.9, articles=[
+                        _article("넷마블 게임 신작 공개", "https://x.com/g1"),
+                        _article("엔씨 게임 매출 반등", "https://x.com/g2"),
+                    ]),
+                    "반도체 수출": _news(3, 1, 2, 0.9, articles=[
+                        _article("반도체 수출 증가 발표", "https://x.com/b1"),
+                        _article("반도체 수출 호조 지속", "https://x.com/b2"),
+                    ]),
+                },
+                "datalab": {}, "google": {},
+            }
+
+        top_real = main_module._rank_and_select(cands, _signals(), "test")
+        with patch.object(ranker, "detect_broad_category_singletons", return_value=[]):
+            top_noop = main_module._rank_and_select(
+                [dict(c) for c in cands], _signals(), "test"
+            )
+        # top 전체(순서/개수/keyword/display/rank + builder가 소비하는 articles/score/
+        # source_breakdown/representative 등 모든 필드)가 detect 유무와 무관하게 동일해야
+        # 한다(Codex diff 재리뷰 P3: fingerprint 일부만 보면 in-place 변형을 놓침).
+        self.assertEqual(top_real, top_noop)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

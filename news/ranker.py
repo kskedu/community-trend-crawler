@@ -1338,6 +1338,137 @@ def exclude_generic_singletons(merged: List[Dict]) -> tuple:
     return kept, excluded
 
 
+# === broad category(업종/분야) generic singleton 탐지 — 1차: logging first ===
+# 운영 관찰(2026-07-09): "건설"/"게임"처럼 순수 한글 업종/분야어가 단독(singleton)으로
+# final에 노출됐는데, 표시 기사는 서로 다른 주체(현대건설/대우건설)의 별개 사건 묶음이었다.
+# _is_generic_only_display(신임/수사 등 행위·인사 서술어)에도, §0-4 영문/숫자 modifier
+# 보강(_boost_short_generic_singleton_display)에도 안 걸려 어떤 방어도 타지 않는다.
+#
+# 이 1차 작업은 **탐지·로그만** 한다(제외/강등/순위 변경 없음). Codex 계획 review-only:
+# "title 첫 토큰 = 주체" 추출은 [속보]/인용/날짜/기관어 접두 등에 취약해 hard exclude
+# 오탐 위험이 크므로, 먼저 관찰 로그로 운영 1~2회 데이터를 쌓은 뒤 제외/강등 기준을
+# 별도 PR에서 확정한다. 아래 subject 추출과 dispersion 판정은 전부 shadow(관찰) 전용이며
+# 절대 final 결과에 반영하지 않는다.
+#
+# 주의: _TOO_BROAD_SINGLE_WORDS(41행)와 역할이 다르다 — 그건 substring merge 억제 +
+# 대표 선택 감점(tie-breaker) 전용이고, 이 집합은 singleton 탐지(관찰) 전용이다. 이슈
+# 단독어(태풍/주담대/금리)는 업종/분야어가 아니라 절대 넣지 않는다(false positive 방어).
+_BROAD_CATEGORY_WORDS = {
+    "건설", "게임", "금융", "사업", "산업", "기업", "시장", "기술",
+    "정책", "병원", "투자", "지원", "공급", "운영",
+}
+
+# 주체 추출에서 접두 노이즈로 흔한 토큰(shadow 판정 전용). title 첫머리에 오지만 실제
+# 이슈 주체가 아닌 기관어/시점어/서술 접두어(Codex 계획 리뷰 P1: 첫 토큰이 주체가
+# 아닌 케이스 방어). 이 목록은 관찰 dispersion 정확도만 높이며 hard exclude에는 쓰지 않는다.
+_SUBJECT_NOISE_PREFIXES = {
+    "속보", "단독", "특징주", "포토", "영상", "오늘", "내일", "어제", "정부",
+    "업계", "국내", "해외", "이번", "관련", "종합",
+}
+
+
+def _extract_subject_token(title: str, kw_tok: str) -> Optional[str]:
+    """기사 title에서 "주체 후보" 토큰 1개 추출(shadow dispersion 판정 전용).
+
+    title 첫 토큰을 주체 후보로 본다(대개 주어 "현대건설,"/"대우건설,"). 단:
+    - keyword 토큰과 같으면 그 다음 토큰을 본다("건설안전…"이 첫 토큰이면 keyword 자신).
+    - 접두 노이즈(_SUBJECT_NOISE_PREFIXES: 속보/정부/업계 등)면 건너뛰고 다음 토큰.
+    없으면 None. _tokens는 [속보]/인용부호/날짜 기호를 이미 제거하므로 기호 접두는
+    자연히 걸러진다(정규식 `[가-힣A-Za-z0-9]{2,}`). 이건 관찰용 근사이지 정확한 NER이
+    아니며(Codex P1), hard exclude 근거로 쓰지 않는다.
+    """
+    from news.summarizer import _tokens
+
+    toks = _tokens(title or "")
+    for tok in toks:
+        if tok == kw_tok:
+            continue
+        if tok in _SUBJECT_NOISE_PREFIXES:
+            continue
+        return tok
+    return None
+
+
+def detect_broad_category_singletons(items: List[Dict]) -> List[Dict]:
+    """broad category generic singleton 후보를 **탐지만** 한다(제외/강등/순위 변경 없음).
+
+    반환값은 관찰용 진단 리스트로, 호출부(main.py)는 이를 로그로만 남기고 파이프라인
+    결과에는 절대 반영하지 않는다. 대상 판정(모두 만족):
+    - group_size == 1(merge 안 된 단독. related_keywords 없음).
+    - keyword가 단일 토큰(_tokens 길이 1).
+    - keyword가 _BROAD_CATEGORY_WORDS에 포함(순수 업종/분야어).
+    - display_keyword == keyword(§0-4 "AI 안경" 보강 결과물은 제외 — display가 이미
+      구체화됐으면 관찰 대상 아님, Codex 계획 P2).
+
+    각 후보에 대해 표시 기사(dedup→filter_articles_for_display→[:ARTICLES_MAX], §0-4/
+    builder/invariant와 동일 집합) 기준 subject dispersion(주체 분산)을 shadow로 계산해
+    진단에 담는다. dispersion 판정 규칙(shadow):
+    - 서로 다른 주체 후보가 2개 이상이고, 최다 주체도 표시 기사의 과반(>50%) 미만이면
+      "dispersed=True"(서로 다른 주체가 keyword 하나로 묶임 의심).
+    - 단일 주체가 과반이면 dispersed=False(동일 회사/작품 반복 → 정상 이슈 가능).
+    - 표시 기사 2건 미만이면 dispersed=None(판정 불가, 보수적).
+    """
+    from news.summarizer import _tokens
+    from news.dedup import dedup_articles
+    from news.candidates import filter_articles_for_display, build_display_articles
+    from news.builder import ARTICLES_MIN, ARTICLES_MAX
+
+    diagnostics: List[Dict] = []
+    for item in items:
+        if item.get("related_keywords"):
+            continue  # merge group은 대상 아님(_build_display_keyword가 처리)
+        kw = (item.get("keyword", "") or "").strip()
+        kw_toks = _tokens(kw)
+        if len(kw_toks) != 1 or kw not in _BROAD_CATEGORY_WORDS:
+            continue
+        display = item.get("display_keyword") or kw
+        if display != kw:
+            continue  # §0-4 등으로 이미 display가 구체화됨 → 관찰 대상 아님
+        kw_tok = kw_toks[0]
+
+        # 실제 상세 팝업 노출 기사와 동일 집합으로 subject를 집계한다(Codex diff P2):
+        # builder가 display_articles를 만들 때 filter_articles_for_display 이후
+        # build_display_articles(anchor 재확인)를 한 번 더 통과시키므로, 관찰 로그가
+        # 실제 노출 기사와 어긋나지 않도록 여기서도 동일 단계를 밟는다. 대상은
+        # display==keyword이므로 effective_keyword=kw.
+        news_meta = item.get("news_meta") or {}
+        filtered = filter_articles_for_display(
+            dedup_articles(news_meta.get("articles") or []), min_count=ARTICLES_MIN
+        )[:ARTICLES_MAX]
+        articles = build_display_articles(
+            kw, filtered, news_meta.get("representative_article")
+        )
+
+        subjects: List[str] = []
+        for a in articles:
+            subj = _extract_subject_token(a.get("title", "") or "", kw_tok)
+            if subj:
+                subjects.append(subj)
+
+        subject_counts: Dict[str, int] = {}
+        for s in subjects:
+            subject_counts[s] = subject_counts.get(s, 0) + 1
+
+        n_articles = len(articles)
+        if n_articles < 2:
+            dispersed = None  # 판정 불가(보수적)
+        else:
+            top_subject_hits = max(subject_counts.values()) if subject_counts else 0
+            distinct = len(subject_counts)
+            dispersed = distinct >= 2 and top_subject_hits <= n_articles / 2
+
+        diagnostics.append({
+            "keyword": kw,
+            "display_keyword": display,
+            "articles": n_articles,
+            "subject_dist": dict(sorted(
+                subject_counts.items(), key=lambda kv: (-kv[1], kv[0])
+            )),
+            "shadow_dispersed": dispersed,
+        })
+    return diagnostics
+
+
 # === PR/광고성 클러스터 hard exclude (문제 B) ===
 COMMERCIAL_PR_RATIO_THRESHOLD = 0.6
 PR_MIN_ARTICLES = 2  # 순수 PR 판정에 필요한 최소 PR 기사 수(단건 stray 마커 노이즈 방어)
