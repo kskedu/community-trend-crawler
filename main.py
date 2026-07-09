@@ -184,6 +184,8 @@ def _rank_and_select(candidates, signals, pass_name):
     if pr_excluded:
         logger.warning("[news] %s: PR/광고성 클러스터 제외 %s", pass_name, pr_excluded)
     merged = ranker.dedupe_and_merge(ranked)
+    # singleton sense-mixing display 보정("위홀 뜻" 사례) — merge 후, invariant 검증 전.
+    merged = ranker.resolve_singleton_displays(merged)
     # display_keyword/articles 정합성 invariant — merge 후, generic guard 전(문제 A).
     merged = ranker.enforce_display_article_consistency(merged)
     kept, generic_excluded = ranker.exclude_generic_singletons(merged)

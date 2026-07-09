@@ -3229,5 +3229,149 @@ class TestCollectKeywordCaches(unittest.TestCase):
         self.assertEqual(call_order, ["keywords", "briefing"])
 
 
+class TestSenseMixingDisplay(unittest.TestCase):
+    """짧고 애매한 keyword가 서로 다른 의미의 기사를 흡수하는 sense-mixing 방어
+    ("위홀 뜻" 사례, 2026-07). 검색의도 suffix display 방지 + 다른 의미 article
+    혼입 방지 + 정상 케이스 회귀 없음을 검증한다."""
+
+    def _andy_warhol_articles(self):
+        # 앤디워홀/미술관/대구/전시 — "위홀" 토큰만 공유하는 무관 기사 클러스터.
+        return [
+            {"title": "대구문화예술회관, 7월 '미술관 라이브' 개최…앤디 워홀 특별전과 대구",
+             "originallink": "https://a.com/w1",
+             "description": "앤디 워홀 예술을 팔다 포스터 대구문화예술회관 대표 융합 미술 프로그램",
+             "pubDate": None},
+            {"title": "앤디 워홀 특별전, 대구서 개막…미술관 전시 화제",
+             "originallink": "https://a.com/w2",
+             "description": "앤디 워홀의 작품 세계를 조명하는 전시가 대구에서 열린다",
+             "pubDate": None},
+        ]
+
+    def _hyori_articles(self):
+        # 이효리/연애전쟁/위홀 커플/조언 — keyword "위홀 뜻"의 실제 다수 클러스터.
+        # 스크린샷 원문 검색결과 문구를 그대로 사용(제목/스니펫에 "위홀" 표기가 실제로
+        # 등장 — naver 검색 결과 자체가 이렇게 표기됐던 실사례를 재현).
+        return [
+            {"title": "'연애전쟁' 이효리, 위홀 커플 조언",
+             "originallink": "https://a.com/h1",
+             "description": "'연애전쟁' JTBC '연애전쟁'에서 이효리가 위킹홀리데이를 앞둔 커플에게 현실적인 연애 조언을 건넸다. 감정 기복으로 힘들어하는 여자친구를 향한 공감과 진심 어린 위로가 시청자들의 공감을 얻었다. JTBC",
+             "pubDate": None},
+            {"title": "'3년 차 커플' 결혼 vs 위홀..마지막 여행서 끝내 눈물의 파국[연애전쟁",
+             "originallink": "https://a.com/h2",
+             "description": "'연애전쟁'에서 남자친구와 결혼을 원하는 여자친구의 갈등이 공개됐다. 7일 방송된 JTBC 예능프로그램 '연애전쟁'에서는 3년째 교제 중인 4살 차이 커플의 여행이 공개됐다. 이날 여행은 남성이 워킹홀리데이를 앞두고",
+             "pubDate": None},
+            {"title": "친오빠 친구와 5년 째 연애 시작했는데...\"18일 뒤 위홀 떠난다\" (연애전...",
+             "originallink": "https://a.com/h3",
+             "description": "7일 방송되는 JTBC '연애전쟁' 3회에서는 세 번째 협상 의뢰인으로 '위홀 커플'이 출연한다. 두 사람은... 그러나 여자친구는 '위홀'의 '위'자만 나와도 눈물 뚝뚝 떨구는 모습을 보였고, 이에 이효리와 서장은",
+             "pubDate": None},
+            {"title": "이효리 한방 조언 \"안달나게 하고 싶으면...\" (연애전쟁)",
+             "originallink": "https://a.com/h4",
+             "description": "7일 방송된 JTBC '연애전쟁' 3회에는 특별외교관으로 이준이 출연한 가운데, 출국을 앞둔 '위홀 커플'.. 결국 '위홀 커플'은 워킹홀리데이 기간 연락 횟수에 대해서는 합의했지만 결혼 시기에 대한 의견 차는",
+             "pubDate": None},
+        ]
+
+    def _mixed_raw_items(self):
+        return self._hyori_articles() + self._andy_warhol_articles()
+
+    def test_search_intent_suffix_display_avoided(self):
+        # keyword="위홀 뜻", 기사 다수는 이효리/연애전쟁/위홀 커플/조언 →
+        # display_keyword가 "위홀 뜻"이면 실패.
+        sig = cand.compute_news_signal("위홀 뜻", self._mixed_raw_items())
+        item = {"keyword": "위홀 뜻", "news_meta": sig}
+        resolved = ranker.resolve_singleton_displays([item])
+        self.assertNotEqual(resolved[0]["display_keyword"], "위홀 뜻")
+
+    def test_display_keyword_reflects_dominant_cluster(self):
+        # 재구성된 display_keyword는 이효리/워홀 커플/조언 계열이어야 한다.
+        sig = cand.compute_news_signal("위홀 뜻", self._mixed_raw_items())
+        item = {"keyword": "위홀 뜻", "news_meta": sig}
+        resolved = ranker.resolve_singleton_displays([item])
+        display = resolved[0]["display_keyword"]
+        self.assertTrue(
+            any(tok in display for tok in ("이효리", "워홀", "조언", "연애전쟁")),
+            msg=f"display_keyword={display!r}가 dominant cluster를 반영하지 않음",
+        )
+        self.assertNotIn("앤디", display)
+        self.assertNotIn("미술관", display)
+
+    def test_andy_warhol_articles_excluded_from_display(self):
+        # 앤디워홀/미술관/대구 기사는 표시 articles(display_articles)에서 제외돼야 한다.
+        sig = cand.compute_news_signal("위홀 뜻", self._mixed_raw_items())
+        articles = cand.filter_articles_for_display(sig["articles"], min_count=1)
+        display_articles = cand.build_display_articles(
+            "위홀 뜻", articles, sig["representative_article"]
+        )
+        for a in display_articles:
+            self.assertNotIn("앤디", a["title"])
+            self.assertNotIn("미술관", a["title"])
+
+    def test_off_primary_sense_flag_set_for_unrelated_cluster(self):
+        # compute_news_signal이 앤디워홀 기사에 is_off_primary_sense=True를 부여해야 한다.
+        sig = cand.compute_news_signal("위홀 뜻", self._mixed_raw_items())
+        off_sense_titles = [a["title"] for a in sig["articles"] if a.get("is_off_primary_sense")]
+        self.assertTrue(any("앤디" in t for t in off_sense_titles))
+        self.assertGreaterEqual(sig["off_primary_sense_count"], 1)
+
+    def test_search_intent_suffix_alone_not_displayed(self):
+        # "뜻"/"의미"/"누구"/"프로필"/"나이" 단독 keyword는 suffix만 있으므로(stem 없음)
+        # 재구성 대상이 아니라 원래 keyword를 그대로 유지한다(vacuous 재구성 방지,
+        # Codex review-only P1 반영).
+        for kw in ("뜻", "의미", "누구", "프로필", "나이"):
+            item = {"keyword": kw, "news_meta": {"articles": []}}
+            resolved = ranker.resolve_singleton_displays([item])
+            self.assertEqual(resolved[0]["display_keyword"], kw)
+
+    def test_normal_typhoon_keyword_unaffected(self):
+        sig = cand.compute_news_signal("태풍", [
+            {"title": "태풍 북상, 제주도 강풍 특보", "originallink": "https://t.com/1",
+             "description": "태풍이 북상하며 제주도에 강풍 특보가 발효됐다", "pubDate": None},
+            {"title": "태풍 경로 예측, 남부지방 영향권", "originallink": "https://t.com/2",
+             "description": "태풍의 예상 경로가 남부지방을 지날 것으로 보인다", "pubDate": None},
+        ])
+        item = {"keyword": "태풍", "news_meta": sig}
+        resolved = ranker.resolve_singleton_displays([item])
+        self.assertEqual(resolved[0]["display_keyword"], "태풍")
+
+    def test_normal_worldcup_16gang_keyword_unaffected(self):
+        item = {"keyword": "월드컵 16강", "news_meta": {"articles": []}}
+        resolved = ranker.resolve_singleton_displays([item])
+        self.assertEqual(resolved[0]["display_keyword"], "월드컵 16강")
+
+    def test_normal_hong_seokgi_keyword_unaffected(self):
+        item = {"keyword": "홍석기 치안감", "news_meta": {"articles": []}}
+        resolved = ranker.resolve_singleton_displays([item])
+        self.assertEqual(resolved[0]["display_keyword"], "홍석기 치안감")
+
+    def test_normal_jang_yoonjeong_mom_keyword_unaffected(self):
+        item = {"keyword": "장윤정 엄마", "news_meta": {"articles": []}}
+        resolved = ranker.resolve_singleton_displays([item])
+        self.assertEqual(resolved[0]["display_keyword"], "장윤정 엄마")
+
+    def test_merged_group_not_affected_by_singleton_resolver(self):
+        # related_keywords가 있는(merge된) item은 resolve_singleton_displays 대상이 아니다.
+        item = {
+            "keyword": "위홀 뜻", "display_keyword": "위홀 뜻 커플",
+            "related_keywords": ["위홀 커플"], "news_meta": {"articles": []},
+        }
+        resolved = ranker.resolve_singleton_displays([item])
+        self.assertEqual(resolved[0]["display_keyword"], "위홀 뜻 커플")
+
+    def test_generic_singleton_suffix_penalty_in_representative_score(self):
+        # _representative_score의 suffix 페널티 축이 정상 반영되는지(튜플 2번째 원소).
+        common_tokens = set()
+        member_suffix = {"keyword": "위홀 뜻", "score": 0.9}
+        member_normal = {"keyword": "위홀 커플", "score": 0.9}
+        score_suffix = ranker._representative_score(member_suffix, common_tokens, [])
+        score_normal = ranker._representative_score(member_normal, common_tokens, [])
+        self.assertLess(score_suffix, score_normal)
+
+    def test_substring_suffix_not_penalized(self):
+        # "이나이 대표"처럼 suffix 문자열이 다른 토큰의 일부로 우연히 섞인 경우는
+        # 토큰 단위 정확 일치가 아니므로 오탐 감점되지 않아야 한다.
+        self.assertFalse(ranker._ends_with_search_intent_suffix("이나이 대표"))
+        self.assertTrue(ranker._ends_with_search_intent_suffix("위홀 뜻"))
+        self.assertTrue(ranker._ends_with_search_intent_suffix("아이유 프로필"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

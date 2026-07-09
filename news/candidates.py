@@ -450,6 +450,82 @@ def select_primary_cluster(clusters: List[List[Dict]]) -> List[Dict]:
     return max(clusters, key=lambda c: sum(a.get("relevance_score", 0.0) for a in c))
 
 
+# === sense-mixing 방어(2026-07) — non-primary cluster 기사의 "다른 의미" 판별 ===
+# "위홀 뜻" 사례: keyword가 이효리/워홀커플 기사와 앤디워홀 기사를 모두 substring
+# 매칭으로 흡수. cluster_articles()가 두 그룹으로 나누지만, non-primary cluster
+# 기사도 anchor 토큰 overlap 조건만 통과하면 표시 articles에 그대로 남는다
+# (Codex review-only 계획 리뷰: primary cluster 선택 로직 자체(select_primary_cluster)는
+# 이번 범위에서 변경하지 않고, non-primary가 이미 명확히 다른 의미로 판별될 때만
+# 추가로 배제하는 완화책으로 좁힌다).
+_OFF_PRIMARY_SENSE_MIN_DF = 2  # 문서빈도(반복 등장) 최소 기준. 미만이면 singleton fallback.
+
+
+def _cluster_common_tokens(articles: List[Dict], min_df: int = _OFF_PRIMARY_SENSE_MIN_DF) -> set:
+    """기사 그룹에서 문서빈도(DF) >= min_df인 토큰 집합. 유효 기사가 min_df 미만이면
+    (반복 관측 불가) 전체 토큰을 후보로 반환한다(ranker._group_df_tokens와 동일 원리를
+    candidates.py 내부에 소규모 복제 — ranker.py가 candidates.py를 import하는 순환
+    구조라 역참조 불가)."""
+    if not articles:
+        return set()
+    if len(articles) < min_df:
+        toks = set()
+        for a in articles:
+            toks |= set(_tokens(f"{a.get('title', '')} {a.get('snippet', '')}"))
+        return toks
+    df: Dict[str, int] = {}
+    for a in articles:
+        text = f"{a.get('title', '')} {a.get('snippet', '')}"
+        for tok in set(_tokens(text)):
+            df[tok] = df.get(tok, 0) + 1
+    return {t for t, c in df.items() if c >= min_df}
+
+
+def mark_off_primary_sense(keyword: str, scored_articles: List[Dict], primary: List[Dict]) -> None:
+    """non-primary cluster 기사 중 keyword와 "다른 의미"로 판별되는 기사에
+    is_off_primary_sense=True를 부여한다(scored_articles를 in-place 수정).
+
+    판별 기준: non-primary cluster의 공통 토큰(_cluster_common_tokens)이
+    (a) keyword 토큰과 1개 이상 겹치거나, (b) primary cluster(대표 이슈)
+    기사들의 title/snippet 토큰 전체와 2개 이상 겹치면 "같은 의미"로 보아
+    False. 둘 다 아니면 "다른 의미"로 True. "위홀 뜻" keyword 토큰({위홀})과
+    앤디워홀 클러스터 공통 토큰({앤디, 워홀, 미술관, 대구, 전시})은 keyword와도
+    0개, primary(이효리/워홀 커플) 기사 토큰과도 겹치는 게 없거나 1개 이하라
+    "다른 의미"로 판정된다.
+
+    primary와도 비교하는 이유(Codex review-only diff 리뷰 P2 1·2·3차): keyword
+    토큰 하나만으로 판정하면, 같은 이슈인데 표현이 달라 클러스터가 쪼개진
+    경우("다어절 검색어의 일부만 한 기사에 등장, 나머지는 동의어")까지 keyword
+    literal과 안 겹친다는 이유로 과잉 배제될 위험이 있다(1차 지적). primary
+    앵커를 DF>=2 공통 토큰으로 좁히면 대표 기사 title과의 same-issue 증거를
+    놓칠 수 있어(2차 지적) primary 기사 전체 title/snippet 토큰 합집합으로
+    확장했으나, 1토큰만 겹쳐도 통과시키면 primary snippet의 흔한 사건어
+    하나만으로 과다 허용된다(3차 지적). 그래서 keyword 매칭(1개 이상, 원래
+    keyword 자체가 짧을 수 있어 임계를 낮게 유지)과 primary 매칭(2개 이상,
+    _display_anchor_allowed의 shared_with_rep>=2와 동일 강도)을 분리한다.
+    primary cluster 기사는 항상 False(대상 아님).
+    """
+    kw_toks = set(_tokens(keyword or ""))
+    primary_ids = {id(a) for a in primary}
+
+    non_primary = [a for a in scored_articles if id(a) not in primary_ids]
+    if not non_primary:
+        return
+
+    primary_all_tokens: set = set()
+    for a in primary:
+        primary_all_tokens |= set(_tokens(f"{a.get('title', '')} {a.get('snippet', '')}"))
+
+    non_primary_clusters = cluster_articles(non_primary)
+    for cluster in non_primary_clusters:
+        common = _cluster_common_tokens(cluster)
+        same_sense = bool(common & kw_toks) or len(common & primary_all_tokens) >= 2
+        is_off_sense = bool(common) and not same_sense
+        for a in cluster:
+            a["is_off_primary_sense"] = is_off_sense
+    for a in scored_articles:
+        a.setdefault("is_off_primary_sense", False)
+
+
 def compute_topic_coherence(clusters: List[List[Dict]], total_articles: int) -> float:
     """primary cluster 비중 기반 topic_coherence(0~1). 기사 주제가 분산될수록 낮음."""
     if not clusters or total_articles <= 0:
@@ -551,18 +627,44 @@ def _display_anchor_allowed(effective_keyword: str, article: Dict, representativ
       "공유"/"성과" 같은 generic 단일 토큰은 _GENERIC_SINGLE_TOKENS에서 이미 걸러지므로
       이 예외를 타지 못한다(오염 방어 유지).
     - "공유"처럼 모호한 단일 토큰 하나만 겹치는 기사는 제외.
+
+    sense-mixing 방어(2026-07): article.is_off_primary_sense=True(compute_news_signal의
+    mark_off_primary_sense가 부여 — non-primary cluster이면서 keyword와 공통 토큰이
+    없는 "다른 의미" 기사)이면, 아래 단일 고유토큰 예외를 먼저 평가하고 그것도 통과 못
+    하면 즉시 제외한다(기존 anchor overlap 조건으로 내려가지 않음). "위홀 뜻" 사례의
+    앤디워홀 기사가 우연한 토큰 overlap으로 새어나가는 것을 막는다. 단일 고유토큰 예외
+    (장동건류)는 이 방어보다 먼저 평가해 기존 동작을 그대로 보존한다.
     """
     text = f"{article.get('title', '')} {article.get('clean_description') or article.get('snippet', '')}"
     text_tokens = set(_tokens(text))
+
+    kw_tokens = set(_tokens(effective_keyword))
+    matched_kw = _matched_tokens(kw_tokens, text, text_tokens)
+    non_generic_matched = matched_kw - _GENERIC_SINGLE_TOKENS
+
+    # 단일 non-generic 토큰(고유명/인물명) 키워드 예외 — title 주제 기사만 허용.
+    # "키워드 자체가 토큰 1개"일 때만 적용한다(Codex review-only P1, 2026-07-05):
+    # len(kw_non_generic)==1만 보면 "여행 공유"/"지원 발표"처럼 generic을 뺀 뒤 1개만
+    # 남는 다토큰 키워드까지 anchor 검증 없이 예외를 타 오염이 다시 샌다. 원래 키워드가
+    # 단일 토큰("장동건")이고 그 토큰이 generic이 아닐 때로 좁힌다.
+    single_token_exception = (
+        len(kw_tokens) == 1
+        and not (kw_tokens & _GENERIC_SINGLE_TOKENS)
+        and non_generic_matched
+        and not article.get("is_incidental")
+        and article.get("relevance_reason") == "keyword_main_topic"
+    )
+    if single_token_exception:
+        return True
+
+    if article.get("is_off_primary_sense"):
+        return False
 
     rep_title = (representative or {}).get("title") or ""
     rep_tokens = set(_tokens(rep_title))
     shared_with_rep_all = _matched_tokens(rep_tokens, text, text_tokens)
     shared_with_rep = shared_with_rep_all - _GENERIC_SINGLE_TOKENS
 
-    kw_tokens = set(_tokens(effective_keyword))
-    matched_kw = _matched_tokens(kw_tokens, text, text_tokens)
-    non_generic_matched = matched_kw - _GENERIC_SINGLE_TOKENS
     if len(non_generic_matched) >= 2:
         return True
     if len(non_generic_matched) >= 1 and len(matched_kw) >= 2 and len(shared_with_rep) >= 1:
@@ -571,19 +673,6 @@ def _display_anchor_allowed(effective_keyword: str, article: Dict, representativ
     if len(shared_with_rep) >= 2:
         return True
 
-    # 단일 non-generic 토큰(고유명/인물명) 키워드 예외 — title 주제 기사만 허용.
-    # "키워드 자체가 토큰 1개"일 때만 적용한다(Codex review-only P1, 2026-07-05):
-    # len(kw_non_generic)==1만 보면 "여행 공유"/"지원 발표"처럼 generic을 뺀 뒤 1개만
-    # 남는 다토큰 키워드까지 anchor 검증 없이 예외를 타 오염이 다시 샌다. 원래 키워드가
-    # 단일 토큰("장동건")이고 그 토큰이 generic이 아닐 때로 좁힌다.
-    if (
-        len(kw_tokens) == 1
-        and not (kw_tokens & _GENERIC_SINGLE_TOKENS)
-        and non_generic_matched
-        and not article.get("is_incidental")
-        and article.get("relevance_reason") == "keyword_main_topic"
-    ):
-        return True
     return False
 
 
@@ -804,6 +893,11 @@ def compute_news_signal(keyword: str, raw_items: List[dict], require_all_tokens:
     for a in scored_articles:
         a["is_primary_cluster"] = id(a) in primary_ids
 
+    # sense-mixing 방어(2026-07) — non-primary cluster 중 keyword와 다른 의미로
+    # 판별되는 기사에 is_off_primary_sense 플래그 부여(_display_anchor_allowed에서 소비).
+    mark_off_primary_sense(keyword, scored_articles, primary)
+    off_primary_sense_count = sum(1 for a in scored_articles if a.get("is_off_primary_sense"))
+
     representative_title = (representative or {}).get("title")
     # representative_summary: description hygiene 정책 적용(build_representative_summary,
     # 2026-07-04) — 대표 기사 raw snippet을 그대로 쓰지 않는다(이미지 캡션 노출 방지).
@@ -879,6 +973,7 @@ def compute_news_signal(keyword: str, raw_items: List[dict], require_all_tokens:
         "public_interest_count": public_interest_count,
         "issue_article_count": issue_article_count,
         "commercial_pr_ratio": round(commercial_pr_ratio, 4),
+        "off_primary_sense_count": off_primary_sense_count,
     }
 
 
