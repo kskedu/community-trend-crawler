@@ -1,6 +1,6 @@
 # 실시간 이슈 랭킹 품질 개선 계획
 
-상태: **완료 (운영 반영 완료, 2026-07-01)**
+상태: **완료 (운영 반영 완료, 최신: 2026-07-09)**
 관련 원 설계: `docs/news-ranking-plan.md`, `news/ranker.py`, `news/movement.py`, `news/builder.py`
 
 ## 0. 최종 결과 요약 (완료 처리, 2026-07-01)
@@ -12,6 +12,117 @@
 - 운영/로컬 3001 실데이터로 유사 키워드 dedupe("배재고" ← "배재고 출전정지")와 same-issue merge("모스 탄 명예훼손" ← 관련기사 overlap 기반 5개 키워드 흡수, "비빔밥" ← "단합") 실사례 확인
 - 남은 리스크(P2, 실무 투입 지장 없음): incidental mention 판정이 문자열 거리 휴리스틱 기반이라, 구두점 없는 "주체+판촉 이벤트" title 패턴(예: "쿠팡 선풍기 증정 이벤트 진행" — 콤마 없이)은 완벽히 구분되지 않을 수 있음. 무거운 NLP(개체명 인식) 없이는 구조적 한계. 운영 모니터링 대상.
 - 후속 개선은 이번 작업과 분리해 별도 계획/리뷰/승인 흐름으로 진행한다(이 문서의 범위는 여기서 종료).
+
+## 0-1. 후속 개선 1차 — same-issue merge 강화 + incidental 필터 강화 (완료, 2026-07-01)
+
+§0 운영 반영 이후 실제 화면에서 확인된 잔여 이슈 2건에 대한 후속 개선.
+
+- 문제: (1) "배재고 출전정지"↔"권오영 감독"처럼 article overlap이 threshold(0.5) 미만이라 놓치는
+  same-issue 케이스, (2) "닌텐도 스위치 2" 상세에 경품 나열 기사(BNK경남은행 페스티벌)가 그대로 노출.
+- 커밋: community-trend-crawler `290163d`
+- Codex review-only 검증: 계획 리뷰 3회 + diff 리뷰 2회, P1 다수 반영(대표적으로 article 그룹 간 공유
+  사건 토큰(DF≥2 근사) + keyword anchor 교차 검증 조합으로 merge 신호 추가, `filter_articles_for_display`
+  하한 보호 로직 추가) 후 최종 P0/P1 없음
+- 단위 테스트 118개 전체 통과
+- GitHub Actions workflow_dispatch 1회 실행(run id `28554248444`, success) → `news_top` 저장 10개
+- 운영 화면 확인: same-issue merge("배재고 출전정지" ← "권오영 감독" 실사례는 로컬 e2e로 재현 확인,
+  운영 화면에서는 사건이 진화해 별도 키워드로 노출된 시점이라 직접 관측은 못 함), incidental 필터는
+  "선풍기"/"닌텐도 스위치 2" 기사 relevance_score 정확히 판정되나, `filter_articles_for_display`의
+  `min_count` 하한 보호가 진짜 관련 기사 0건인 키워드를 그대로 보충해 화면상 개선 전과 비슷해 보이는
+  잔여 이슈 발견 → §0-2로 이어짐.
+
+## 0-2. 후속 개선 2차 — keyword-level quality gate + object/side-mention 필터 (완료, 2026-07-02)
+
+§0-1 운영 반영 이후 실제 화면에서 확인된 잔여 이슈 2건에 대한 추가 후속 개선.
+
+- 문제: (1) "선풍기" 상세 기사 5건이 전부 incidental로 정확히 판정됐지만 keyword 자체를 Top10에서
+  거를 gate가 없어 하한 보충으로 여전히 노출, (2) "노트북" 대표 기사가 "쿠팡 국정원 갈등에서 노트북
+  회수 조치"만 언급하는 곁가지 기사로 선정(경품 마커로는 못 잡는 별도 패턴).
+- 커밋: community-trend-crawler `4c38b0e`
+- Codex review-only 검증: 계획 리뷰 5회 + diff 리뷰 2회. 주요 P1: `non_incidental_count`가
+  `object_side_mention`(is_incidental=False)에 의해 gate 무력화되는 문제 → relevance 임계값
+  기준으로 재정의, quality gate가 `available["news"]` 판정을 꺼서 기존 news-required 로직이
+  무력화되는 회귀 → `news_available_before_gate` 사전 확정으로 해결, `_article_overlap`이
+  `object_side_mention`을 못 걸러 same-issue merge로 새는 경로 → `_is_same_issue_evidence_article`
+  기준 통일, snippet-only side-mention이 `snippet_only_incidental_mention`으로 새는 우회 경로 → 차단.
+  최종 P0/P1/P2 없음.
+- **스코프 한정(사용자 승인)**: "news 신호 없는 후보가 정규화 입력(rc_raw/delta_raw/g_raw/d_raw)을
+  오염시키는" 기존 구조(290163d 이전부터 존재)는 이번 범위 밖으로 분리. `compute_scores()` 정규화
+  파이프라인 전체 재작성은 하지 않음. 후속 이슈로 코드 주석(`news/ranker.py` `compute_scores()`)에
+  기록만 함.
+- 단위 테스트 128개 전체 통과
+- GitHub Actions workflow_dispatch 1회 실행(run id `28557093478`, success, 3m7s) → `news_top` 저장
+  8개(직전 10개 대비 감소 — quality gate가 저품질 keyword를 실제로 걸러낸 결과로 추정)
+- 운영 화면 확인(2026-07-02 09:35 기준 데이터): "선풍기"/"노트북" 모두 이번 Top10에서 완전히 사라짐.
+  콘솔 에러 없음, 모바일 overflow 없음. "조희연 수영선수"(배재고 사건이 진화한 후속 인물) 상세 5건
+  전부 실제 관련 기사로 정상 노출 확인 — same-issue merge 회귀 징후 없음.
+
+### 후속 관찰 항목 (운영 모니터링, 코드 변경 아님)
+
+- 다음 2~3회 scheduled run에서 `news_top` 저장 개수가 계속 10개 미만(현재 8개)인지 확인한다.
+- **계속 8개 이하로 떨어지면** quality gate 완화가 아니라 **후보 pool 확장 또는 backfill 로직
+  개선**으로 별도 계획을 세운다(quality gate 자체를 낮추는 방향은 이번 개선의 목적과 상충하므로
+  1차 대응에서 제외).
+- 지금은 코드 수정 없이 운영 모니터링만 진행한다.
+
+## 0-3. 후속 개선 3차 — sense-mixing(중의적 키워드) 기사 혼입 방어 (완료, 2026-07-09)
+
+운영 화면에서 확인된 새로운 유형의 잔여 이슈: §0~§0-2가 다룬 "완전 무관 기사 혼입"(선풍기 증정,
+독일 축구/철학 등)과 달리, 짧고 애매한 keyword가 서로 다른 **의미**의 기사를 함께 흡수하는
+sense-mixing 문제.
+
+- 문제 사례: display "위홀 뜻" 아래 이효리/연애전쟁/워홀 커플/조언 기사(실제 이슈)와 앤디워홀/
+  미술관/대구/전시 기사(무관 동음이의 콘텐츠)가 함께 노출. "위홀"이라는 짧은 문자열이 두 의미
+  모두에 substring 토큰으로 매칭돼 relevance_score가 둘 다 높게 나오는 게 근본 원인. 검색의도
+  suffix("뜻"/"의미"/"누구" 등)가 붙은 raw keyword가 그대로 display로 노출되는 문제도 함께 확인.
+- PR: community-trend-crawler [#1](https://github.com/kskedu/community-trend-crawler/pull/1)
+  (squash merge, main 반영 커밋 `bf7236a`)
+- worktree: 별도 worktree(`fix/news-top-sense-mixing` 브랜치)에서 진행, merge 후 원격 브랜치 삭제
+- 수정 내용:
+  - `news/candidates.py` `mark_off_primary_sense()`(신규) — non-primary cluster 중 keyword/primary
+    어느 근거로도 "같은 의미"임을 확인할 수 없는 기사에 `is_off_primary_sense` 플래그 부여
+  - `_display_anchor_allowed()` 강화 — 위 플래그로 조기 차단(기존 단일 고유토큰 예외는 먼저
+    평가해 보존 — "장동건"류 정상 단일 인물명 케이스 회귀 방지)
+  - `news/ranker.py` 검색의도 suffix(뜻/의미/누구/프로필/나이/인스타/결혼/근황/학력/직업) display
+    방어 추가(어절 단위 정확 일치, substring 오탐 없음)
+  - `resolve_singleton_displays()`(신규) — merge 안 된 단독 keyword의 display를 표시 기사 공통
+    토큰 기반으로 재구성(vacuous 재구성 방지 조건 포함)
+  - `main.py` / `news/dryrun.py` 파이프라인에 `resolve_singleton_displays()` 호출 연결
+- Codex review-only 검증: 계획 리뷰 4회(설계 확정 과정에서 P1 지적 반영 — primary cluster 오염
+  자체는 이번 범위 밖으로 명시적 제외) + diff 리뷰 5회(P1 1건 + P2 3건 + P3 1건 순차 반영, 최종
+  No findings) + **PR 기준 최종 review-only 1회 추가**(merge 직전, 독립적으로 재검토)
+- 단위 테스트 244개 전체 통과(기존 232 + 신규 12, `TestSenseMixingDisplay`)
+- GitHub Actions workflow_dispatch 1회 실행(run id `28984705150`, `mode=news_top_only`, success,
+  약 11분 소요) → `news_top` 저장 10개(`sources=['naver_news','datalab','bing_home','daum_home',
+  'google_trends','nate_home']`)
+- 운영 화면 확인(StartHub, 검증용 별도 vercel dev 인스턴스 + Playwright): `.news-brief-row` 10건
+  정상 렌더, 콘솔 에러 없음, 모바일(375×812) overflow 없음. "위홀 뜻" 사례 자체는 이번 실행 데이터에
+  없었으나(특정 시점 데이터라 매 실행 재현 안 됨), 같은 로직이 "태풍"(무관 사극 기사 1건),
+  "꽃게"(등대주간 AR체험 기사 2건), "하이닉스 주가"(삼성전자 실적 비교 기사 2건),
+  "스마일게이트"(예술기업 투자 기사 2건) 등 실제 무관 기사 7건을 `is_off_primary_sense`로 정상
+  감지해 `display_articles`에서 제외함을 확인 — 로직이 운영 데이터에서 실효성 있게 작동.
+  PR/광고 클러스터, "신임"/"수사"/"투자" 단독 display, suffix 단독 display 노출 전부 없음.
+
+**남은 리스크(known limitation)**: keyword가 단일 토큰이고, non-primary cluster가 그 keyword와
+**동일한 문자열**을 공유하는 진짜 동음이의 케이스(예: keyword 원문 자체가 "워홀"이고 앤디워홀
+기사 원문도 정확히 "워홀"인 경우)에서는 sense-mixing이 남을 수 있다. 이번 PR 최종 검토에서
+규칙 기반 수정을 3가지 시도했으나 모두 "장동건"류 정상 단일 고유명사 케이스를 회귀시켜, 순수
+토큰 집합 비교만으로는 "같은 개체의 표현 차이"와 "동음이의 문자열"을 안정적으로 구분할 수 없음을
+확인하고 되돌렸다. 사용자가 제시한 실제 사례(keyword 원문 "위홀" vs 앤디워홀 원문 "워홀")는
+문자열 자체가 달라 이번 PR로 정상 방어된다. 근본 해결(select_primary_cluster 개선, 형태소
+분석/개체명 인식 도입)은 후속 이슈로 분리해 유지한다(닫지 않음):
+[#2](https://github.com/kskedu/community-trend-crawler/issues/2).
+
+### 후속 관찰 항목 (운영 모니터링, 코드 변경 아님)
+
+- 다음 2~3회 scheduled/workflow_dispatch run에서 sense-mixing(다른 의미 기사 혼입) 재발 여부를
+  운영 화면에서 관찰한다.
+- PR/광고성 클러스터 노출 여부, "신임"/"수사"/"투자" 등 generic 단독 display 노출 여부를 함께
+  관찰한다(이번 개선이 기존 방어를 약화시키지 않았는지 확인).
+- news_top Top10 유지 여부(개수 감소 없이 10개 유지되는지)를 확인한다 — off_primary_sense 필터가
+  과도하게 작동해 정상 기사까지 걸러내면 개수가 줄 수 있다.
+- 이상 징후가 지속되면 issue #2의 "근본 해결 방향" 섹션에 관찰 내용을 추가하고, 코드 수정이
+  필요한지는 별도 계획으로 판단한다. 지금은 코드 수정 없이 운영 모니터링만 진행한다.
 
 ## 1. 배경
 
