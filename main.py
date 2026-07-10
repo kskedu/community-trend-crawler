@@ -218,6 +218,16 @@ def _rank_and_select(candidates, signals, pass_name):
         logger.warning(
             "[news] %s: broad category singleton 관찰(제외 아님) %s", pass_name, broad_diags
         )
+    # 단일 토큰 keyword 동음이의 sense 탐지(issue #2 후속, 1차: logging first — 순수 관찰).
+    # "워홀"처럼 동일 문자열 토큰을 공유하는 다른 의미 클러스터(앤디 워홀 전시)의 표시
+    # 기사 혼입 가능성을 shadow로 탐지해 로그만 남긴다. 제외/강등/순위 변경 없음 —
+    # 반환값 top은 그대로 유지한다. 운영 로그로 오탐률/would_* 수치를 관찰한 뒤
+    # _display_anchor_allowed 단일 토큰 예외 자격 조건 소비를 별도 PR에서 판단한다.
+    homonym_diags = ranker.detect_homonym_entity_singletons(top)
+    if homonym_diags:
+        logger.warning(
+            "[news] %s: homonym entity sense 관찰(제외 아님) %s", pass_name, homonym_diags
+        )
     return top
 
 

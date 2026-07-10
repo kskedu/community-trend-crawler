@@ -113,6 +113,33 @@ sense-mixing 문제.
 분석/개체명 인식 도입)은 후속 이슈로 분리해 유지한다(닫지 않음):
 [#2](https://github.com/kskedu/community-trend-crawler/issues/2).
 
+### 후속 과제 — 단일 토큰 동음이의 sense 탐지 (1차 탐지 착수, 2026-07-10)
+
+상태: 1차 = logging first(탐지·로그만) 구현. display 소비(단일 토큰 예외 자격 조건
+강화)/primary 선택 보조 신호는 운영 로그 관찰 후 별도 PR로 분리.
+
+- 위 known limitation을 fixture로 재현해 실제 누수를 확인했다: keyword="워홀 뜻"/"워홀"에서
+  앤디워홀 클러스터 공통 토큰에 동일 문자열 "워홀"이 들어가 `mark_off_primary_sense`의
+  keyword 매칭이 same_sense로 오판하고(`off_primary_sense_count=0`), 앤디 기사도
+  relevance 0.9(keyword_main_topic)라 `_display_anchor_allowed`의 단일 토큰 예외(장동건류
+  보존, off-sense 체크보다 먼저 평가)까지 통과해 display_articles에 혼입된다.
+- 판별 신호는 토큰 집합이 아니라 **dominant collocation**: 앤디워홀 클러스터에서 "워홀"의
+  exact 토큰 등장은 전부 "앤디" 바로 뒤(합성 고유명의 일부)이고 partner("앤디")가 primary
+  기사에 미등장. "장동건"은 인접 토큰이 기사마다 달라 일관 partner가 없다(§0-4 prev-token
+  modifier와 같은 신호 계열).
+- 1차 구현: `ranker.detect_homonym_entity_singletons()`가 final(top)의 단일 토큰 core
+  후보에 대해 표시 기사 집합(실제 노출 파이프라인과 동일 산출)의 non-primary 묶음별
+  collocation partner(prev/next 양방향, 전 등장 일치+2회 이상+non-generic·비역할명+
+  primary 미등장, primary 등장 시 same-sense 증거로 클러스터 veto)를 shadow 탐지하고
+  `main._rank_and_select`가 로그만 남긴다. 진단에 `would_exclude_display_count`/
+  `would_drop_candidate_by_display_min`(후속 hard exclude 판단용)과 `primary_suspect`
+  (primary가 뒤집힌 케이스 관찰)를 포함한다. **final 결과/저장 payload 완전 불변**
+  (진단이 별도 리스트로만 존재 — article/news_meta 무오염, 테스트로 no-op 동치 및
+  builder payload 동일성 검증).
+- Codex 계획 review-only 3라운드: 1차 P1 3건(역할명 접두 오탐/next 미탐/primary 뒤집힘)
+  → logging-first 하향, 2차 P1 2건(payload 누출 경로/would_* 산출 위치) → 탐지를
+  ranker detect + final(top) 호출로 이동, 3차 P0/P1 없음("구현 진행 가능").
+
 ### 후속 관찰 항목 (운영 모니터링, 코드 변경 아님)
 
 - 다음 2~3회 scheduled/workflow_dispatch run에서 sense-mixing(다른 의미 기사 혼입) 재발 여부를

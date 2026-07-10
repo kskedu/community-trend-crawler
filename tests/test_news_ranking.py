@@ -3947,5 +3947,328 @@ class TestBroadCategorySingletonDetect(unittest.TestCase):
         self.assertEqual(top_real, top_noop)
 
 
+class TestHomonymEntitySingletonDetect(unittest.TestCase):
+    """단일 토큰 keyword 동음이의 sense 탐지 — 1차 logging first(issue #2 후속).
+
+    detect_homonym_entity_singletons는 탐지·진단만 반환하고 final 결과를 바꾸지 않는다.
+    "워홀"(연애 예능의 워킹홀리데이) keyword에 "앤디 워홀"(다른 개체의 합성 고유명 일부)
+    기사 클러스터가 혼입되는 케이스를 dominant collocation(전 등장 동일 인접 partner +
+    partner가 primary에 미등장)으로 shadow 탐지한다. "장동건"류 정상 단일 고유명사는
+    인접 토큰이 기사마다 달라 미발화한다.
+    """
+
+    @staticmethod
+    def _art(title, url, snippet="", primary=False):
+        # 표시 파이프라인(filter_articles_for_display → build_display_articles)을 실기사와
+        # 동일하게 통과하도록 relevance 메타를 부여한다. 단일 토큰 keyword의 non-primary
+        # 기사는 _display_anchor_allowed의 단일 토큰 예외 경로로 표시에 남는다(그 혼입이
+        # 이번 관찰 대상).
+        return {
+            "title": title, "url": url, "snippet": snippet, "press": "x",
+            "published_at": None, "thumbnail": None,
+            "relevance_score": 0.9, "relevance_reason": "keyword_main_topic",
+            "is_incidental": False, "is_primary_cluster": primary,
+        }
+
+    @staticmethod
+    def _item(keyword, articles, display=None, related=None):
+        item = {
+            "keyword": keyword,
+            "display_keyword": display if display is not None else keyword,
+            "news_meta": {"articles": articles},
+        }
+        if related:
+            item["related_keywords"] = related
+        return item
+
+    def _hyori_primary(self):
+        # primary(연애 예능 워홀 커플) — "워홀" 인접 토큰이 기사마다 다름.
+        return [
+            self._art("'연애전쟁' 이효리, 워홀 커플 조언", "https://x.com/h1",
+                      "이효리가 워킹홀리데이를 앞둔 커플에게 조언을 건넸다", primary=True),
+            self._art("'3년 차 커플' 결혼 vs 워홀 눈물의 파국", "https://x.com/h2",
+                      "결혼을 원하는 여자친구의 갈등이 공개됐다", primary=True),
+        ]
+
+    def _andy_cluster(self):
+        # 다른 의미(앤디 워홀 전시) — "워홀" exact 등장이 전부 "앤디" 바로 뒤.
+        # 두 기사가 cluster_articles(Jaccard 0.3)에서 한 묶음이 되도록 실기사처럼
+        # 공통 어휘(앤디/워홀/특별전/대구/미술관)를 충분히 공유시킨다.
+        return [
+            self._art("앤디 워홀 특별전, 대구 미술관 개막", "https://x.com/w1",
+                      "앤디 워홀 특별전 전시가 대구 미술관에서 열린다"),
+            self._art("대구 미술관 앤디 워홀 특별전 화제", "https://x.com/w2",
+                      "앤디 워홀 특별전 전시 작품을 대구 미술관에서 공개한다"),
+        ]
+
+    # ── positive: 동음이의 collocation shadow 탐지 ──
+    def test_warhol_suffix_keyword_shadow_detected(self):
+        # keyword="워홀 뜻"(1글자 suffix가 토큰화에서 빠져 core 단일 토큰 {워홀}).
+        item = self._item("워홀 뜻", self._hyori_primary() + self._andy_cluster())
+        diags = ranker.detect_homonym_entity_singletons([item])
+        self.assertEqual(len(diags), 1)
+        self.assertEqual(len(diags[0]["clusters"]), 1)
+        self.assertEqual(diags[0]["clusters"][0]["partner"], "앤디")
+        self.assertEqual(diags[0]["clusters"][0]["direction"], "prev")
+        self.assertEqual(diags[0]["would_exclude_display_count"], 2)
+        # 표시 4건 중 2건 제외돼도 2건 남음(>= DISPLAY_ARTICLES_MIN) → drop 아님.
+        self.assertFalse(diags[0]["would_drop_candidate_by_display_min"])
+
+    def test_warhol_alone_end_to_end_detected(self):
+        # keyword="워홀" 단독 — compute_news_signal 실제 경로(primary 선택/off-sense
+        # 판정 포함)로 흘려도 앤디워홀 클러스터가 shadow 탐지된다(issue #2 재현 fixture).
+        raw = [
+            {"title": "'연애전쟁' 이효리, 워홀 커플 조언", "originallink": "https://a.com/h1",
+             "description": "'연애전쟁' JTBC에서 이효리가 워킹홀리데이를 앞둔 커플에게 조언을 건넸다.",
+             "pubDate": None},
+            {"title": "'3년 차 커플' 결혼 vs 워홀..마지막 여행서 눈물의 파국[연애전쟁",
+             "originallink": "https://a.com/h2",
+             "description": "'연애전쟁'에서 결혼을 원하는 여자친구의 갈등이 공개됐다. JTBC 예능프로그램.",
+             "pubDate": None},
+            {"title": "친오빠 친구와 연애 시작했는데...\"18일 뒤 워홀 떠난다\" (연애전...",
+             "originallink": "https://a.com/h3",
+             "description": "JTBC '연애전쟁' 3회에서는 세 번째 협상 의뢰인으로 '워홀 커플'이 출연한다.",
+             "pubDate": None},
+            {"title": "앤디 워홀 특별전, 대구서 개막…미술관 전시 화제", "originallink": "https://a.com/w1",
+             "description": "앤디 워홀의 작품 세계를 조명하는 전시가 대구에서 열린다", "pubDate": None},
+            {"title": "대구문화예술회관, 7월 '미술관 라이브' 개최…앤디 워홀 특별전과 대구",
+             "originallink": "https://a.com/w2",
+             "description": "앤디 워홀 예술을 팔다 포스터 대구문화예술회관 대표 융합 미술 프로그램",
+             "pubDate": None},
+        ]
+        sig = cand.compute_news_signal("워홀", raw)
+        # 전제 확인: 현재 코드에서 앤디 기사는 off-sense로 못 걸러(동일 문자열 공유) 표시에 혼입.
+        arts = cand.filter_articles_for_display(sig["articles"], min_count=1)
+        disp = cand.build_display_articles("워홀", arts, sig["representative_article"])
+        self.assertTrue(any("앤디" in a["title"] for a in disp))
+        diags = ranker.detect_homonym_entity_singletons(
+            [{"keyword": "워홀", "display_keyword": "워홀", "news_meta": sig}]
+        )
+        self.assertEqual(len(diags), 1)
+        partners = [c["partner"] for c in diags[0]["clusters"]]
+        self.assertIn("앤디", partners)
+
+    def test_next_token_partner_detected(self):
+        # 후행(next) partner형 동음이의 — "소희 미술관"류(Codex 계획 리뷰 1차 P1 반영).
+        item = self._item("소희", [
+            self._art("소희 신곡 음원차트 1위", "https://x.com/s1", primary=True),
+            self._art("소희 컴백 무대 화제", "https://x.com/s2", primary=True),
+            # 두 기사가 한 클러스터로 묶이도록 공통 어휘(미술관/특별/기념전)를 공유.
+            self._art("소희 미술관 개관 특별 기념전 개최", "https://x.com/m1"),
+            self._art("소희 미술관 소장품 특별 기념전 공개", "https://x.com/m2"),
+        ])
+        diags = ranker.detect_homonym_entity_singletons([item])
+        self.assertEqual(len(diags), 1)
+        self.assertEqual(diags[0]["clusters"][0]["partner"], "미술관")
+        self.assertEqual(diags[0]["clusters"][0]["direction"], "next")
+
+    def test_would_drop_flag_when_remainder_below_min(self):
+        # primary 1건 + 동음이의 2건 → 제외 시 1건 남아 DISPLAY_ARTICLES_MIN 미만 → True.
+        item = self._item("워홀", self._hyori_primary()[:1] + self._andy_cluster())
+        diags = ranker.detect_homonym_entity_singletons([item])
+        self.assertEqual(len(diags), 1)
+        self.assertTrue(diags[0]["would_drop_candidate_by_display_min"])
+
+    def test_primary_suspect_observed_separately(self):
+        # primary 선택이 뒤집혀 동음이의 클러스터가 primary가 된 경우 — 별도 키로만 관찰.
+        item = self._item("워홀", [
+            self._art("앤디 워홀 특별전, 대구서 개막", "https://x.com/w1",
+                      "미술관 전시가 열린다", primary=True),
+            self._art("대구문화예술회관 앤디 워홀 특별전 화제", "https://x.com/w2",
+                      "작품 세계를 조명한다", primary=True),
+            self._art("'연애전쟁' 이효리, 워홀 커플 조언", "https://x.com/h1"),
+            self._art("'3년 차 커플' 결혼 vs 워홀 눈물의 파국", "https://x.com/h2"),
+        ])
+        diags = ranker.detect_homonym_entity_singletons([item])
+        self.assertEqual(len(diags), 1)
+        self.assertEqual(diags[0]["primary_suspect"], {"partner": "앤디", "direction": "prev"})
+        # non-primary(연애 예능) 쪽은 인접 토큰이 제각각이라 clusters로는 안 잡힌다.
+        self.assertEqual(diags[0]["clusters"], [])
+
+    # ── negative: 기존 방어/정상 케이스 미발화 ──
+    def test_wihol_existing_defense_untouched(self):
+        # 기존 실사례 "위홀 뜻"(keyword 위홀 ≠ 원문 워홀, 문자열 다름)은 off-sense 방어가
+        # 그대로 동작해 앤디 기사가 표시에서 이미 빠지고, shadow 탐지도 발화하지 않는다.
+        raw = [
+            {"title": "'연애전쟁' 이효리, 위홀 커플 조언", "originallink": "https://a.com/h1",
+             "description": "이효리가 워킹홀리데이를 앞둔 커플에게 조언을 건넸다.", "pubDate": None},
+            {"title": "\"18일 뒤 위홀 떠난다\" 커플의 눈물 (연애전쟁)", "originallink": "https://a.com/h2",
+             "description": "'연애전쟁'에서 '위홀 커플'이 출연해 갈등을 상담했다.", "pubDate": None},
+            {"title": "앤디 워홀 특별전, 대구서 개막…미술관 전시 화제", "originallink": "https://a.com/w1",
+             "description": "앤디 워홀의 작품 세계를 조명하는 전시가 대구에서 열린다", "pubDate": None},
+            {"title": "대구문화예술회관 앤디 워홀 특별전과 대구", "originallink": "https://a.com/w2",
+             "description": "앤디 워홀 예술을 팔다 포스터 대구문화예술회관", "pubDate": None},
+        ]
+        sig = cand.compute_news_signal("위홀 뜻", raw)
+        arts = cand.filter_articles_for_display(sig["articles"], min_count=1)
+        disp = cand.build_display_articles("위홀 뜻", arts, sig["representative_article"])
+        self.assertFalse(any("앤디" in a["title"] for a in disp))  # 기존 방어 유지
+        diags = ranker.detect_homonym_entity_singletons(
+            [{"keyword": "위홀 뜻", "display_keyword": "위홀 뜻", "news_meta": sig}]
+        )
+        self.assertEqual(diags, [])
+
+    def test_jangdonggun_normal_person_not_detected(self):
+        # 같은 인물의 다른 각도 기사(클러스터 분산) — 인접 토큰이 제각각이라 미발화.
+        raw = [
+            {"title": "노화 고백한 장동건, 급 '탱탱' 동안됐다", "originallink": "https://x.com/j1",
+             "description": "배우 장동건이 한층 어려진 비주얼로 등장했다", "pubDate": None},
+            {"title": "못 알아볼 뻔…장동건, 공식석상서 포착된 달라진 이미지", "originallink": "https://x.com/j2",
+             "description": "장동건이 공식 행사에서 달라진 모습을 보였다", "pubDate": None},
+            {"title": "54세 장동건, 못 알아볼 뻔한 바뀐 얼굴", "originallink": "https://x.com/j3",
+             "description": "장동건의 외모 변화가 화제다", "pubDate": None},
+            {"title": "중년 배우들 회춘…볼살 통통해진 장동건", "originallink": "https://x.com/j4",
+             "description": "황정민과 장동건 등 중년 배우들의 외모 변화가 눈길을 끈다", "pubDate": None},
+        ]
+        sig = cand.compute_news_signal("장동건", raw)
+        diags = ranker.detect_homonym_entity_singletons(
+            [{"keyword": "장동건", "display_keyword": "장동건", "news_meta": sig}]
+        )
+        self.assertEqual(diags, [])
+
+    def test_role_prefix_partner_not_detected(self):
+        # "배우 장동건" 역할명 접두가 일관 반복돼도 weak partner라 증거로 쓰지 않는다
+        # (Codex 계획 리뷰 1차 P1: 역할명 오탐 방어).
+        item = self._item("장동건", [
+            self._art("장동건 신작 영화 촬영 시작", "https://x.com/p1", primary=True),
+            self._art("장동건 인터뷰 공개", "https://x.com/p2", primary=True),
+            self._art("배우 장동건 근황 화제", "https://x.com/r1"),
+            self._art("배우 장동건 시상식 참석", "https://x.com/r2"),
+        ])
+        diags = ranker.detect_homonym_entity_singletons([item])
+        self.assertEqual(diags, [])
+
+    def test_partner_present_in_primary_not_detected(self):
+        # partner("앤디")가 primary 표시 기사에도 등장하면 같은 이슈의 표기 변형일 수
+        # 있어 증거로 쓰지 않는다.
+        item = self._item("워홀", [
+            self._art("워홀 준비 비자 신청 급증", "https://x.com/v1",
+                      "앤디 소속사 관계자도 워킹홀리데이를 언급했다", primary=True),
+            self._art("워홀 비자 발급 확대", "https://x.com/v2", primary=True),
+        ] + self._andy_cluster())
+        diags = ranker.detect_homonym_entity_singletons([item])
+        self.assertEqual(diags, [])
+
+    def test_single_occurrence_not_detected(self):
+        # exact 등장 1회뿐이면 "일관 반복"을 관측할 수 없어 보수적으로 미발화.
+        item = self._item("워홀", self._hyori_primary() + [
+            self._art("앤디 워홀 특별전, 대구서 개막", "https://x.com/w1"),
+        ])
+        diags = ranker.detect_homonym_entity_singletons([item])
+        self.assertEqual(diags, [])
+
+    def test_noise_prefix_partner_not_detected(self):
+        # partner가 주체 노이즈 접두("오늘" 등)면 증거로 쓰지 않는다.
+        item = self._item("워홀", self._hyori_primary() + [
+            self._art("오늘 워홀 비자 정책 발표", "https://x.com/n1"),
+            self._art("오늘 워홀 시행 확대 결정", "https://x.com/n2"),
+        ])
+        diags = ranker.detect_homonym_entity_singletons([item])
+        self.assertEqual(diags, [])
+
+    def test_normal_single_and_multi_token_keywords_not_detected(self):
+        # 정상 보존 케이스: 단일 토큰(태풍/스마일게이트)은 인접 불일치로 미발화,
+        # 다토큰(하이닉스 주가/홍석기 치안감/장윤정 엄마/월드컵 8강 대진표/박은영 셰프
+        # 신혼여행)은 core 단일 토큰 조건에서 애초에 대상이 아니다.
+        items = [
+            self._item("태풍", [
+                self._art("태풍 북상, 제주 강풍 특보", "https://t.com/1", primary=True),
+                self._art("태풍 경로 예측 남부 영향권", "https://t.com/2", primary=True),
+                self._art("전국 태풍 대비 점검", "https://t.com/3"),
+                self._art("항공편 태풍 결항 속출", "https://t.com/4"),
+            ]),
+            self._item("스마일게이트", [
+                self._art("스마일게이트 신작 공개", "https://s.com/1", primary=True),
+                self._art("스마일게이트 글로벌 진출 확대", "https://s.com/2", primary=True),
+                self._art("업계가 주목한 스마일게이트 전략", "https://s.com/3"),
+                self._art("인디게임 지원 나선 스마일게이트", "https://s.com/4"),
+            ]),
+            self._item("하이닉스 주가", [
+                self._art("하이닉스 주가 신고가", "https://h.com/1", primary=True),
+                self._art("하이닉스 주가 상승 지속", "https://h.com/2"),
+            ]),
+            self._item("홍석기 치안감", [
+                self._art("홍석기 치안감 임명", "https://g.com/1", primary=True),
+            ]),
+            self._item("장윤정 엄마", [
+                self._art("장윤정 엄마 근황", "https://y.com/1", primary=True),
+            ]),
+            self._item("월드컵 8강 대진표", [
+                self._art("월드컵 8강 대진표 확정", "https://w.com/1", primary=True),
+            ]),
+            self._item("박은영 셰프 신혼여행", [
+                self._art("박은영 셰프 신혼여행 공개", "https://p.com/1", primary=True),
+            ]),
+        ]
+        self.assertEqual(ranker.detect_homonym_entity_singletons(items), [])
+
+    def test_merge_group_not_detected(self):
+        # related_keywords 존재(merge group) → 1차 관찰 대상 아님.
+        item = self._item("워홀", self._hyori_primary() + self._andy_cluster(),
+                          related=["워홀 커플"])
+        self.assertEqual(ranker.detect_homonym_entity_singletons([item]), [])
+
+    # ── final 불변성 ──
+    def test_detect_does_not_mutate_input(self):
+        # detect는 입력 items/article dict/news_meta를 절대 변형하지 않는다(딥카피 동치).
+        import copy
+        item = self._item("워홀 뜻", self._hyori_primary() + self._andy_cluster())
+        before = copy.deepcopy(item)
+        ranker.detect_homonym_entity_singletons([item])
+        self.assertEqual(item, before)
+
+    def test_payload_unchanged_by_detect(self):
+        # builder 산출물(저장 payload의 keywords 부분)이 detect 실행 전후 동일해야 한다
+        # (Codex 계획 리뷰 2차 P1: shadow 필드가 articles/display_articles로 새면 안 됨).
+        import copy
+        item = self._item("워홀 뜻", self._hyori_primary() + self._andy_cluster())
+        item.update({"score": 0.9, "rank_reason": "", "source_breakdown": {},
+                     "sources": {"daum_home": 1}})
+        pristine = copy.deepcopy(item)
+        ranker.detect_homonym_entity_singletons([item])
+        issues_after = build_ranked_issues([item], {}, ["naver_news"])
+        issues_pristine = build_ranked_issues([pristine], {}, ["naver_news"])
+        self.assertEqual(issues_after["keywords"], issues_pristine["keywords"])
+
+    def test_rank_and_select_top_identical_with_and_without_detect(self):
+        # call-site 불변식: _rank_and_select의 homonym detect 호출은 로그 전용이라 top
+        # 전체 객체가 detect 유무와 무관하게 동일해야 한다(broad category 패턴 재사용).
+        # fixture는 relevance/primary 메타를 실기사처럼 채워 "워홀"이 display gate를
+        # 통과해 final에 남고 탐지가 실제로 발화하는 경로를 태운다(Codex diff 리뷰 P2:
+        # 후보가 final 전에 탈락하면 "진단 truthy일 때의 불변" 통합 검증이 비어버림).
+        def _cands():
+            return [
+                {"keyword": "워홀", "sources": {"daum_home": 1}},
+                {"keyword": "반도체 수출", "sources": {"nate_home": 1}},
+            ]
+
+        def _signals():
+            warhol_articles = (
+                [dict(a) for a in self._hyori_primary()]
+                + [dict(a) for a in self._andy_cluster()]
+            )
+            return {
+                "news": {
+                    "워홀": _news(3, 1, 2, 0.9, articles=warhol_articles),
+                    "반도체 수출": _news(3, 1, 2, 0.9, articles=[
+                        _article("반도체 수출 증가 발표", "https://x.com/b1"),
+                        _article("반도체 수출 호조 지속", "https://x.com/b2"),
+                    ]),
+                },
+                "datalab": {}, "google": {},
+            }
+
+        top_real = main_module._rank_and_select(_cands(), _signals(), "test")
+        # 전제 확인: "워홀"이 final에 생존했고, detect가 실제로 truthy 진단을 반환해
+        # _rank_and_select의 warning 분기를 탔다(로그 전용 분기 실경로 고정).
+        self.assertIn("워홀", [t["keyword"] for t in top_real])
+        diags = ranker.detect_homonym_entity_singletons(top_real)
+        self.assertTrue(diags)
+        self.assertEqual(diags[0]["clusters"][0]["partner"], "앤디")
+        with patch.object(ranker, "detect_homonym_entity_singletons", return_value=[]):
+            top_noop = main_module._rank_and_select(_cands(), _signals(), "test")
+        self.assertEqual(top_real, top_noop)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
