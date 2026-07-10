@@ -1469,6 +1469,208 @@ def detect_broad_category_singletons(items: List[Dict]) -> List[Dict]:
     return diagnostics
 
 
+# === 단일 토큰 keyword 동음이의(homonym entity) sense 탐지 — 1차: logging first (issue #2) ===
+# known limitation(issue #2): keyword core가 단일 토큰("워홀")이고 non-primary cluster가
+# **동일한 문자열 토큰**을 title/snippet에 포함하는 동음이의 케이스(앤디 워홀 전시 기사)는
+# mark_off_primary_sense의 keyword 매칭(common & kw_toks)이 same_sense로 오판하고,
+# _display_anchor_allowed의 단일 토큰 예외(장동건류 보존, off-sense 체크보다 먼저 평가)도
+# 통과해 display_articles에 혼입된다. PR #1에서 토큰 집합 기반 3가지 접근이 모두 "장동건"
+# 회귀 테스트를 깨뜨려(같은 개체의 표현 차이 vs 다른 개체의 동음이의를 집합만으로 구분
+# 불가) 이 잔여 리스크로 남았다.
+#
+# 판별 신호는 토큰 집합이 아니라 **dominant collocation**: 앤디워홀 클러스터에서 "워홀"의
+# exact 토큰 등장은 항상 "앤디" 바로 뒤(합성 고유명의 일부)이고 그 partner("앤디")는
+# primary cluster 기사에 전혀 등장하지 않는다. 반면 "장동건" 클러스터는 인접 토큰이
+# 기사마다 제각각이라 일관 partner가 없다(§0-4 prev-token modifier 보강과 같은 신호 계열).
+#
+# 이 1차 작업은 **탐지·로그만** 한다(제외/강등/순위 변경 없음). Codex 계획 review-only
+# 3라운드 결론: prev-token 일관성만으로 hard exclude하면 역할명 접두("배우 장동건")류
+# 오탐 위험이 있어, 먼저 관찰 로그로 운영 데이터를 쌓은 뒤 _display_anchor_allowed 단일
+# 토큰 예외의 자격 조건 소비(2차 PR)를 판단한다. 진단은 반환 리스트에만 존재하며 입력
+# items/article dict/news_meta에는 어떤 필드도 추가하지 않는다(builder 경유 저장 payload
+# 누출을 구조적으로 차단 — Codex 2차 계획 리뷰 P1).
+_HOMONYM_WEAK_PARTNER_WORDS = {
+    # 역할/직함 접두어 — 같은 인물 기사에서도 "배우 장동건"처럼 일관 반복될 수 있어
+    # 동음이의 partner 증거로 쓰지 않는다(Codex 계획 리뷰 1차 P1/2차 P2).
+    "배우", "가수", "의원", "감독", "대표", "회장", "장관", "총리", "대통령",
+    "선수", "코치", "작가", "셰프", "아나운서", "교수", "기자",
+}
+
+
+def _exact_token_occurrences(articles: List[Dict], kw_tok: str) -> List[tuple]:
+    """기사들의 title/snippet에서 kw_tok과 **exact 일치**하는 토큰 등장의 (prev, next)
+    인접 토큰 쌍 목록(등장 순서 유지, 문장 시작/끝이면 None).
+
+    exact 기준은 summarizer._tokens 결과 리스트(정규식 `[가-힣A-Za-z0-9]{2,}`, 문자
+    span 아님) — 조사 결합형("워홀의")/붙임형("앤디워홀전")은 별도 토큰이라 미집계한다
+    (관찰용 한계로 의도된 보수 처리, Codex 계획 리뷰 3차 P2. 영문 partner의 대소문자도
+    정규화하지 않는다 — 미집계/불일치는 "탐지 안 함" 방향이라 오탐보다 안전).
+    title과 snippet은 따로 토큰화한다(연결 경계에서 가짜 인접쌍이 생기는 것을 방지).
+    """
+    from news.summarizer import _tokens
+
+    occurrences = []
+    for a in articles:
+        for text in (a.get("title", "") or "", a.get("snippet", "") or ""):
+            toks = _tokens(text)
+            for i, t in enumerate(toks):
+                if t != kw_tok:
+                    continue
+                prev_tok = toks[i - 1] if i > 0 else None
+                next_tok = toks[i + 1] if i + 1 < len(toks) else None
+                occurrences.append((prev_tok, next_tok))
+    return occurrences
+
+
+def _consistent_collocation_partner(
+    occurrences: List[tuple], kw_tok: str, primary_tokens_cf: set
+) -> Optional[tuple]:
+    """모든 exact 등장에서 동일하게 인접하는 partner 토큰을 (partner, direction)으로
+    반환(prev 우선, 없으면 next — "앤디 워홀"형이 전형이라 prev를 먼저 본다). 조건:
+
+    - 등장 최소 2회(1회뿐이면 "일관 반복"을 관측할 수 없음 — 보수적 미탐).
+    - 전 등장에서 partner가 존재하고 동일(한 번이라도 없거나 다르면 실패).
+    - partner가 kw_tok 자신이 아니고, display 일반어/검색의도 suffix/주체 노이즈 접두/
+      역할명(_HOMONYM_WEAK_PARTNER_WORDS) 어디에도 속하지 않음.
+    - partner가 primary cluster 표시 기사 토큰(casefold)에 미등장 — exact 토큰 기준
+      (Codex 3차 P2: prev/next 판정과 동일하게 _tokens exact로 일관).
+    기각 사유에 따라 동작이 다르다:
+    - partner가 primary에 등장 → 같은 이슈(같은 개체의 표기 변형)라는 **적극적 증거**
+      이므로 다른 방향을 더 보지 않고 클러스터 전체를 즉시 None(veto). 한 방향이
+      same-sense 증거를 보이는데 다른 방향 partner로 탐지하면 정밀도가 무너진다.
+    - generic/역할명/불일치 기각 → 증거가 "없는" 것뿐이므로 다음 방향을 계속 본다.
+    조건 미달 시 None — "확신 없으면 탐지 안 함" 원칙(관찰 로그의 정밀도 우선).
+    """
+    if len(occurrences) < 2:
+        return None
+    excluded = (
+        _all_display_generic() | _SEARCH_INTENT_SUFFIXES
+        | _SUBJECT_NOISE_PREFIXES | _HOMONYM_WEAK_PARTNER_WORDS
+    )
+    for direction, idx in (("prev", 0), ("next", 1)):
+        partners = {o[idx] for o in occurrences}
+        if len(partners) != 1:
+            continue
+        partner = next(iter(partners))
+        if not partner or partner == kw_tok or partner in excluded:
+            continue
+        if partner.casefold() in primary_tokens_cf:
+            return None  # same-sense 적극적 증거 → 클러스터 전체 veto
+        return partner, direction
+    return None
+
+
+def detect_homonym_entity_singletons(items: List[Dict]) -> List[Dict]:
+    """단일 토큰 core keyword의 동음이의 혼입 후보를 **탐지만** 한다(제외/강등/순위
+    변경 없음 — detect_broad_category_singletons와 동일한 logging-first 구조).
+
+    반환값은 관찰용 진단 리스트로, 호출부(main.py)는 로그로만 남기고 파이프라인 결과에는
+    절대 반영하지 않는다. 입력 items를 mutate하지 않으며 article/news_meta에 어떤 필드도
+    추가하지 않는다. 대상 판정(모두 만족):
+    - related_keywords 없음(merge group 동음이의는 이번 관찰 대상에서 제외 — 1차 범위,
+      Codex 3차 P3).
+    - keyword core가 단일 토큰(_tokens 기준 1개 — "워홀 뜻"은 1글자 suffix "뜻"이
+      토큰화에서 빠져 {워홀} 하나만 남으므로 대상에 포함).
+
+    표시 기사 집합은 실제 노출 파이프라인과 동일하게 산출한다(dedup →
+    filter_articles_for_display → [:ARTICLES_MAX] → build_display_articles, effective
+    keyword = display_keyword). would_* 진단값이 exclude_insufficient_display_articles와
+    같은 입력 기준이 되도록 final(top) 단계에서 호출한다(Codex 2차 계획 리뷰 P1).
+
+    표시 기사 중 non-primary(is_primary_cluster=False — compute_news_signal 당시 판정을
+    그대로 신뢰)를 cluster_articles로 재군집하는데, 이 재군집은 원래 primary cluster
+    재판정이 아니라 "표시된 non-primary 기사 안의 의미 묶음"을 shadow 진단하기 위한
+    보조 단계다(Codex 3차 P2). 각 묶음의 dominant collocation partner가 확인되면 진단에
+    담는다. primary 표시 기사가 없으면(baseline 부재) 판정 불가로 skip.
+
+    진단 dict 필드:
+    - keyword/display_keyword/displayed_articles(표시 기사 수)
+    - clusters: [{partner, direction, articles, exact_occurrences}] — 탐지된 shadow 묶음
+    - would_exclude_display_count: 탐지 묶음 기사 합(후속 hard exclude 시 빠질 표시 기사
+      수, candidate 누적 기준 — Codex 3차 P2: 묶음별로 따로 보면 누적 drop을 과소평가)
+    - would_drop_candidate_by_display_min: 그 결과 표시 기사가 DISPLAY_ARTICLES_MIN
+      미만이 되어 후보 자체가 drop됐을지(bool)
+    - primary_suspect: primary cluster 기사에도 같은 collocation 판정을 적용한 결과
+      ({partner, direction} | None). primary 선택이 뒤집혀 동음이의가 primary가 된
+      경우를 관찰하기 위한 별도 키(차단 후보 목록이 아님 — Codex 1차 P1-3/3차 P3).
+    """
+    from news.summarizer import _tokens
+    from news.dedup import dedup_articles
+    from news.candidates import (
+        build_display_articles, cluster_articles, filter_articles_for_display,
+    )
+    from news.builder import ARTICLES_MIN, ARTICLES_MAX
+
+    diagnostics: List[Dict] = []
+    for item in items:
+        if item.get("related_keywords"):
+            continue  # merge group은 1차 관찰 대상 아님
+        kw = (item.get("keyword", "") or "").strip()
+        kw_toks = _tokens(kw)
+        if len(kw_toks) != 1:
+            continue
+        kw_tok = kw_toks[0]
+
+        news_meta = item.get("news_meta") or {}
+        effective_keyword = item.get("display_keyword") or kw
+        filtered = filter_articles_for_display(
+            dedup_articles(news_meta.get("articles") or []), min_count=ARTICLES_MIN
+        )[:ARTICLES_MAX]
+        displayed = build_display_articles(
+            effective_keyword, filtered, news_meta.get("representative_article")
+        )
+
+        primary = [a for a in displayed if a.get("is_primary_cluster")]
+        non_primary = [a for a in displayed if not a.get("is_primary_cluster")]
+        if not primary or not non_primary:
+            continue  # baseline(primary 표시 기사) 또는 관찰 대상이 없으면 판정 불가
+
+        primary_tokens_cf: set = set()
+        for a in primary:
+            primary_tokens_cf |= {
+                t.casefold()
+                for t in _tokens(f"{a.get('title', '')} {a.get('snippet', '')}")
+            }
+
+        clusters_found: List[Dict] = []
+        for cluster in cluster_articles(non_primary):
+            occurrences = _exact_token_occurrences(cluster, kw_tok)
+            found = _consistent_collocation_partner(occurrences, kw_tok, primary_tokens_cf)
+            if found:
+                partner, direction = found
+                clusters_found.append({
+                    "partner": partner,
+                    "direction": direction,
+                    "articles": len(cluster),
+                    "exact_occurrences": len(occurrences),
+                })
+
+        primary_suspect = None
+        found_primary = _consistent_collocation_partner(
+            # primary 자신과의 미등장 비교는 성립하지 않으므로 빈 집합을 넘긴다.
+            _exact_token_occurrences(primary, kw_tok), kw_tok, frozenset()
+        )
+        if found_primary:
+            primary_suspect = {"partner": found_primary[0], "direction": found_primary[1]}
+
+        if not clusters_found and primary_suspect is None:
+            continue
+
+        would_exclude = sum(c["articles"] for c in clusters_found)
+        diagnostics.append({
+            "keyword": kw,
+            "display_keyword": effective_keyword,
+            "displayed_articles": len(displayed),
+            "clusters": clusters_found,
+            "would_exclude_display_count": would_exclude,
+            "would_drop_candidate_by_display_min": (
+                len(displayed) - would_exclude
+            ) < DISPLAY_ARTICLES_MIN,
+            "primary_suspect": primary_suspect,
+        })
+    return diagnostics
+
+
 # === PR/광고성 클러스터 hard exclude (문제 B) ===
 COMMERCIAL_PR_RATIO_THRESHOLD = 0.6
 PR_MIN_ARTICLES = 2  # 순수 PR 판정에 필요한 최소 PR 기사 수(단건 stray 마커 노이즈 방어)
