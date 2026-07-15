@@ -30,11 +30,22 @@ SUMMARY_MAX = 120
 #
 # 대표기사 생성 조건(명시):
 #   1) 대표 자격 기사(evidence, _evidence_articles 참조)가 2건 이상이고
-#   2) 키워드 자체/파생형·날짜·일반어를 제외한 잔여 공통 토큰 중
-#   3) evidence의 "엄격한 과반"(n//2+1)에서 반복 등장하는 토큰(= 하위주제 토큰)이
+#   2) 키워드 자체/파생형·날짜·일반어를 제외한 잔여 토큰 중
+#   3) 최소 2개 기사에서 반복 등장하는 토큰(= 하위주제 토큰)이
 #   4) _SUBTOPIC_MIN_TOKENS(2)개 이상일 때만
 # 대표를 선정한다. 미달이면 ("", "no_representative") — summary를 특정 기사
 # title로 채우지 않는다(홈은 문구 숨김, 팝업은 기사 목록만 유지).
+#
+# "과반" 요구는 쓰지 않는다(2026-07-15 운영 실데이터 검증). 초기 구현은 엄격한
+# 과반(n//2+1)을 요구했으나, 운영 news_top 10건에 적용해 보니 5건(홈플러스,
+# 프랑스 스페인, 호프 영화, 김민하, 제헌절)이 억제됐다 — 기사 5~8건에서 특정
+# 토큰이 3~5건에 반복되기를 요구하면, 같은 사건이라도 매체별 표현이 갈려
+# (제목엔 "2000억", 다른 기사엔 "메리츠") 과반을 못 넘는 것이 정상이기 때문이다.
+# 반면 "키워드·날짜·일반어를 뺀 뒤 2개 이상 기사가 2개 이상 토큰을 공유하는가"만
+# 봐도 초복(잔여 토큰 {삼계탕} 1개뿐)은 정확히 억제되고 운영 10건은 모두 유지된다
+# (여유 폭: 최소 5토큰 ~ 최대 46토큰). 실제 사건을 공유하는 기사는 고유명사·기관·
+# 인물을 여러 개 함께 반복하지만, broad 키워드는 세시풍속 소품 하나만 겹친다.
+_SUBTOPIC_MIN_DF = 2          # 하위주제 토큰으로 인정할 최소 문서빈도(반복 관측)
 _SUBTOPIC_MIN_TOKENS = 2      # 하위주제로 인정할 최소 토큰 수
 _NUMERIC_LEAD_RE = re.compile(r"^\d")  # "15일"/"37"처럼 숫자로 시작하는 토큰(날짜·수치)
 
@@ -44,8 +55,9 @@ _NUMERIC_LEAD_RE = re.compile(r"^\d")  # "15일"/"37"처럼 숫자로 시작하�
 # 가 같은 이유로 토큰 집계를 복제한 것과 동일한 선례). 한쪽을 바꾸면 다른 쪽도 함께 본다.
 _EVIDENCE_MIN_RELEVANCE = 0.5
 
-# 기사 간 공통 사건을 식별하지 못하는 일반 서술어/행사어 최소셋. 과반 임계가 대부분을
-# 걸러내므로 사전을 키우지 않는다(fixture 과적합·유지보수 위험).
+# 기사 간 공통 사건을 식별하지 못하는 일반 서술어/행사어 최소셋. 이 집합에 의존해 사전을
+# 키우지 않는다(fixture 과적합·유지보수 위험) — 판정의 주력은 "키워드·날짜를 제외한 뒤에도
+# 2개 이상 토큰이 2개 이상 기사에서 반복되는가"이고, 이 집합은 그 보조다.
 _SUBTOPIC_GENERIC_TOKENS = {
     "맞아", "맞이", "지역", "행사", "진행", "참석", "개최", "실시", "예정",
     "이날", "당일", "하루", "어제", "내일", "전국", "각각", "일부",
@@ -70,10 +82,11 @@ def _evidence_articles(articles: List[dict]) -> List[dict]:
     """하위주제 근거로 쓸 기사만 남긴다 — 대표 기사 자격이 없는 기사는 제외.
 
     builder는 summarize() 호출 전에 filter_articles_for_display(min_count=ARTICLES_MIN)로
-    "관련 기사가 부족하면 저관련/incidental 기사를 하한까지 보충"한다. 이 보충분을 과반
-    분모에 넣으면, 동일 사건 기사 2건 + 보충 3건인 정상 키워드가 need=3이 되어 대표가
-    억울하게 억제된다(Codex review-only P1, 2026-07-15). 보충된 기사도 is_incidental/
-    relevance_score 필드를 그대로 유지하므로 여기서 식별해 분모에서 뺀다.
+    "관련 기사가 부족하면 저관련/incidental 기사를 하한까지 보충"한다. 이 보충분을 근거
+    집계에 넣으면 무관 기사의 토큰이 하위주제로 오인되거나(보충 기사끼리 공유하는 매체
+    boilerplate 등), 보충 기사가 대표로 뽑힐 수 있다(Codex review-only P1, 2026-07-15 —
+    실제로 훼손 시 summary가 '무관 기사 0'이 됐다). 보충된 기사도 is_incidental/
+    relevance_score 필드를 그대로 유지하므로 여기서 식별해 제외한다.
     표시용 목록(display_articles)은 건드리지 않는다 — 근거 집계에서만 제외한다.
 
     자격 기준은 candidates.select_representative/build_representative_summary와 동일하게
@@ -98,10 +111,10 @@ def _evidence_articles(articles: List[dict]) -> List[dict]:
 def subtopic_tokens(keyword: str, articles: List[dict]) -> Set[str]:
     """기사들이 공유하는 "하위주제 토큰" 집합.
 
-    키워드 자체(및 파생형), 날짜/수치, 일반 서술어를 제외하고 과반 기사에서
+    키워드 자체(및 파생형), 날짜/수치, 일반 서술어를 제외하고 2개 이상 기사에서
     반복 등장하는 토큰만 남긴다. 비어 있으면 "키워드 말고는 공통점이 없다"는 뜻.
 
-    과반 분모는 incidental 보충분을 뺀 "근거 기사"(_evidence_articles) 기준이다.
+    집계 대상은 incidental/저관련 보충분을 뺀 "근거 기사"(_evidence_articles)다.
 
     keyword가 빈 문자열이면 키워드 제외를 적용하지 않는다 — substring 검사에서
     ""가 모든 토큰에 매칭돼 전부 지워지는 것을 막는다(빈 키워드 호출은
@@ -120,12 +133,10 @@ def subtopic_tokens(keyword: str, articles: List[dict]) -> Set[str]:
         low = tok.lower()
         return any(k in low for k in kw_tokens)
 
-    need = len(articles) // 2 + 1  # 엄격한 과반(n=6 → 4). ceil(n/2)는 과반이 아니다.
     return {
         tok
         for tok, df in _document_freq(articles).items()
-        if df >= need
-        and df >= 2                       # 반복 관측(최소 2개 기사) 없으면 근거 아님
+        if df >= _SUBTOPIC_MIN_DF          # 반복 관측(최소 2개 기사) 없으면 근거 아님
         and not _is_keyword_derived(tok)
         and not _NUMERIC_LEAD_RE.match(tok)
         and tok not in _SUBTOPIC_GENERIC_TOKENS

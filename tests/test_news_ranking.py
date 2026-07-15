@@ -4319,9 +4319,15 @@ class TestBroadKeywordRepresentative(unittest.TestCase):
         for a in self.CHOBOK:
             self.assertNotEqual(summary, a["title"])
 
-    def test_broad_keyword_subtopic_tokens_empty(self):
-        # 키워드/파생형/날짜/일반어를 빼면 과반 공유 토큰이 남지 않는다.
-        self.assertEqual(cand_summarizer.subtopic_tokens("초복", self.CHOBOK), set())
+    def test_broad_keyword_subtopic_tokens_below_threshold(self):
+        # 키워드/파생형/날짜/일반어를 빼면 남는 공유 토큰은 세시풍속 소품 {삼계탕}
+        # 하나뿐 — 공통 "사건"의 증거가 아니므로 임계(2) 미만이어야 한다.
+        tokens = cand_summarizer.subtopic_tokens("초복", self.CHOBOK)
+        self.assertLess(len(tokens), 2)
+        self.assertNotIn("초복", tokens)      # 키워드 자신
+        self.assertNotIn("초복맞이", tokens)  # 파생형
+        self.assertNotIn("15일", tokens)      # 날짜
+        self.assertNotIn("맞아", tokens)      # 일반 서술어
 
     # --- 동일 사건: 기존 동작 회귀 ---
 
@@ -4338,7 +4344,7 @@ class TestBroadKeywordRepresentative(unittest.TestCase):
         self.assertTrue(summary)
 
     def test_same_event_survives_one_unrelated_article(self):
-        # 과반 기준이라 무관 기사 1건이 섞여도 대표가 유지된다.
+        # 무관 기사 1건이 섞여도 동일 사건 토큰이 반복되므로 대표가 유지된다.
         mixed = self.SAME_EVENT + [_article("폭염 특보 확대", "https://x.com/u1",
                                             "기상청은 전국에 폭염 특보를 확대 발효했다.")]
         _, summary_type = summarize("민경욱", mixed)
@@ -4346,16 +4352,55 @@ class TestBroadKeywordRepresentative(unittest.TestCase):
 
     # --- 경계/함정 (Codex review-only P2) ---
 
-    def test_two_plus_two_split_events_has_no_representative(self):
-        # 2+2로 갈린 서로 다른 사건 — 어느 쪽도 과반이 아니므로 대표 없음.
+    def test_real_world_same_event_keywords_keep_representative(self):
+        # 운영 news_top 실데이터 회귀(2026-07-15). 초기 구현은 "엄격한 과반" 임계를
+        # 요구했는데, 운영 10건에 적용해 보니 5건이 억제됐다 — 같은 사건이라도 매체별
+        # 표현이 갈리면(제목엔 "2000억", 다른 기사엔 "메리츠") 과반을 못 넘는 게 정상.
+        # 아래는 그때 억제됐던 실제 키워드들의 축약본이다. 과반 요구가 되살아나면 깨진다.
+        homeplus = [
+            _article("파산 위기 홈플러스, 2000억 긴급자금 확보…MBK·메리츠 잠정 합의",
+                     "https://x.com/h1", "홈플러스가 메리츠금융그룹과 2000억원 긴급자금 잠정 합의에 이르렀다."),
+            _article("홈플러스 2000억 ‘긴급 수혈’", "https://x.com/h2",
+                     "메리츠금융그룹이 홈플러스에 2000억원을 대출하는 방안을 잠정 합의했다."),
+            _article("홈플러스 극적 회생?…메리츠 내일 2천억 원 대출 재논의", "https://x.com/h3",
+                     "메리츠가 홈플러스 긴급자금 대출을 재논의한다. MBK파트너스와의 협의도 이어진다."),
+            _article("홈플러스 폐점 후폭풍…도심 속 애물단지되나?", "https://x.com/h4",
+                     "폐점 이후 빈 점포 활용 문제가 남았다."),
+        ]
+        _, summary_type = summarize("홈플러스", homeplus)
+        self.assertEqual(summary_type, "rule")
+
+        # 5건 중 '결승' 등 소수 토큰만 공유하는 경기 기사 — 과반 임계에선 억제됐다.
+        match = [
+            _article("무적함대 스페인, 16년 만에 결승 진출", "https://x.com/m1",
+                     "스페인이 프랑스를 꺾고 16년 만에 월드컵 결승에 올랐다."),
+            _article("전술·기술 다 밀렸다…스페인에 무릎 꿇은 프랑스", "https://x.com/m2",
+                     "프랑스는 스페인에 완패하며 결승 진출이 좌절됐다."),
+            _article("음바페 지운 스페인 협력 수비…‘무적 함대’의 힘", "https://x.com/m3",
+                     "스페인의 협력 수비가 음바페를 지웠다. 월드컵 결승 진출의 원동력."),
+        ]
+        _, summary_type = summarize("프랑스 스페인", match)
+        self.assertEqual(summary_type, "rule")
+
+    def test_two_plus_two_split_events_picks_evidenced_cluster(self):
+        # 알려진 한계(2026-07-15): 2+2로 갈린 서로 다른 사건에서는 대표가 생성되고,
+        # 근거 토큰을 더 많이 담은 클러스터의 기사가 대표가 된다.
+        #
+        # "과반" 임계를 쓰면 이 케이스도 억제할 수 있지만, 운영 실데이터 10건 중
+        # 5건(홈플러스/프랑스 스페인/호프 영화/김민하/제헌절)이 함께 억제되는 대가를
+        # 치른다 — 같은 사건도 매체별 표현이 갈리면 과반을 못 넘기 때문이다. 이번
+        # 작업의 대상은 "공통 사건이 아예 없는" broad 키워드(초복)이고, 2+2는 공통
+        # 사건이 둘 존재하는 다른 문제다. 실데이터 회귀를 감수하면서까지 닫지 않는다.
         split = [
             _article("A시, 신청사 착공식 개최", "https://x.com/p1", "A시가 신청사 착공식을 열었다."),
             _article("A시 신청사 착공 본격화", "https://x.com/p2", "A시 신청사 착공이 본격화됐다."),
             _article("B사, 신형 전기차 공개", "https://x.com/p3", "B사가 신형 전기차를 공개했다."),
             _article("B사 전기차 사전계약 시작", "https://x.com/p4", "B사 전기차 사전계약이 시작됐다."),
         ]
-        _, summary_type = summarize("공개", split)
-        self.assertEqual(summary_type, "no_representative")
+        summary, summary_type = summarize("공개", split)
+        self.assertEqual(summary_type, "rule")
+        # 임의 기사가 아니라 실제 반복 토큰을 담은 기사가 선택된다.
+        self.assertIn(summary, [a["title"] for a in split])
 
     def test_snippet_only_boilerplate_has_no_representative(self):
         # 매체 boilerplate가 snippet에만 반복되는 경우 — 사건 증거가 아니다.
@@ -4422,8 +4467,8 @@ class TestBroadKeywordRepresentative(unittest.TestCase):
     def test_builder_backfilled_incidentals_do_not_suppress_representative(self):
         # Codex review-only P1(2026-07-15): builder는 summarize() 전에
         # filter_articles_for_display(min_count=5)로 저관련/incidental 기사를 하한까지
-        # 보충한다. 이 보충분이 과반 분모에 들어가면 "동일 사건 2건 + 보충 3건"인
-        # 정상 키워드가 need=3이 되어 대표가 억울하게 억제된다.
+        # 보충한다. 이 보충분이 근거 집계에 들어가면 보충 기사가 대표로 뽑히거나
+        # 그들끼리의 공통 토큰이 하위주제로 오인된다(훼손 시 summary='무관 기사 0').
         related = [
             dict(a, relevance_score=0.9, relevance_reason="keyword_main_topic",
                  is_incidental=False)
@@ -4449,8 +4494,8 @@ class TestBroadKeywordRepresentative(unittest.TestCase):
 
     def test_low_relevance_articles_excluded_from_evidence(self):
         # Codex review-only P1(2차): is_incidental=False여도 relevance_score가 대표
-        # 자격(0.5) 미만인 object-side 기사는 과반 분모에서 빠져야 한다. 그렇지 않으면
-        # 동일 사건 2건 + 저관련 3건에서 need=3이 되어 정상 대표가 억제된다.
+        # 자격(0.5) 미만인 object-side 기사는 근거 집계에서 빠져야 한다 — 그렇지 않으면
+        # 저관련 기사가 대표로 뽑히거나 그 토큰이 하위주제로 오인된다.
         related = [
             dict(a, relevance_score=0.9, relevance_reason="keyword_main_topic",
                  is_incidental=False)
@@ -4489,18 +4534,11 @@ class TestBroadKeywordRepresentative(unittest.TestCase):
                  is_incidental=False, is_primary_cluster=True)
             for a in self.CHOBOK
         ]
-        rep_article = {"title": "보은군, 민관 협력으로 초복 맞이 삼계탕 나눔 행사 성황리 진행"}
-        anchored = dict(
-            _article("보은군 삼계탕 나눔 행사에 지역 후원회 동참", "https://x.com/a1",
-                     "보은군 삼계탕 나눔 행사가 이어졌다."),
-            relevance_score=0.8, relevance_reason="keyword_main_topic",
-            is_incidental=False, is_primary_cluster=False,
-        )
-        articles = primary + [anchored]
         ranked_item = {
             "keyword": "초복", "score": 0.7,
             "source_breakdown": {"news": 0.7}, "rank_reason": "",
-            "news_meta": {"articles": articles, "representative_article": rep_article},
+            "news_meta": {"articles": primary,
+                          "representative_article": {"title": primary[1]["title"]}},
             "used_signals": ["news"],
             "display_keyword": "초복",
             "sources": {"daum_home": 1},
@@ -4508,12 +4546,44 @@ class TestBroadKeywordRepresentative(unittest.TestCase):
         entry = build_ranked_entry(1, ranked_item)
         self.assertEqual(entry["summary_type"], "no_representative")
         self.assertIsNone(entry["representative_article"])
-        # anchor로만 살아남는 non-primary 기사가 목록에 남아 있어야 한다 —
-        # 대표를 안 뽑는 것과 기사를 숨기는 것은 다르다.
+        # 대표를 안 뽑는 것과 기사를 숨기는 것은 다르다 — 목록은 그대로.
         titles = [a["title"] for a in entry["display_articles"]]
-        self.assertIn(anchored["title"], titles)
         for a in primary:
             self.assertIn(a["title"], titles)
+
+    def test_builder_passes_representative_anchor_to_display_filter(self):
+        # builder는 representative_article을 출력 JSON에서만 비우고
+        # build_display_articles에는 계속 넘겨야 한다. anchor를 끊으면 primary cluster
+        # 밖 기사가 연관성 재확인을 통과하지 못해 팝업 목록이 바뀐다.
+        #
+        # 초복 fixture로는 이 검증이 불가능하다 — anchor 검사를 통과할 만큼 대표와
+        # 겹치는 기사는 필연적으로 두 번째 공유 토큰을 만들어 게이트를 rule로 뒤집는다.
+        # 그래서 대표가 정상 생성되는 동일 사건 키워드로 anchor 전달 자체를 검증한다.
+        primary = [
+            dict(a, relevance_score=0.9, relevance_reason="keyword_main_topic",
+                 is_incidental=False, is_primary_cluster=True)
+            for a in self.SAME_EVENT
+        ]
+        # non-primary이며 keyword 토큰이 1개(=단일 토큰 조건 미달)라, 대표 title과의
+        # 토큰 overlap(_display_anchor_allowed)으로만 목록에 남는 기사.
+        anchored = dict(
+            _article("의식 불명 상태로 병원 이송된 전 의원 근황", "https://x.com/a9",
+                     "자택에서 발견돼 병원으로 이송된 전 의원의 치료가 이어지고 있다."),
+            relevance_score=0.8, relevance_reason="keyword_main_topic",
+            is_incidental=False, is_primary_cluster=False,
+        )
+        ranked_item = {
+            "keyword": "민경욱", "score": 0.7,
+            "source_breakdown": {"news": 0.7}, "rank_reason": "",
+            "news_meta": {"articles": primary + [anchored],
+                          "representative_article": {"title": primary[0]["title"]}},
+            "used_signals": ["news"],
+            "display_keyword": "민경욱",
+            "sources": {"daum_home": 1},
+        }
+        entry = build_ranked_entry(1, ranked_item)
+        titles = [a["title"] for a in entry["display_articles"]]
+        self.assertIn(anchored["title"], titles)
 
     def test_builder_same_event_keeps_representative_fields(self):
         # 회귀: 동일 사건 키워드는 기존대로 대표 필드가 살아 있어야 한다.
