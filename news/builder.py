@@ -38,7 +38,7 @@ def build_keyword_entry(
         "rank": rank,
         "keyword": keyword,
         "summary": summary,
-        "summary_type": summary_type,  # rule | title | seed_only
+        "summary_type": summary_type,  # rule | title | seed_only | no_representative
         "signals": {
             "news": has_news,
             "trend": False,  # P0: 데이터랩 미사용
@@ -95,11 +95,28 @@ def build_ranked_entry(
     # representative_summary → representative_title → summarize() 결과(article title fallback) 순.
     representative_summary = news_meta.get("representative_summary")
     representative_title = news_meta.get("representative_title")
+
+    # broad/generic 키워드 방어(2026-07-15): 기사 간 공통 하위주제가 없어 대표를 뽑지
+    # 않기로 한 키워드는, summary뿐 아니라 노출되는 대표 관련 필드도 모두 비운다.
+    # 그렇지 않으면 summary만 비고 news_meta의 representative_*가 그대로 남아 상세
+    # 팝업이 여전히 특정 기사를 "대표"로 간주한다(요구사항: 어느 한 기사도 대표로
+    # 선택되지 않음). articles/display_articles(관련 기사 목록)와 랭킹 신호는 유지한다.
+    no_representative = summary_type == "no_representative"
+    if no_representative:
+        representative_summary = None
+        representative_title = None
+
     breakdown = ranked_item.get("source_breakdown") or {}
 
     # display_articles(2026-07-04): 상세 팝업 노출 전용 — articles(랭킹/게이트 근거)는 그대로
     # 두고, display_keyword(merge 후 최종 표기) 기준으로 한 번 더 걸러낸다. 같은 keyword의
     # 일반어 토큰(예: "공유")만 겹치는 무관 기사가 상세 팝업에 섞이는 것을 방지한다.
+    #
+    # no_representative여도 여기엔 representative_article을 그대로 넘긴다.
+    # build_display_articles는 이 값을 "대표 표기"가 아니라 primary cluster 밖 기사의
+    # 연관성 재확인(_display_anchor_allowed) 기준으로만 쓴다. None을 넘기면 그 앵커
+    # 검사가 무력화돼 팝업 기사 목록 자체가 바뀐다(요구사항: 목록은 그대로 유지).
+    # 노출용 representative_article 필드만 아래 return에서 비운다.
     effective_keyword = ranked_item.get("display_keyword") or keyword
     display_articles = build_display_articles(
         effective_keyword, articles, news_meta.get("representative_article")
@@ -135,7 +152,7 @@ def build_ranked_entry(
         "merge_reason": ranked_item.get("merge_reason"),
         "representative_title": representative_title,
         "representative_summary": representative_summary,
-        "representative_article": news_meta.get("representative_article"),
+        "representative_article": None if no_representative else news_meta.get("representative_article"),
         "primary_cluster_size": news_meta.get("primary_cluster_size"),
         "topic_coherence": news_meta.get("topic_coherence"),
     }

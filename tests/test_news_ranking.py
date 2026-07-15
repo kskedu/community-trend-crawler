@@ -20,6 +20,8 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from news import ranker, candidates as cand, datalab, google, normalizer
+from news import summarizer as cand_summarizer
+from news.summarizer import summarize
 from news.builder import build_ranked_issues, build_ranked_entry
 from news.movement import apply_movement
 import main as main_module
@@ -4268,6 +4270,274 @@ class TestHomonymEntitySingletonDetect(unittest.TestCase):
         with patch.object(ranker, "detect_homonym_entity_singletons", return_value=[]):
             top_noop = main_module._rank_and_select(_cands(), _signals(), "test")
         self.assertEqual(top_real, top_noop)
+
+
+class TestBroadKeywordRepresentative(unittest.TestCase):
+    """broad/generic 키워드('초복') 대표기사 억제 — 기사들이 키워드 단어만 공유하고
+    실제 사건·인물·기관·지역이 다르면 대표를 뽑지 않는다(2026-07-15)."""
+
+    # 실제 '초복' 사례: 키워드('초복')와 세시풍속 소품('삼계탕')만 겹칠 뿐
+    # 청도/하림/보은/성남/대통령/폭염은 서로 다른 사건이다.
+    CHOBOK = [
+        _article("청도군, 거연리 주민과 초복맞이 화합과 소통의 시간 가져", "https://x.com/c1",
+                 "청도군은 지난 14일 환경산림과와 물관리사업소 주관으로 거연리 주민들과 함께하는 화합의 자리를 가졌다."),
+        _article("하림 오드그로서, 초복 맞아 삼계탕으로 팀워크 다져", "https://x.com/c2",
+                 "오늘(15일) 하림에 따르면 초복을 하루 앞둔 어제(14일) 선수들은 서울 강남구에 위치한 PBA 라운지 오픈"),
+        _article("보은군, 민관 협력으로 초복 맞이 삼계탕 나눔 행사 성황리 진행", "https://x.com/c3",
+                 "보은군이 초복을 맞아 지역 내 어르신과 장애인들의 건강한 여름나기를 돕기 위해 행사를 지원한 장애인후원회"),
+        _article("성남시의회, 수진2동 초복맞이 삼계탕 나눔행사 참석", "https://x.com/c4",
+                 "성남시의회는 15일 수진2동 단체장협의회 초복맞이 삼계탕 나눔행사에 참석했다. 이번 행사는 지역 내 취약계층"),
+        _article("李대통령, 초복 맞아 靑직원들과 콩국수 오찬...깜짝 기자간담회", "https://x.com/c5",
+                 "靑 격무 부서 직원들과 격려 오찬 오찬 뒤 춘추관 깜짝 방문 이재명 대통령이 15일 초복을 맞아 청와대"),
+        _article("경산·경주 감포 37.9도...초복 대구·경북 찜통더위", "https://x.com/c6",
+                 "초복인 15일 대구·경북 대부분 지역에 폭염이 이어지며 찜통더위 최고기온은 경산과 경주 감포가 37.9도"),
+    ]
+
+    # 동일 사건을 보도한 기사들 — 기존처럼 대표기사/summary가 생성돼야 한다.
+    SAME_EVENT = [
+        _article("민경욱 전 의원, 자택서 의식 불명 상태로 발견", "https://x.com/s1",
+                 "민경욱 전 의원이 15일 서울 자택에서 의식 불명 상태로 발견돼 병원으로 이송됐다."),
+        _article("민경욱 의식 불명…병원 이송 후 치료 중", "https://x.com/s2",
+                 "경찰에 따르면 민경욱 전 의원은 자택에서 쓰러진 채 발견됐으며 현재 병원에서 치료를 받고 있다."),
+        _article("[속보] 민경욱 전 의원 자택서 쓰러져 병원 이송", "https://x.com/s3",
+                 "민경욱 전 의원이 자택에서 의식 불명 상태로 발견됐다고 경찰이 밝혔다."),
+    ]
+
+    # --- broad 키워드: 대표 없음 ---
+
+    def test_broad_keyword_has_no_representative(self):
+        self.assertFalse(cand_summarizer.has_representative("초복", self.CHOBOK))
+
+    def test_broad_keyword_summary_is_empty(self):
+        summary, summary_type = summarize("초복", self.CHOBOK)
+        self.assertEqual(summary, "")
+        self.assertEqual(summary_type, "no_representative")
+
+    def test_broad_keyword_summary_is_not_any_article_title(self):
+        # 어느 한 기사도 대표로 선택되지 않아야 한다(특히 기존 우승자였던 '하림').
+        summary, _ = summarize("초복", self.CHOBOK)
+        for a in self.CHOBOK:
+            self.assertNotEqual(summary, a["title"])
+
+    def test_broad_keyword_subtopic_tokens_empty(self):
+        # 키워드/파생형/날짜/일반어를 빼면 과반 공유 토큰이 남지 않는다.
+        self.assertEqual(cand_summarizer.subtopic_tokens("초복", self.CHOBOK), set())
+
+    # --- 동일 사건: 기존 동작 회귀 ---
+
+    def test_same_event_keeps_representative(self):
+        self.assertTrue(cand_summarizer.has_representative("민경욱", self.SAME_EVENT))
+        summary, summary_type = summarize("민경욱", self.SAME_EVENT)
+        self.assertEqual(summary_type, "rule")
+        self.assertIn(summary, [a["title"] for a in self.SAME_EVENT])
+
+    def test_same_event_two_articles_boundary(self):
+        # 동일 사건 2건(최소 경계)에서도 대표가 생성돼야 한다.
+        summary, summary_type = summarize("민경욱", self.SAME_EVENT[:2])
+        self.assertEqual(summary_type, "rule")
+        self.assertTrue(summary)
+
+    def test_same_event_survives_one_unrelated_article(self):
+        # 과반 기준이라 무관 기사 1건이 섞여도 대표가 유지된다.
+        mixed = self.SAME_EVENT + [_article("폭염 특보 확대", "https://x.com/u1",
+                                            "기상청은 전국에 폭염 특보를 확대 발효했다.")]
+        _, summary_type = summarize("민경욱", mixed)
+        self.assertEqual(summary_type, "rule")
+
+    # --- 경계/함정 (Codex review-only P2) ---
+
+    def test_two_plus_two_split_events_has_no_representative(self):
+        # 2+2로 갈린 서로 다른 사건 — 어느 쪽도 과반이 아니므로 대표 없음.
+        split = [
+            _article("A시, 신청사 착공식 개최", "https://x.com/p1", "A시가 신청사 착공식을 열었다."),
+            _article("A시 신청사 착공 본격화", "https://x.com/p2", "A시 신청사 착공이 본격화됐다."),
+            _article("B사, 신형 전기차 공개", "https://x.com/p3", "B사가 신형 전기차를 공개했다."),
+            _article("B사 전기차 사전계약 시작", "https://x.com/p4", "B사 전기차 사전계약이 시작됐다."),
+        ]
+        _, summary_type = summarize("공개", split)
+        self.assertEqual(summary_type, "no_representative")
+
+    def test_snippet_only_boilerplate_has_no_representative(self):
+        # 매체 boilerplate가 snippet에만 반복되는 경우 — 사건 증거가 아니다.
+        boiler = [
+            _article("가 지역 축제 개막", "https://x.com/b1", "무단전재 재배포 금지 저작권자 제보는 카카오톡"),
+            _article("나 지역 마라톤 열려", "https://x.com/b2", "무단전재 재배포 금지 저작권자 제보는 카카오톡"),
+            _article("다 지역 음악회 성료", "https://x.com/b3", "무단전재 재배포 금지 저작권자 제보는 카카오톡"),
+        ]
+        summary, summary_type = summarize("축제", boiler)
+        # boilerplate 토큰이 과반을 넘더라도 어느 title에도 없으므로 대표 title을
+        # 특정할 수 없다 → 임의 기사로 채우지 않는다.
+        self.assertEqual(summary_type, "no_representative")
+        self.assertEqual(summary, "")
+
+    def test_empty_keyword_keeps_legacy_behavior(self):
+        # candidates.build_representative_summary가 쓰는 keyword="" 경로는
+        # 키워드 제외를 적용하지 않는다(""가 모든 토큰에 substring 매칭되면 전멸).
+        summary, summary_type = summarize("", self.SAME_EVENT)
+        self.assertEqual(summary_type, "rule")
+        self.assertTrue(summary)
+
+    def test_single_article_keeps_title(self):
+        # 1건은 "여러 기사 중 임의 선택" 문제가 없다 — 기존 동작 유지.
+        summary, summary_type = summarize("초복", self.CHOBOK[:1])
+        self.assertEqual(summary_type, "title")
+        self.assertEqual(summary, self.CHOBOK[0]["title"])
+
+    def test_no_articles_still_seed_only(self):
+        self.assertEqual(summarize("초복", []), ("", "seed_only"))
+
+    # --- builder 통합: 랭킹 유지 + 대표 필드만 비움 ---
+
+    def test_builder_keeps_keyword_and_articles_but_drops_representative(self):
+        ranked_item = {
+            "keyword": "초복", "score": 0.7,
+            "source_breakdown": {"news": 0.7}, "rank_reason": "",
+            "news_meta": {
+                "articles": self.CHOBOK,
+                "representative_title": "하림 오드그로서, 초복 맞아 삼계탕으로 팀워크 다져",
+                "representative_summary": "하림이 초복을 맞아 삼계탕으로 팀워크를 다졌다.",
+                "representative_article": {"title": "하림 오드그로서, 초복 맞아 삼계탕으로 팀워크 다져"},
+                "primary_cluster_size": 2,
+                "topic_coherence": 0.3,
+            },
+            "used_signals": ["news"],
+            "display_keyword": "초복",
+            "sources": {"daum_home": 1},
+        }
+        entry = build_ranked_entry(1, ranked_item)
+
+        # 키워드는 랭킹에 유지 + 기사 목록도 유지
+        self.assertEqual(entry["keyword"], "초복")
+        self.assertEqual(entry["rank"], 1)
+        self.assertTrue(entry["signals"]["news"])
+        self.assertTrue(len(entry["articles"]) > 0)
+
+        # summary 없음 + 어느 기사도 대표로 간주되지 않음
+        self.assertEqual(entry["summary"], "")
+        self.assertEqual(entry["summary_type"], "no_representative")
+        self.assertIsNone(entry["representative_title"])
+        self.assertIsNone(entry["representative_summary"])
+        self.assertIsNone(entry["representative_article"])
+
+    def test_builder_backfilled_incidentals_do_not_suppress_representative(self):
+        # Codex review-only P1(2026-07-15): builder는 summarize() 전에
+        # filter_articles_for_display(min_count=5)로 저관련/incidental 기사를 하한까지
+        # 보충한다. 이 보충분이 과반 분모에 들어가면 "동일 사건 2건 + 보충 3건"인
+        # 정상 키워드가 need=3이 되어 대표가 억울하게 억제된다.
+        related = [
+            dict(a, relevance_score=0.9, relevance_reason="keyword_main_topic",
+                 is_incidental=False)
+            for a in self.SAME_EVENT[:2]
+        ]
+        incidental = [
+            dict(_article(f"무관 기사 {i}", f"https://x.com/i{i}", "전혀 다른 내용"),
+                 relevance_score=0.1, is_incidental=True)
+            for i in range(3)
+        ]
+        ranked_item = {
+            "keyword": "민경욱", "score": 0.7,
+            "source_breakdown": {"news": 0.7}, "rank_reason": "",
+            "news_meta": {"articles": related + incidental},
+            "used_signals": ["news"],
+            "display_keyword": "민경욱",
+            "sources": {"daum_home": 1},
+        }
+        entry = build_ranked_entry(1, ranked_item)
+        # 보충분은 하한 보호로 articles에 남지만, 대표 판정 근거에서는 빠져야 한다.
+        self.assertEqual(entry["summary_type"], "rule")
+        self.assertIn(entry["summary"], [a["title"] for a in related])
+
+    def test_low_relevance_articles_excluded_from_evidence(self):
+        # Codex review-only P1(2차): is_incidental=False여도 relevance_score가 대표
+        # 자격(0.5) 미만인 object-side 기사는 과반 분모에서 빠져야 한다. 그렇지 않으면
+        # 동일 사건 2건 + 저관련 3건에서 need=3이 되어 정상 대표가 억제된다.
+        related = [
+            dict(a, relevance_score=0.9, relevance_reason="keyword_main_topic",
+                 is_incidental=False)
+            for a in self.SAME_EVENT[:2]
+        ]
+        low_rel = [
+            dict(_article(f"저관련 기사 {i}", f"https://x.com/l{i}", "다른 내용"),
+                 relevance_score=0.35, relevance_reason="object_side_mention",
+                 is_incidental=False)
+            for i in range(3)
+        ]
+        summary, summary_type = summarize("민경욱", related + low_rel)
+        self.assertEqual(summary_type, "rule")
+        self.assertIn(summary, [a["title"] for a in related])
+
+    def test_all_incidental_has_no_representative(self):
+        # 명시적으로 전부 대표 자격 미달이면 evidence 0건 → 대표 없음.
+        # (단일 기사 예외가 evidence 필터보다 먼저 실행되면 이 불변식이 깨진다.)
+        only_incidental = [
+            dict(_article("부수 언급 기사", "https://x.com/n1", "키워드가 스쳐 지나간다"),
+                 relevance_score=0.2, is_incidental=True),
+        ]
+        self.assertEqual(summarize("키워드", only_incidental), ("", "no_representative"))
+        self.assertFalse(cand_summarizer.has_representative("키워드", only_incidental))
+
+    def test_builder_no_representative_keeps_display_articles(self):
+        # 팝업 기사 목록(display_articles)이 대표 억제와 무관하게 보존되는지 검증한다.
+        #
+        # 모든 기사를 is_primary_cluster=True로 두면 build_display_articles가 anchor를
+        # 보지도 않고 전부 통과시켜, builder가 anchor에 None을 넘기는 회귀가 생겨도
+        # 테스트가 통과한다(Codex review-only P2). 그래서 한 건은 non-primary로 두고
+        # representative title과의 토큰 overlap(_display_anchor_allowed)으로만 살아남게
+        # 구성한다 — anchor가 끊기면 이 기사가 목록에서 빠져 테스트가 깨진다.
+        primary = [
+            dict(a, relevance_score=0.9, relevance_reason="keyword_main_topic",
+                 is_incidental=False, is_primary_cluster=True)
+            for a in self.CHOBOK
+        ]
+        rep_article = {"title": "보은군, 민관 협력으로 초복 맞이 삼계탕 나눔 행사 성황리 진행"}
+        anchored = dict(
+            _article("보은군 삼계탕 나눔 행사에 지역 후원회 동참", "https://x.com/a1",
+                     "보은군 삼계탕 나눔 행사가 이어졌다."),
+            relevance_score=0.8, relevance_reason="keyword_main_topic",
+            is_incidental=False, is_primary_cluster=False,
+        )
+        articles = primary + [anchored]
+        ranked_item = {
+            "keyword": "초복", "score": 0.7,
+            "source_breakdown": {"news": 0.7}, "rank_reason": "",
+            "news_meta": {"articles": articles, "representative_article": rep_article},
+            "used_signals": ["news"],
+            "display_keyword": "초복",
+            "sources": {"daum_home": 1},
+        }
+        entry = build_ranked_entry(1, ranked_item)
+        self.assertEqual(entry["summary_type"], "no_representative")
+        self.assertIsNone(entry["representative_article"])
+        # anchor로만 살아남는 non-primary 기사가 목록에 남아 있어야 한다 —
+        # 대표를 안 뽑는 것과 기사를 숨기는 것은 다르다.
+        titles = [a["title"] for a in entry["display_articles"]]
+        self.assertIn(anchored["title"], titles)
+        for a in primary:
+            self.assertIn(a["title"], titles)
+
+    def test_builder_same_event_keeps_representative_fields(self):
+        # 회귀: 동일 사건 키워드는 기존대로 대표 필드가 살아 있어야 한다.
+        ranked_item = {
+            "keyword": "민경욱", "score": 0.7,
+            "source_breakdown": {"news": 0.7}, "rank_reason": "",
+            "news_meta": {
+                "articles": self.SAME_EVENT,
+                "representative_title": self.SAME_EVENT[0]["title"],
+                "representative_summary": "민경욱 전 의원이 자택에서 의식 불명 상태로 발견됐다.",
+                "representative_article": {"title": self.SAME_EVENT[0]["title"]},
+                "primary_cluster_size": 3,
+                "topic_coherence": 0.9,
+            },
+            "used_signals": ["news"],
+            "display_keyword": "민경욱",
+            "sources": {"daum_home": 1},
+        }
+        entry = build_ranked_entry(1, ranked_item)
+        self.assertEqual(entry["summary_type"], "rule")
+        self.assertTrue(entry["summary"])
+        self.assertIsNotNone(entry["representative_title"])
+        self.assertIsNotNone(entry["representative_summary"])
+        self.assertIsNotNone(entry["representative_article"])
 
 
 if __name__ == "__main__":

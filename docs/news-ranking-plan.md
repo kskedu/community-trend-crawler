@@ -187,8 +187,8 @@ renorm = {신호: w/total for 신호, w in available.items()}
     {
       "rank": 1,
       "keyword": "...",
-      "summary": "...",
-      "summary_type": "rule|title|seed_only",
+      "summary": "...",            // no_representative면 "" (프론트는 홈 설명줄 자체를 숨김)
+      "summary_type": "rule|title|seed_only|no_representative",
       "signals": {
         "news": true,
         "trend": false,            // 기존 호환
