@@ -419,3 +419,78 @@ P0/P1 잔존 없음(1건 즉시 반영) → 구현 착수 가능 상태.
 | 9차(최종) | No P0/P1. 커밋 가능 여부 재확인(Yes) | 커밋 진행 |
 
 가장 오래 반복된 지점(4~8차, incidental mention 판정)은 "키워드가 기사의 진짜 주체인지 부속물인지"를 무거운 NLP 없이 문자열 규칙만으로 구분하려는 시도의 근본적 한계를 보여준다. 완벽한 해는 개체명 인식(NER) 수준이 필요하지만 계획서의 "무거운 NLP 의존성 추가 금지" 원칙과 상충해 도입하지 않았고, 현재 규칙(첫 절 완전 일치 조건)은 알려진 핵심 반례를 모두 닫은 상태에서 실무 투입을 승인했다.
+
+## 12. broad/generic 키워드 대표기사 억제 (2026-07-15)
+
+### 문제
+
+"초복"처럼 검색·트렌드 신호는 충분하지만, 수집된 기사들이 **키워드 단어만 공유하고 실제 사건·인물·기관·지역이 서로 다른** 키워드에서 근거 없이 임의 기사가 대표로 뽑혔다.
+
+실측(초복, 기사 6건 — 청도군 화합행사 / 하림 팀워크 / 보은군 삼계탕나눔 / 성남시의회 행사 / 대통령 오찬 / 폭염):
+
+- DF>=2 공통 토큰 = `{초복:4, 초복을:3, 초복맞이:2, 15일:4, 14일:2, 맞아:3, 지역:2, 삼계탕:2}`
+- 전부 (a)키워드 자신·파생형 (b)날짜 (c)일반 동사 (d)세시풍속 소품 → **공통 사건의 증거가 아니다**
+- 그럼에도 4개 기사가 동점(score=2)이 되어 `score > best_score` 루프의 **최초 우승자**(하림)가 대표로 확정됐다
+
+### 대표기사 생성 조건 (명시)
+
+`summarizer.subtopic_tokens()` / `has_representative()`:
+
+1. 대표 자격 기사(evidence)가 2건 이상이고
+2. 키워드 자체·파생형(단방향 substring), 날짜/수치 시작 토큰, `_STOPWORDS`, `_SUBTOPIC_GENERIC_TOKENS`를 제외한 잔여 토큰 중
+3. **2개 이상 기사**(`_SUBTOPIC_MIN_DF`)에서 반복 등장하는 토큰이
+4. `_SUBTOPIC_MIN_TOKENS`(2)개 이상일 때만
+
+대표를 선정한다. 미달이면 `("", "no_representative")`.
+
+**evidence(대표 자격 기사)** = `is_incidental=False` 이고 `relevance_score >= 0.5`. `candidates.select_representative`/`build_representative_summary`와 같은 기준이다. builder가 `summarize()` 호출 전에 `filter_articles_for_display(min_count=5)`로 저관련/incidental 기사를 하한까지 **보충**하므로, 이 보충분이 과반 분모에 섞이면 정상 키워드의 대표까지 억제된다.
+
+### 동작 계약
+
+| 상태 | summary | summary_type | representative_* | articles / display_articles | 홈 | 팝업 |
+|---|---|---|---|---|---|---|
+| 기사 0건 | `""` | `seed_only` | None | 없음 | 키워드만 | empty-state |
+| broad/generic | `""` | `no_representative` | **None** | **그대로 유지** | 키워드·순위만(설명줄 span 미생성) | 기사 목록 유지, 대표 없음 |
+| 동일 사건 | 대표 title | `rule` | 유지 | 유지 | 설명줄 노출 | 기존과 동일 |
+
+- 키워드는 **랭킹에서 유지**한다(`signals.news`/score 미변경). 대표만 억제한다.
+- placeholder 문구는 추가하지 않는다(사용자 정책). 프론트는 `summary`가 비면 `js/news-brief.js`의 `_buildRow`가 headline span 자체를 만들지 않는다 — StartHub 변경 불필요.
+- `representative_article`은 **출력 JSON에서만** None으로 비운다. `build_display_articles()`에는 그대로 넘긴다 — 이 값은 primary cluster 밖 기사의 연관성 재확인(`_display_anchor_allowed`) 앵커라서, None을 넘기면 **팝업 기사 목록 자체가 바뀐다**.
+
+### Codex review-only 이력 (계획 1회 + diff 3회)
+
+| 회차 | 주요 findings | 처리 |
+|---|---|---|
+| 계획 | P1: `ceil(n*0.5)`는 과반이 아님(n=6→3). P1: `keyword=""`(build_representative_summary 경로)에 substring 제외를 적용하면 `""`가 모든 토큰에 매칭돼 전멸 | `n//2+1`로 수정, 빈 키워드 가드를 substring 검사보다 먼저 배치 |
+| 1차 | P1: builder의 `filter_articles_for_display` backfill이 과반 분모에 섞여 "정상 기사 2건 + 보충 3건"의 대표를 억제(재현 확인). P2: display_articles 회귀 테스트 부재 | `_evidence_articles()` 도입, builder 통합 회귀 테스트 추가 |
+| 2차 | P2: `_evidence_articles` fallback이 "필드 없는 legacy 입력"과 "명시적 all-incidental"을 구분 못 함. P2: display 테스트가 전부 `is_primary_cluster=True`라 anchor 회귀를 못 잡는 **동어반복 테스트** | 판별 필드 유무로 legacy만 구분, non-primary anchor 기사를 넣어 실제 회귀를 잡도록 테스트 재작성 |
+| 3차 | P1: `is_incidental`만 봐서 `relevance_score=0.35`(object_side_mention) 기사가 분모에 남아 같은 과잉 억제 재발. P2: 단일 기사 예외가 evidence 필터보다 먼저 실행돼 all-incidental 1건이 title로 새어나감 | evidence 기준에 `relevance_score >= 0.5` 추가, `summarize()`를 evidence 기준 분기로 재구성 |
+| 4차 | No P0/P1, 수용 불가 P2 없음 | 커밋 |
+| **운영 실데이터 검증(머지 전)** | **초기 "엄격한 과반" 임계가 운영 news_top 10건 중 5건(홈플러스/프랑스 스페인/호프 영화/김민하/제헌절)을 억제** — 같은 사건도 매체별 표현이 갈리면(제목엔 "2000억", 다른 기사엔 "메리츠") 과반을 못 넘는 것이 정상이기 때문. fixture 검증만으로는 못 잡았다 | 과반 요구 제거(DF>=2 + min_tokens=2로 확정). 초복 억제 유지 + 운영 10/10 유지 확인. 실데이터 회귀 테스트 추가 |
+| 5차(최종) | No P0/P1, 수용 불가 P2 없음 | 머지 진행 |
+
+`_EVIDENCE_MIN_RELEVANCE`(0.5)는 `candidates.REPRESENTATIVE_MIN_RELEVANCE`와 같은 값·같은 의미지만, `candidates.py`가 `summarizer.py`를 import하는 단방향 구조라 역참조 시 순환 import가 되어 값을 복제했다(`candidates._cluster_common_tokens`가 같은 이유로 토큰 집계를 복제한 선례와 동일). **한쪽을 바꾸면 다른 쪽도 함께 본다.**
+
+### 임계 결정 근거 (운영 실데이터, 2026-07-15)
+
+초기 구현은 "엄격한 과반"(`n//2+1`)을 요구했으나, **머지 직전 운영 `news_issue_cache` 실데이터로 검증하니 10건 중 5건이 억제**됐다. 기사 5~8건에서 특정 토큰이 3~5건에 반복되기를 요구하는 셈인데, 같은 사건이라도 매체별 표현이 갈리면 과반을 못 넘는 것이 정상이다.
+
+| 설정 | 초복 억제 | 운영 10건 유지 |
+|---|---|---|
+| DF>=2 + 과반(0.5) + min_tokens=2 (**초기 구현**) | O | **5/10** — 운영 5건 억제 |
+| DF>=2 + 과반(0.5) + min_tokens=1 | O | 10/10 (단, 임계 1은 초복 억제가 아슬아슬) |
+| DF>=2 + **과반 없음** + min_tokens=2 | **O** | **10/10** |
+| DF>=2 + 과반 없음 + min_tokens=1 | **X (억제 실패)** | 10/10 |
+| DF>=3 + min_tokens=2 | O | 8/10 |
+
+> 표의 "운영 10건 유지"는 subtopic 토큰 기준 게이트 통과 수다. 초기 구현(과반)의 실제 `summarize()` 결과는 10건 중 5건이 `no_representative`로 flip했다.
+
+확정: **DF>=2, 과반 요구 없음, min_tokens=2**. 초복의 잔여 토큰은 `{삼계탕}` 1개뿐이라 정확히 억제되고, 운영 10건은 여유 폭 5~46토큰으로 모두 유지된다. `min_tokens=1`은 `삼계탕` 하나로 초복이 통과해 버리므로 2토큰 하한이 핵심이다.
+
+**교훈**: fixture(초복 6건 + 동일사건 3건)만으로는 과잉 억제를 못 잡았다. 랭킹/요약 임계를 바꿀 때는 **머지 전에 운영 실데이터 분포로 검증**한다.
+
+### 알려진 한계
+
+- `_SUBTOPIC_GENERIC_TOKENS`는 하드코딩 최소셋이다. 사전을 키우면 fixture 과적합·유지보수 부담이 커지므로, 판정의 주력은 "키워드·날짜를 제외한 뒤에도 2개 이상 토큰이 2개 이상 기사에서 반복되는가"이고 이 집합은 보조다.
+- 키워드 파생형 판정은 형태소 분석이 아니라 단방향 substring이다. 짧은 키워드가 별개 고유명사에 우연히 포함되면 그 토큰이 근거에서 빠질 수 있다(계획서의 "무거운 NLP 의존성 추가 금지" 원칙과의 절충 — §5).
+- **복수 하위 사건이 섞인 키워드는 억제하지 않는다.** DF>=2는 전체 기사 토큰 union 기준이라, (a) 8건 중 2건만 두 토큰을 공유하는 2+6, (b) 기사 1·2가 토큰 X를, 기사 3·4가 토큰 Y를 공유하는 서로 다른 pair, (c) 클러스터별로 각각 공통 토큰을 내는 다중 사건도 게이트를 통과한다. 두 토큰이 같은 기사 pair에서 함께 관측될 필요도 없다. 이 경우 근거 토큰을 더 많이 담은 기사가 대표가 된다. 과반 임계로 닫을 수 있지만 운영 실데이터 5건이 함께 억제되는 대가가 커서 열어 뒀다(Codex review-only P2로 범위 명시). 이번 작업 대상은 "공통 사건이 아예 없는" broad 키워드이고, 이는 공통 사건이 존재하는 별개 문제다.
