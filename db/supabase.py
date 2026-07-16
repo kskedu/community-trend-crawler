@@ -115,3 +115,26 @@ def upsert_news_issues(issues: Dict, source: str = "news_top") -> bool:
     except Exception as e:
         logger.error(f"[{source}] news issues upsert 실패: {e}")
         return False
+
+
+def record_news_diagnostics(run: Dict, decisions: list) -> bool:
+    """뉴스 키워드 진단 이력을 RPC 1회로 원자 적재한다.
+
+    - 테이블 직접 write 금지 — service_role은 이 RPC EXECUTE 권한만 갖는다.
+    - 멱등: 동일 run_key면 기존 run_id를 반환하고 decisions를 추가하지 않는다(RPC 계약).
+    - 실패해도 news_top 결과를 되돌리거나 실패시키지 않는다 → bool만 반환한다.
+    - 로그에 예외 메시지를 남기지 않는다: postgrest/httpx 예외 메시지에는 요청 payload와
+      Authorization 헤더가 실릴 수 있다(사용자 확정 §10-1). 타입명만 남긴다.
+    """
+    if not run:
+        return False
+    client = get_client()
+    try:
+        client.rpc("news_diag_record_run", {
+            "p_run": run,
+            "p_decisions": decisions,
+        }).execute()
+        return True
+    except Exception as e:
+        logger.warning("[news-diag] 진단 적재 실패(랭킹 영향 없음): %s", type(e).__name__)
+        return False

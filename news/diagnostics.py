@@ -1,0 +1,306 @@
+"""뉴스 키워드 진단 수집기 — 랭킹 판정 이력을 관찰만 하고 기록한다.
+
+설계 계약(사용자 확정 2026-07-16):
+- **순수 관찰**: 이 모듈의 어떤 오류도 랭킹 결과를 바꾸거나 실행을 중단시키지 않는다.
+  호출부는 반드시 `_safe_diag(target, thunk)` 경계를 통과한다(main.py).
+- **snapshot 소유권**: PassSnapshot은 호출자가 생성해 명시적으로 전달한다.
+  암묵적 "현재 활성 snapshot" 전역 상태를 두지 않는다.
+- **degraded 격리**: degraded/errors는 PassSnapshot 로컬. commit된 snapshot의 것만 run으로 승격.
+  폐기된 pass의 오류는 최종 이력을 오염시키지 않는다.
+- **부분 이력 금지**: 채택 snapshot이 degraded면 RPC를 호출하지 않는다(진단 누락 > 잘못된 이력).
+- **로그 위생**: 예외는 `type(e).__name__`만 남긴다. 메시지/payload/기사 본문/secret 금지.
+
+카운트 invariant:
+    candidate_count = len(decisions) = selected + not_selected + rule_excluded
+NO_REPRESENTATIVE는 selected의 부분집합이며 별도 합산하지 않는다.
+"""
+
+import logging
+import os
+from datetime import datetime, timezone
+
+logger = logging.getLogger(__name__)
+
+# 결과 상태 — 배포 SQL CHECK와 1:1
+# (news_keyword_decisions.result_status IN ('selected','not_selected','selected_no_representative'))
+STATUS_SELECTED = "selected"
+STATUS_SELECTED_NO_REP = "selected_no_representative"
+STATUS_NOT_SELECTED = "not_selected"
+
+_SELECTED_STATUSES = (STATUS_SELECTED, STATUS_SELECTED_NO_REP)
+
+# 규칙 제외는 별도 result_status가 아니라 not_selected + reason_code로 구분한다(배포 스키마).
+# 카운트에서는 RANK_CUTOFF(순위 컷)와 규칙 제외를 reason_code로 나눈다.
+RANK_CUTOFF = "RANK_CUTOFF"
+
+# RPC가 강제하는 decisions 상한(초과 시 EXCEPTION) — 클라이언트에서 먼저 방어한다.
+MAX_DECISIONS = 200
+
+# 배포 SQL의 news_keyword_runs.run_type CHECK와 1:1. 여기 없는 값을 보내면 RPC 내부
+# INSERT가 CHECK 위반으로 실패해 **모든 진단 적재가 조용히 실패**한다(RPC를 mock한
+# 단위 테스트로는 잡히지 않음 — Codex diff review P1).
+RUN_TYPES = ("full", "news_top_only", "baseline")
+
+# 기사 메타 allowlist — 본문/description 저장 금지(사용자 확정).
+_ARTICLE_FIELDS = (
+    "title", "url", "source", "published_at",
+    "relevance_score", "is_incidental", "is_primary_cluster",
+)
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _norm_key(keyword):
+    """후보 안정 식별자 — candidates._merge()의 pool 키와 동일 규약.
+
+    display_keyword(merge 후 변형)나 객체 identity(dict 복사로 깨짐)를 쓰지 않는다.
+    """
+    return (keyword or "").strip().lower()
+
+
+def _safe_article(article):
+    """기사 메타를 allowlist로 축소한다. 본문/description은 애초에 담지 않는다."""
+    return {f: article.get(f) for f in _ARTICLE_FIELDS if article.get(f) is not None}
+
+
+class PassSnapshot:
+    """단일 pass의 판정 결과 + degraded/errors를 함께 보유한다.
+
+    호출자가 생성해 `_rank_and_select(..., diag=snapshot)`으로 전달한다.
+    폐기되면 commit되지 않으므로 그 오류는 run에 섞이지 않는다.
+    """
+
+    def __init__(self, pass_name):
+        self.pass_name = pass_name
+        self.decisions = {}          # _norm_key -> decision dict (후보당 정확히 1개)
+        self.degraded = False
+        self.errors = []             # type name만 보관(메시지 금지)
+        self.closed = False
+
+    # -- 상태 --------------------------------------------------------------
+
+    def mark_degraded(self, exc):
+        """오류 1회라도 나면 degraded. 예외 '타입명'만 남긴다(§10-1)."""
+        self.degraded = True
+        self.errors.append(type(exc).__name__)
+
+    def close(self):
+        """seal — 추가 기록만 막고 수집분은 보존한다(폐기가 아니다).
+
+        _backfill_pass의 finally에서 닫혀도 호출자가 final_snapshot으로 commit할 수 있어야 한다.
+        """
+        self.closed = True
+
+    # -- 기록 --------------------------------------------------------------
+
+    def record(self, keyword, result_status, reason_code, **fields):
+        """후보 1건의 최종 판정. 같은 후보를 두 번 기록하면 degraded(계약 위반 신호)."""
+        if self.closed:
+            raise RuntimeError("closed snapshot")
+        key = _norm_key(keyword)
+        if key in self.decisions:
+            raise RuntimeError("duplicate decision")
+        row = {
+            "keyword": keyword,
+            "result_status": result_status,
+            "reason_code": reason_code,
+        }
+        articles = fields.pop("articles", None)
+        if articles:
+            row["articles"] = [_safe_article(a) for a in articles]
+        for k, v in fields.items():
+            if v is not None:
+                row[k] = v
+        self.decisions[key] = row
+
+    # -- 집계 --------------------------------------------------------------
+
+    def finalize_selected(self, published_keywords):
+        """발행 payload(issues["keywords"])로 selected 행의 실제 값을 확정한다.
+
+        _rank_and_select 시점에는 rank/summary/representative/display_articles가 **아직
+        존재하지 않는다**(builder가 나중에 만든다). 그 시점 값으로 기록하면 selected가
+        전부 rank=None + NO_REPRESENTATIVE로 남아 진단이 실제 발행 결과와 어긋난다
+        (Codex diff review P1). 그래서 발행 직전에 최종 값으로 덮어쓴다.
+
+        1차 범위 한계(의도적): evidence_tokens / token_df / min_tokens /
+        relevance_threshold / evidence_article_count는 채우지 않는다(NULL 허용 컬럼).
+        summarize()가 (summary, summary_type)만 반환하고 판정 토큰·DF는 내부에서 버려서,
+        정확히 채우려면 news/summarizer.py에 analysis helper를 추가해야 한다 — 이번 PR의
+        승인 파일 범위 밖이고 "대표기사 규칙 변경 금지" 제약에도 맞물린다. 진단 측에서
+        로직을 복제하면 향후 판정과 조용히 어긋나므로 복제하지 않는다.
+        """
+        for entry in published_keywords or []:
+            key = _norm_key(entry.get("keyword"))
+            row = self.decisions.get(key)
+            if row is None or row["result_status"] not in _SELECTED_STATUSES:
+                continue
+            # 대표 없음의 권위 기준은 builder와 동일하게 summary_type이다(news/builder.py:104).
+            # representative_title/article 존재로 재판정하면 어긋난다 — builder는
+            # no_representative일 때 title은 비우지만 representative_article은 anchor 재확인
+            # 용도로 그대로 넘기기 때문이다(builder.py:115). 그 값을 보고 판정하면 대표가
+            # 없는 키워드를 SELECTED로 잘못 기록한다(Codex diff review P1).
+            has_rep = entry.get("summary_type") != "no_representative"
+            row["result_status"] = STATUS_SELECTED if has_rep else STATUS_SELECTED_NO_REP
+            row["reason_code"] = "SELECTED" if has_rep else "NO_REPRESENTATIVE"
+            row["has_representative"] = has_rep
+            row["rank"] = entry.get("rank")
+            row["score"] = entry.get("score")
+            row["summary"] = entry.get("summary")
+            row["summary_type"] = entry.get("summary_type")
+            row["display_keyword"] = entry.get("display_keyword")
+            row["merge_reason"] = entry.get("merge_reason")
+            row["representative_title"] = entry.get("representative_title")
+            rep = entry.get("representative_article") if has_rep else None
+            row["representative_url"] = rep.get("url") if isinstance(rep, dict) else None
+            row["signals"] = entry.get("signals")
+            row["rank_delta"] = entry.get("rank_delta")
+            row["article_count"] = len(entry.get("articles") or [])
+            display = entry.get("display_articles") or []
+            row["display_article_count"] = len(display)
+            row["articles"] = [_safe_article(a) for a in display]
+
+    def counts(self):
+        """candidate_count = selected + not_selected + rule_excluded (invariant).
+
+        rule_excluded는 별도 result_status가 아니라 not_selected 중 RANK_CUTOFF가 아닌 것
+        (배포 스키마의 result_status CHECK가 3값뿐이므로 reason_code로 나눈다).
+        """
+        rows = list(self.decisions.values())
+        selected = sum(1 for r in rows if r["result_status"] in _SELECTED_STATUSES)
+        not_selected = sum(
+            1 for r in rows
+            if r["result_status"] == STATUS_NOT_SELECTED and r["reason_code"] == RANK_CUTOFF
+        )
+        rule_excluded = sum(
+            1 for r in rows
+            if r["result_status"] == STATUS_NOT_SELECTED and r["reason_code"] != RANK_CUTOFF
+        )
+        no_rep = sum(1 for r in rows if r["result_status"] == STATUS_SELECTED_NO_REP)
+        return {
+            "candidate_count": len(rows),
+            "selected_count": selected,
+            "not_selected_count": not_selected,
+            "rule_excluded_count": rule_excluded,
+            "no_representative_count": no_rep,
+        }
+
+    def payload_decisions(self):
+        return list(self.decisions.values())
+
+
+class RunDiagnostics:
+    """run 단위 수집기. 채택된 snapshot 1개만 commit받는다."""
+
+    def __init__(self, run_type="full"):
+        if run_type not in RUN_TYPES:
+            raise ValueError(f"invalid run_type: {run_type!r}")
+        self.run_type = run_type
+        self.started_at = _now_iso()
+        self.status = "success"
+        self.skip_reason = None
+        self.error_summary = None
+        self.collected_candidate_count = 0
+        self.thresholds = {}
+        self.final_snapshot = None
+        self.degraded = False         # run 전역(공통 초기화/payload 조립 오류)
+        self.errors = []
+
+    # -- 상태 --------------------------------------------------------------
+
+    def mark_degraded(self, exc):
+        """pass 바깥 오류 = run 전역 degraded(§3-1 계약 5)."""
+        self.degraded = True
+        self.errors.append(type(exc).__name__)
+
+    def mark_collected(self, count):
+        self.collected_candidate_count = count
+
+    def mark_skipped(self, skip_reason):
+        self.status = "skipped"
+        self.skip_reason = skip_reason
+
+    def mark_failed(self, skip_reason, exc=None):
+        self.status = "failed"
+        self.skip_reason = skip_reason
+        if exc is not None:
+            # 예외 '타입명'만 — 메시지에 payload/헤더/secret이 실릴 수 있다(§10-1).
+            self.error_summary = type(exc).__name__
+
+    def commit(self, snapshot):
+        """채택 확정된 snapshot만 승격. degraded/errors도 이 시점에 함께 넘어온다."""
+        self.final_snapshot = snapshot
+
+    # -- 판정 --------------------------------------------------------------
+
+    def is_degraded(self):
+        """run 전역 degraded 또는 채택 snapshot degraded면 저장 금지."""
+        if self.degraded:
+            return True
+        return bool(self.final_snapshot and self.final_snapshot.degraded)
+
+    def build_payload(self, run_key, git_sha=None, rules_version=None):
+        """RPC payload 조립. 여기서 나는 오류는 호출부에서 run 전역 degraded로 처리된다."""
+        snap = self.final_snapshot
+        counts = snap.counts() if snap else {
+            "candidate_count": 0, "selected_count": 0, "not_selected_count": 0,
+            "rule_excluded_count": 0, "no_representative_count": 0,
+        }
+        decisions = snap.payload_decisions() if snap else []
+        if len(decisions) > MAX_DECISIONS:
+            raise ValueError("decisions over limit")
+
+        thresholds = dict(self.thresholds)
+        # 수집 원시 후보 수는 카운트 invariant 합계에 넣지 않는 별도 메타값(§8-1).
+        # DB 컬럼 추가 없이 thresholds JSON에 담는다.
+        thresholds["collected_candidate_count"] = self.collected_candidate_count
+
+        run = {
+            "run_key": run_key,
+            "workflow_run_id": os.getenv("GITHUB_RUN_ID"),
+            "run_attempt": _int_or_none(os.getenv("GITHUB_RUN_ATTEMPT")),
+            "run_type": self.run_type,
+            "status": self.status,
+            "skip_reason": self.skip_reason,
+            "started_at": self.started_at,
+            "finished_at": _now_iso(),
+            "git_sha": git_sha,
+            "rules_version": rules_version,
+            "thresholds": thresholds,
+            "error_summary": self.error_summary,
+            "pass_name": snap.pass_name if snap else None,
+        }
+        run.update(counts)
+        return run, decisions
+
+
+def _int_or_none(v):
+    try:
+        return int(v) if v else None
+    except (TypeError, ValueError):
+        return None
+
+
+def build_run_key():
+    """GitHub: '{RUN_ID}:{RUN_ATTEMPT}' / 로컬: 'ts:{ISO8601}'(배포 SQL 주석 규약)."""
+    run_id = os.getenv("GITHUB_RUN_ID")
+    attempt = os.getenv("GITHUB_RUN_ATTEMPT") or "1"
+    if run_id:
+        return f"{run_id}:{attempt}"
+    return f"ts:{_now_iso()}"
+
+
+def resolve_git_sha():
+    sha = os.getenv("GITHUB_SHA")
+    if sha:
+        return sha
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=5,
+        )
+        return out.stdout.strip() or None
+    except Exception:      # noqa: BLE001 — sha는 부가 정보. 실패해도 진단은 계속.
+        return None
