@@ -4610,5 +4610,128 @@ class TestBroadKeywordRepresentative(unittest.TestCase):
         self.assertIsNotNone(entry["representative_article"])
 
 
+class TestTruncatedTitleTiebreak(unittest.TestCase):
+    """동점 후보 중 upstream 절단 제목 후순위(2026-07-16).
+
+    뉴스 검색 API는 기사 제목을 잘라서 반환하는 경우가 있다(raw API 실측: '임영호 가수'
+    10건 중 4건이 문자열 끝 "..."로 절단, 같은 기사 원문 og:title은 전체 제목). 절단
+    제목이 대표로 뽑히면 홈/팝업 설명 문구가 문장 중간에서 끊긴 채 노출된다.
+
+    이 tie-breaker는 절단 제목을 "복원"하지 않는다 — 하위주제 토큰 점수가 완전히 동점일
+    때만 정상 제목을 우선한다. 점수 우위는 절대 뒤집지 않는다.
+    """
+
+    # 운영 캐시 실데이터(2026-07-16 news_top, keyword='임영호 가수') 기반.
+    # 두 제목이 하위주제 토큰을 똑같이 담아 score가 완전히 동일하도록 구성한다 —
+    # 절단 제목이 '먼저' 오므로 기존 로직(score > best_score)만으로는 절단 제목이
+    # 대표가 된다. tie-breaker가 없으면 이 fixture는 실패해야 한다.
+    LIM_YOUNGHO = [
+        _article("가수 임영호 별세, 연인이 부고 전해 향년 49세 추모 물결...",
+                 "https://www.mk.co.kr/article/12099997",
+                 "가수 임영호가 별세했다. 연인이 부고를 전했다. 향년 49세."),
+        _article("가수 임영호 별세, 연인이 부고 전해 향년 49세 추모 이어져",
+                 "https://www.dailian.co.kr/news/view/1667746",
+                 "가수 임영호가 별세했다. 연인이 부고를 전했다. 향년 49세."),
+    ]
+
+    def _scores(self, keyword, articles):
+        """fixture가 실제로 동점인지 확인용(테스트 자체의 전제 검증)."""
+        subtopic = cand_summarizer.subtopic_tokens(keyword, articles)
+        return [
+            sum(1 for tok in set(cand_summarizer._tokens(a["title"])) if tok in subtopic)
+            for a in articles
+        ]
+
+    def test_fixture_is_actually_tied(self):
+        # 전제 검증: 아래 tie-breaker 테스트가 '동점'을 실제로 만드는지 확인한다.
+        # 동점이 아니면 tie-breaker 없이도 통과해 회귀를 못 잡는다(Codex review P1).
+        scores = self._scores("임영호 가수", self.LIM_YOUNGHO)
+        self.assertEqual(len(set(scores)), 1, f"fixture가 동점이 아님: {scores}")
+        self.assertGreater(scores[0], 0)
+
+    def test_tiebreak_prefers_untruncated_title(self):
+        # 동점에서 절단된 최초 후보 대신 정상 제목이 대표가 된다.
+        summary, summary_type = summarize("임영호 가수", self.LIM_YOUNGHO)
+        self.assertEqual(summary_type, "rule")
+        self.assertFalse(summary.endswith("..."))
+        self.assertEqual(summary, self.LIM_YOUNGHO[1]["title"])
+
+    def test_tiebreak_holds_when_candidate_order_reversed(self):
+        # 후보 순서를 뒤집어도(정상 제목이 먼저) 정상 제목이 유지된다.
+        reversed_articles = list(reversed(self.LIM_YOUNGHO))
+        summary, _ = summarize("임영호 가수", reversed_articles)
+        self.assertFalse(summary.endswith("..."))
+        self.assertEqual(summary, self.LIM_YOUNGHO[1]["title"])
+
+    def test_tiebreak_result_is_an_actual_article_title(self):
+        # 대표는 항상 실재하는 기사 제목이어야 한다(문자열 조합/복원 금지).
+        summary, _ = summarize("임영호 가수", self.LIM_YOUNGHO)
+        self.assertIn(summary, [a["title"] for a in self.LIM_YOUNGHO])
+
+    def test_higher_score_truncated_title_still_wins(self):
+        # 점수 우위는 절대 뒤집지 않는다 — 절단 제목이 단독 최고점이면 그대로 대표다.
+        # (운영 실데이터 '이정효' 케이스: 절단 제목이 score=5로 단독 1위 → 변경 없음)
+        # 절단 제목(t1)이 하위주제 토큰 {수원, 삼성, 부산교통공사, 코리아컵}을 더 많이
+        # 담아 단독 최고점이 되도록 구성한다.
+        articles = [
+            _article("골키퍼를 최전방 공격수로?…수원 삼성, 부산교통공사에 코리아컵 패배...",
+                     "https://x.com/t1",
+                     "이정효 감독의 수원 삼성이 부산교통공사에 패해 코리아컵에서 탈락했다."),
+            _article("이정효의 수원, 탈락",
+                     "https://x.com/t2",
+                     "수원 삼성이 부산교통공사에 패해 코리아컵에서 탈락했다."),
+        ]
+        summary, summary_type = summarize("이정효", articles)
+        self.assertEqual(summary_type, "rule")
+        self.assertTrue(summary.endswith("..."))  # 절단이어도 점수가 높으면 유지
+        self.assertEqual(summary, articles[0]["title"])
+
+    def test_mid_title_ellipsis_is_not_penalized(self):
+        # 제목 "중간"의 말줄임표는 정상 표기 — 절단으로 오판하면 안 된다.
+        self.assertFalse(
+            cand_summarizer._is_truncated_title(
+                "가수 와이스토리, 49세로 사망... 연인이 장례 치르고 마지막 인사 남겨"))
+        self.assertTrue(
+            cand_summarizer._is_truncated_title("‘귓속말’ 임영호, 향년 49세로 사망…연인이 전한 부고에 ‘추모 물결..."))
+        self.assertTrue(cand_summarizer._is_truncated_title("제목이 여기서 잘렸다…"))
+        self.assertFalse(cand_summarizer._is_truncated_title("정상적으로 끝나는 제목"))
+
+    def test_truncated_title_trailing_whitespace(self):
+        # 앞뒤 공백 제거 후 끝 문자를 본다.
+        self.assertTrue(cand_summarizer._is_truncated_title("잘린 제목...  "))
+        self.assertFalse(cand_summarizer._is_truncated_title(""))
+        self.assertFalse(cand_summarizer._is_truncated_title(None))
+
+    def test_all_truncated_tie_keeps_first_candidate(self):
+        # 동점 후보가 전부 절단이면 기존 계약(최초 후보) 유지 — 무한 후순위 금지.
+        articles = [
+            _article("민경욱 전 의원 자택서 쓰러져 병원 이송...",
+                     "https://x.com/a1",
+                     "민경욱 전 의원이 자택에서 의식 불명 상태로 발견돼 병원으로 이송됐다."),
+            _article("민경욱 전 의원 자택서 쓰러져 병원 이송 중...",
+                     "https://x.com/a2",
+                     "민경욱 전 의원이 자택에서 의식 불명 상태로 발견돼 병원으로 이송됐다."),
+        ]
+        summary, summary_type = summarize("민경욱", articles)
+        self.assertEqual(summary_type, "rule")
+        self.assertEqual(summary, articles[0]["title"])
+
+    def test_all_zero_score_still_no_representative(self):
+        # 어느 title도 하위주제 토큰을 담지 않으면(전부 score=0) 기존 불변식대로
+        # no_representative — tie-breaker가 score=0 후보를 대표로 승격시키면 안 된다.
+        # (하위주제 증거가 snippet에만 있는 경우)
+        # 두 title은 서로 공통 토큰이 없고(=하위주제 토큰이 될 수 없음) 하위주제 증거는
+        # snippet에만 있다. 한쪽은 절단, 한쪽은 정상 — 그래도 승격되면 안 된다.
+        articles = [
+            _article("속보...", "https://x.com/z1",
+                     "민경욱 전 의원이 자택에서 의식 불명 상태로 발견돼 병원으로 이송됐다."),
+            _article("현장 화보", "https://x.com/z2",
+                     "민경욱 전 의원이 자택에서 의식 불명 상태로 발견돼 병원으로 이송됐다."),
+        ]
+        summary, summary_type = summarize("민경욱", articles)
+        self.assertEqual(summary, "")
+        self.assertEqual(summary_type, "no_representative")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

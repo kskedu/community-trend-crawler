@@ -11,6 +11,10 @@ from typing import Dict, List, Set, Tuple
 
 _TOKEN_RE = re.compile(r"[가-힣A-Za-z0-9]{2,}")
 
+# 문자열 "끝"의 말줄임(= upstream 절단 signature)만 매칭한다. $ 앵커라 제목 중간의
+# 정상 말줄임표는 매칭되지 않는다. 상세 근거는 _is_truncated_title 참조.
+_ENDS_TRUNCATED_RE = re.compile(r"(\.\.\.|…)$")
+
 # 요약 토큰 빈도 집계에서 제외할 일반어 (최소셋)
 _STOPWORDS = {
     "기자", "뉴스", "오늘", "관련", "이번", "지난", "대한", "위해", "그리고",
@@ -66,6 +70,26 @@ _SUBTOPIC_GENERIC_TOKENS = {
 
 def _tokens(text: str) -> List[str]:
     return [t for t in _TOKEN_RE.findall(text or "") if t not in _STOPWORDS]
+
+
+def _is_truncated_title(title: str) -> bool:
+    """제목이 문자열 "끝"에서 말줄임으로 잘려 있는지.
+
+    뉴스 검색 API는 기사 제목을 원문 그대로 주지 않고 잘라서 반환하는 경우가 있다
+    (2026-07-16 raw API 실측: '임영호 가수' 10건 중 4건이 문자열 끝 "..."로 절단,
+    같은 기사 원문 페이지 og:title은 전체 제목. 길이도 41~44자로 제각각이라 crawler의
+    고정 상한이 아니라 upstream 절단이다). 이런 제목이 대표로 뽑히면 홈/팝업 설명
+    문구가 문장 중간에서 끊긴 채 노출된다.
+
+    판정은 "문자열 끝"만 본다(정규식 $ 앵커). 제목 중간의 말줄임표는 정상 표기이므로
+    (예: "가수 와이스토리, 49세로 사망... 연인이 장례 치르고") 영향을 주지 않는다 —
+    raw API 실측에서도 중간 "..."는 절단이 아님을 확인했다. 한국어 조사/종결어미/
+    미완성 어절 판별 같은 휴리스틱은 쓰지 않는다(오판 위험 대비 이득이 없다).
+
+    호출부(summarize)는 normalize_article이 태그 제거 + 엔티티 디코딩을 끝낸 title을
+    넘긴다. 여기서는 앞뒤 공백만 제거하고 끝 문자만 본다.
+    """
+    return bool(_ENDS_TRUNCATED_RE.search((title or "").strip()))
 
 
 def _document_freq(articles: List[dict]) -> Dict[str, int]:
@@ -161,7 +185,9 @@ def summarize(keyword: str, articles: List[dict]) -> Tuple[str, str]:
     - evidence 1건 → 그 기사 제목을 요약으로 ("title").
       단일 기사는 기사 간 합의가 성립하지 않는 명시적 예외다(임의 선택 문제도 없음).
     - evidence 2건+ 이고 공통 하위주제 없음 → ("", "no_representative")
-    - evidence 2건+ → 하위주제 토큰을 가장 많이 포함한 제목 선택 ("rule")
+    - evidence 2건+ → 하위주제 토큰을 가장 많이 포함한 제목 선택 ("rule").
+      토큰 수가 동점이면 upstream에서 끝이 잘린 제목을 후순위로 둔다(품질 개선일 뿐
+      절단 제목을 복원하지는 않는다 — 절단 제목이 단독 최고점이면 그대로 대표다).
     """
     if not articles:
         return "", "seed_only"
@@ -185,16 +211,33 @@ def summarize(keyword: str, articles: List[dict]) -> Tuple[str, str]:
     # 대표 채점도 하위주제 토큰으로 한다 — 키워드/날짜/일반어를 뺀 "사건 증거"를
     # 가장 많이 담은 제목이 대표다.
     # 대표 후보도 근거 기사로 제한한다 — 하한 보충된 incidental 기사가 대표가 되면 안 된다.
+    #
+    # 동점 시에는 upstream 절단 제목을 후순위로 둔다(_is_truncated_title 참조). 점수 우위는
+    # 절대 뒤집지 않으므로 기존 채점 계약(score > best_score)은 그대로다.
     best_title = ""
     best_score = 0
+    best_truncated = False
     for a in evidence:
         title = (a.get("title") or "").strip()
         if not title:
             continue
         score = sum(1 for tok in set(_tokens(title)) if tok in subtopic)
+        truncated = _is_truncated_title(title)
         if score > best_score:
             best_score = score
             best_title = title
+            best_truncated = truncated
+        elif (
+            # best_title 가드: 아직 우승자가 없으면(전 후보 score=0) 동점 교체를 하지 않는다.
+            # 이 가드가 없으면 score=0 정상 제목이 best_title로 올라와, "어느 title도 하위주제
+            # 토큰을 담지 않으면 no_representative"라는 기존 불변식이 깨진다.
+            best_title
+            and score == best_score
+            and best_truncated
+            and not truncated
+        ):
+            best_title = title
+            best_truncated = truncated
 
     # 하위주제 증거가 snippet에만 있고 어느 title도 담지 않은 경우(best_score==0)는
     # 대표 title을 특정할 수 없다 — 임의 기사로 채우지 않는다.
