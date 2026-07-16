@@ -31,13 +31,17 @@ from keywords.msn import MsnKeywordScraper
 from processor.dedup import dedup
 from processor.filter import filter_notices
 from processor.scorer import score_all
-from db.supabase import upsert_posts, upsert_keywords, upsert_news_issues, fetch_news_issues
+from db.supabase import (
+    upsert_posts, upsert_keywords, upsert_news_issues, fetch_news_issues,
+    record_news_diagnostics,
+)
 from news.movement import apply_movement
 from news.thumbnail import enrich_issue_thumbnails
 from news.seed import fetch_ranked_seed
 from news.naver_news import search_news
 from news import candidates as cand
 from news import datalab as datalab_adapter
+from news import diagnostics
 from news import google as google_adapter
 from news import ranker
 from news.builder import build_ranked_issues
@@ -171,11 +175,195 @@ def _count_recent_keywords(top):
     return sum(1 for t in top if (t.get("news_meta") or {}).get("recent_count", 0) >= 1)
 
 
-def _rank_and_select(candidates, signals, pass_name):
+def _safe_diag(target, thunk):
+    """진단 호출 전체(인자 계산 포함)를 격리한다. 어떤 예외도 랭킹으로 전파하지 않는다.
+
+    thunk는 **무인자 callable**이어야 한다 — Python은 호출 전에 인자를 평가하므로
+    `_safe_diag(t, snap.record, _norm_key(c["keyword"]))` 형태로는 인자 계산 예외가
+    이 경계 밖에서 터진다(Codex plan review P1). 반드시 lambda로 감싼다.
+    """
+    if target is None:
+        return
+    try:
+        thunk()
+    except Exception as e:                # noqa: BLE001 — 순수 관찰이므로 전파 금지가 계약
+        try:
+            target.mark_degraded(e)
+        except Exception:                 # noqa: BLE001 — 이것마저 터져도 랭킹은 보호한다
+            logger.warning("[news-diag] mark_degraded 실패 — 진단 포기(랭킹 영향 없음)")
+
+
+def _finalize_selected(run_diag, issues):
+    """발행 payload로 selected 판정을 확정한다(thunk 안에서만 호출된다)."""
+    snap = run_diag.final_snapshot
+    if snap is not None:
+        snap.finalize_selected((issues or {}).get("keywords") or [])
+
+
+def _new_snapshot(run_diag, pass_name):
+    """PassSnapshot 생성 실패는 run 전역 degraded다 — 빈 성공 이력을 남기지 않는다.
+
+    None으로 계속 진행하면 랭킹은 정상이지만 진단이 candidate_count=0인 'success' 행을
+    저장해, 후보가 없었던 실행과 구분되지 않는다(Codex diff review P1). 랭킹은 그대로
+    진행하되 진단은 저장하지 않는 쪽을 택한다.
+    """
+    try:
+        return diagnostics.PassSnapshot(pass_name)
+    except Exception as e:                # noqa: BLE001
+        logger.warning("[news-diag] snapshot 생성 실패(랭킹 영향 없음): %s", type(e).__name__)
+        _safe_diag(run_diag, lambda: run_diag.mark_degraded(e))
+        return None
+
+
+def _finalize_diagnostics(run_diag):
+    """진단 이력을 RPC 1회로 저장한다. 랭킹/news_top 결과에 절대 영향을 주지 않는다.
+
+    - 채택 snapshot 또는 run 전역이 degraded면 저장하지 않는다(부분 이력 금지).
+    - payload 조립 오류는 run 전역 degraded로 처리한다(§3-1 계약 5).
+    - 예외 메시지는 남기지 않는다 — 타입명만(§10-1).
+    """
+    if run_diag is None:
+        return
+    try:
+        if run_diag.is_degraded():
+            errs = list(run_diag.errors)
+            snap = run_diag.final_snapshot
+            if snap is not None:
+                errs += list(snap.errors)
+            logger.warning(
+                "[news-diag] degraded — 진단 저장 생략 (오류 %d건, 최초 유형=%s)",
+                len(errs), errs[0] if errs else "unknown",
+            )
+            return
+        try:
+            run, decisions = run_diag.build_payload(
+                diagnostics.build_run_key(),
+                git_sha=diagnostics.resolve_git_sha(),
+            )
+        except Exception as e:            # noqa: BLE001
+            # payload 조립 오류 = run 전역 degraded(§3-1 계약 5) → 저장하지 않는다.
+            run_diag.mark_degraded(e)
+            logger.warning(
+                "[news-diag] payload 조립 실패 — 진단 저장 생략: %s", type(e).__name__
+            )
+            return
+        if record_news_diagnostics(run, decisions):
+            logger.info(
+                "[news-diag] 진단 저장 완료 (status=%s, 후보 %d, decisions %d)",
+                run.get("status"), run.get("candidate_count", 0), len(decisions),
+            )
+    except Exception as e:                # noqa: BLE001 — 진단 저장 실패는 랭킹과 무관
+        logger.warning("[news-diag] 진단 저장 실패(랭킹 영향 없음): %s", type(e).__name__)
+
+
+_GATE_REASON_CODES = {
+    "horoscope_content": "HOROSCOPE_CONTENT",
+    "low_quality_news": "LOW_QUALITY_NEWS",
+    "stale_only": "STALE_ONLY",
+}
+
+
+def _diag_gate_reason_code(keyword, signals):
+    """compute_scores 내부 continue의 실제 사유를 판정 함수 그대로 호출해 얻는다.
+
+    차집합만으로는 quality gate(HOROSCOPE/LOW_QUALITY/STALE)와 NO_NEWS_EVIDENCE를 구분할 수
+    없다. 진단이 판정과 어긋나지 않도록 로직을 복제하지 않고 _quality_gate_reason을 재사용한다
+    (순수 함수 — 부작용 없음).
+    """
+    news_map = signals.get("news") or {}
+    nm = news_map.get(keyword)
+    if nm is None:
+        return "NO_NEWS_EVIDENCE"
+    reason = ranker._quality_gate_reason(keyword, nm)
+    if reason:
+        return _GATE_REASON_CODES.get(reason, "LOW_QUALITY_NEWS")
+    return "NO_NEWS_EVIDENCE"
+
+
+def _diag_record_pass(diag, candidates, signals, ranked, pr_excluded, merged,
+                      generic_excluded, selected_pre_display, top, display_excluded):
+    """pass의 최종 판정을 후보별 1건씩 기록한다(순수 관찰).
+
+    _rank_and_select의 단계별 지역변수만으로 재구성하므로 ranker 시그니처를 바꾸지 않는다.
+    식별자는 _norm_key(candidates._merge의 pool 키와 동일) — display_keyword나 객체
+    identity는 merge 후 변형/복사되어 식별자로 쓸 수 없다.
+
+    모든 후보는 정확히 1개의 decision을 갖는다:
+      candidate_count = selected + not_selected + rule_excluded
+    """
+    nk = diagnostics._norm_key
+    top_by_key = {nk(t["keyword"]): t for t in top}
+    ranked_keys = {nk(r["keyword"]) for r in ranked}
+    pr_keys = {nk(k) for k in pr_excluded}
+    generic_keys = {nk(k) for k in generic_excluded}
+    display_keys = {nk(k) for k in display_excluded}
+    pre_display_keys = {nk(t["keyword"]) for t in selected_pre_display}
+    merged_keys = {nk(m["keyword"]) for m in merged}
+    # merge로 흡수된 후보 → canonical 대표. related_keywords가 원본 keyword를 보존한다.
+    absorbed = {}
+    for m in merged:
+        for rel in (m.get("related_keywords") or []):
+            absorbed[nk(rel)] = m["keyword"]
+
+    for c in candidates:
+        kw = c["keyword"]
+        key = nk(kw)
+        item = top_by_key.get(key)
+        if item is not None:
+            # 이 시점에는 rank/summary/representative/display_articles가 아직 없다 —
+            # builder가 나중에 만든다. selected 행의 실제 값은 발행 직전
+            # RunDiagnostics.finalize_selected()가 issues["keywords"]로 확정한다.
+            diag.record(
+                kw, diagnostics.STATUS_SELECTED, "SELECTED",
+                display_keyword=item.get("display_keyword"),
+                score=item.get("score"),
+                merge_reason=item.get("merge_reason"),
+                related_keywords=item.get("related_keywords"),
+                source_count=len(c.get("sources") or {}),
+            )
+            continue
+
+        if key in display_keys:
+            status, reason = diagnostics.STATUS_NOT_SELECTED, "INSUFFICIENT_DISPLAY_ARTICLES"
+        elif key in pre_display_keys:
+            # select_top을 통과했지만 display 제외도 아닌데 top에 없다 = 이론상 도달 불가.
+            status, reason = diagnostics.STATUS_NOT_SELECTED, "RANK_CUTOFF"
+        elif key in generic_keys:
+            status, reason = diagnostics.STATUS_NOT_SELECTED, "GENERIC_SINGLETON"
+        elif key in absorbed:
+            status, reason = diagnostics.STATUS_NOT_SELECTED, "MERGED_INTO_OTHER"
+        elif key in merged_keys:
+            # merge 후 생존했으나 select_top에서 탈락 = 순위 컷.
+            status, reason = diagnostics.STATUS_NOT_SELECTED, "RANK_CUTOFF"
+        elif key in pr_keys:
+            status, reason = diagnostics.STATUS_NOT_SELECTED, "PR_CLUSTER"
+        elif key in ranked_keys:
+            # gate/PR/merge 어디에도 없는데 사라짐 → display 정합성 invariant 단계에서 탈락.
+            # 이 단계는 제외 목록을 반환하지 않으므로(반환 계약 불변 유지) 두 reject 분기를
+            # 실제 판정 함수로 되짚어 구분한다 — 안 그러면 DISPLAY_GENERIC_ONLY가 영구
+            # 도달 불가 코드가 된다(Codex diff review P1).
+            status = diagnostics.STATUS_NOT_SELECTED
+            reason = ("DISPLAY_GENERIC_ONLY" if ranker._is_generic_only_display(kw)
+                      else "DISPLAY_ARTICLE_INCONSISTENT")
+        else:
+            # compute_scores 내부 continue — 실제 판정 함수로 사유를 확정한다(추측 금지).
+            status = diagnostics.STATUS_NOT_SELECTED
+            reason = _diag_gate_reason_code(kw, signals)
+
+        diag.record(
+            kw, status, reason,
+            source_count=len(c.get("sources") or {}),
+            canonical_keyword=absorbed.get(key),
+        )
+
+
+def _rank_and_select(candidates, signals, pass_name, diag=None):
     """score → dedupe/merge → generic singleton 제외 → Top10 + pass별 단계 카운트 로그.
 
     final이 TOP_N 미만일 때 부족 사유(어느 단계에서 몇 개가 줄었는지)를 재구성할 수
     있도록 단계별 수를 항상 남긴다(품질 기준 완화 없이 개수만 관찰).
+
+    diag: PassSnapshot(호출자가 생성해 명시 전달). None이면 진단 미수집 — 랭킹 동작 동일.
     """
     ranked = ranker.compute_scores(candidates, signals)
     gate_passed = len(ranked)
@@ -228,6 +416,11 @@ def _rank_and_select(candidates, signals, pass_name):
         logger.warning(
             "[news] %s: homonym entity sense 관찰(제외 아님) %s", pass_name, homonym_diags
         )
+    # 진단 기록(순수 관찰) — 인자 계산까지 thunk 안에서 일어나야 격리된다.
+    _safe_diag(diag, lambda: _diag_record_pass(
+        diag, candidates, signals, ranked, pr_excluded, merged,
+        generic_excluded, selected_pre_display, top, display_excluded,
+    ))
     return top
 
 
@@ -342,6 +535,7 @@ def _cache_google_keywords(google_cands):
 def _backfill_pass(
     pass1_top, pass1_aux, home_fulls, google_cands, daum_full,
     cached_search_news, news_signals, datalab_signals, google_signals,
+    diag=None,
 ):
     """pass2(backfill): 후보 발굴 확장 후 동일 gate/merge로 전체 재계산.
 
@@ -364,6 +558,9 @@ def _backfill_pass(
     diversity/improved/rollback guard는 전부 최종 candidates2 조립 이후에 둔다(위치 불변).
 
     반환: (top2, candidates2). 채택하지 않으면 (None, None).
+
+    diag: pass2 PassSnapshot(호출자 생성·전달). 여기선 채택 여부를 모르므로 commit하지 않고,
+          finally에서 seal만 한다 — 채택 시 호출자가 final_snapshot으로 지정한다.
     """
     try:
         aux_expanded = cand.derive_aux_keywords(
@@ -440,7 +637,7 @@ def _backfill_pass(
             "datalab": datalab_signals,
             "google": google_signals,
         }
-        top2 = _rank_and_select(candidates2, signals2, "pass2(backfill)")
+        top2 = _rank_and_select(candidates2, signals2, "pass2(backfill)", diag=diag)
         # phrase 후보가 최종 Top에 몇 개 생존했는지(diversity 관찰용) — canonical sources에
         # naver_news_phrase 키가 있는 항목 수.
         # 한계(Codex diff 리뷰 P2, 관측 로그 전용이라 기록만): phrase 후보가 non-phrase
@@ -469,9 +666,14 @@ def _backfill_pass(
     except Exception as e:
         logger.warning("[news] pass2 backfill 실패(무시하고 pass1 결과 유지): %s", e)
         return None, None
+    finally:
+        # seal — 추가 기록만 막고 수집분은 보존한다. 폐기든 채택이든 수명을 여기서 확정하고,
+        # 채택 시 호출자가 이 객체를 final_snapshot으로 지정한다(소유권은 호출자).
+        if diag is not None:
+            _safe_diag(diag, diag.close)
 
 
-def run_news_briefing():
+def run_news_briefing(run_type="full"):
     """통합 랭킹으로 news_issue_cache(source='news_top') 갱신.
 
     흐름: 홈/트렌드 seed(google_trends/daum_home/nate_home/bing_home) + 보조후보 수집 →
@@ -493,6 +695,13 @@ def run_news_briefing():
     - recent_guard_failed(Top10 중 최근 기사 보유 키워드 < MIN_RECENT_KEYWORDS) → skip
     실패해도 커뮤니티/키워드 수집 결과엔 영향 없도록 격리.
     """
+    # 진단 수집기(순수 관찰). 어떤 오류도 아래 랭킹 흐름에 영향을 주지 않는다.
+    run_diag = None
+    try:
+        run_diag = diagnostics.RunDiagnostics(run_type=run_type)
+    except Exception as de:               # noqa: BLE001 — 수집기 자체가 없어도 랭킹은 돈다
+        logger.warning("[news-diag] 수집기 초기화 실패(랭킹 영향 없음): %s", type(de).__name__)
+
     try:
         # 1) 홈/트렌드 seed 수집
         home_fulls = _collect_home_seeds()  # {family: ranked(≤20)}
@@ -512,8 +721,11 @@ def run_news_briefing():
         aux = cand.derive_aux_keywords(daum_full, cached_search_news)
         seed_sources = _seed_sources_from(home_fulls, google_cands, HOME_PASS1_TOP)
         candidates = cand.collect_candidates(seed_sources, aux)
+        # 수집 원시 후보 수 — 카운트 invariant 합계에 넣지 않는 별도 메타값(§8-1).
+        _safe_diag(run_diag, lambda: run_diag.mark_collected(len(candidates)))
         if not candidates:
             logger.warning("[news] 후보 없음 → news_top upsert skip (last good 유지)")
+            _safe_diag(run_diag, lambda: run_diag.mark_skipped("NO_CANDIDATES"))
             return
 
         # 다양성 guard(source family)
@@ -523,12 +735,14 @@ def run_news_briefing():
                 "[news] source_diversity_failed(독립 family %d < %d) → skip (last good 유지)",
                 families, cand.MIN_SOURCE_FAMILIES,
             )
+            _safe_diag(run_diag, lambda: run_diag.mark_skipped("SOURCE_DIVERSITY_FAILED"))
             return
 
         # 2) 신호 산출 (홈 rank demand는 ranker가 candidate.sources에서 직접 읽음)
         news_signals = cand.build_news_signals(candidates, cached_search_news)
         if not news_signals:
             logger.warning("[news] no_news_evidence(News 신호 전무) → skip (last good 유지)")
+            _safe_diag(run_diag, lambda: run_diag.mark_skipped("NO_NEWS_SIGNALS"))
             return
         kw_list = [c["keyword"] for c in candidates]
         datalab_signals = datalab_adapter.fetch(kw_list)
@@ -541,19 +755,36 @@ def run_news_briefing():
         }
 
         # 3) pass1(strict): score → dedupe/same-issue merge → generic singleton 제외 → Top10
-        top = _rank_and_select(candidates, signals, "pass1(strict)")
+        # snapshot 소유권은 호출자에 있다 — 여기서 만들어 명시적으로 전달한다(전역 상태 없음).
+        snap1 = _new_snapshot(run_diag, "pass1(strict)")
+        top = _rank_and_select(candidates, signals, "pass1(strict)", diag=snap1)
+        # 채택 확정 시점에만 final_snapshot을 지정한다.
+        _safe_diag(run_diag, lambda: run_diag.commit(snap1))
         if not top:
             logger.warning("[news] 랭킹 결과 없음 → skip (last good 유지)")
+            # 랭킹을 이미 통과했으므로 판정이 실재한다 → snapshot decisions를 보존한다.
+            _safe_diag(run_diag, lambda: run_diag.mark_skipped("NO_RANKING_RESULT"))
             return
 
         # 3-1) pass2(backfill): final 부족 또는 최근성 가드 미달이면 후보 발굴 확장.
         if len(top) < ranker.TOP_N or _count_recent_keywords(top) < MIN_RECENT_KEYWORDS:
+            snap2 = _new_snapshot(run_diag, "pass2(backfill)")
             top2, candidates2 = _backfill_pass(
                 top, aux, home_fulls, google_cands, daum_full,
                 cached_search_news, news_signals, datalab_signals, google_signals,
+                diag=snap2,
             )
             if top2 is not None:
                 top, candidates = top2, candidates2
+                # pass2 채택 → 최종 snapshot 교체(pass1 판정은 최종 결과가 아니므로 폐기).
+                _safe_diag(run_diag, lambda: run_diag.commit(snap2))
+            elif snap2 is not None and snap2.degraded:
+                # 폐기된 pass의 degraded는 정상 pass1 저장을 막지 않는다 — warning만.
+                logger.warning(
+                    "[news-diag] pass2(폐기됨) 진단 오류 %d건, 최초 유형=%s "
+                    "— 최종 pass1 진단 저장에는 영향 없음",
+                    len(snap2.errors), snap2.errors[0] if snap2.errors else "unknown",
+                )
 
         # Top10 최근성 가드
         recent_kw = _count_recent_keywords(top)
@@ -562,6 +793,8 @@ def run_news_briefing():
                 "[news] recent_guard_failed(최근 기사 보유 키워드 %d < %d) → skip (last good 유지)",
                 recent_kw, MIN_RECENT_KEYWORDS,
             )
+            # 채택 pass의 전체 판정이 실재한다 → 보존한다(0으로 밀지 않는다).
+            _safe_diag(run_diag, lambda: run_diag.mark_skipped("RECENT_GUARD_FAILED"))
             return
         if len(top) < ranker.TOP_N:
             # publish 정책(사용자 확정 2026-07-04):
@@ -602,6 +835,13 @@ def run_news_briefing():
         except Exception as te:
             logger.warning("[news] 썸네일 enrich 실패(무시하고 진행): %s", te)
 
+        # selected 행의 rank/summary/대표/display_articles는 여기서야 확정된다
+        # (_rank_and_select 시점에는 builder가 아직 안 돌아 존재하지 않는다).
+        # 실제 발행되는 payload 그대로 진단에 반영해 둘이 어긋나지 않게 한다.
+        _safe_diag(run_diag, lambda: _finalize_selected(run_diag, issues))
+
+        # upsert_news_issues는 예외가 아니라 False를 반환한다(db/supabase.py) —
+        # False를 성공으로 기록하지 않는다.
         if upsert_news_issues(issues, source="news_top"):
             logger.info(
                 "[news] news_top 저장 완료 (%d개, sources=%s)",
@@ -609,8 +849,15 @@ def run_news_briefing():
             )
         else:
             logger.warning("[news] news_top 저장 실패")
+            _safe_diag(run_diag, lambda: run_diag.mark_failed("NEWS_TOP_UPSERT_FAILED"))
     except Exception as e:
         logger.error(f"[news] 실시간 이슈 브리핑 실패(커뮤니티/키워드 수집에는 영향 없음): {e}")
+        # skip_reason CHECK에 실행 예외용 값이 없다(배포 스키마) → status=failed만 남기고
+        # 사유는 error_summary(예외 타입명)로 기록한다. 새 코드를 임의로 만들지 않는다.
+        _safe_diag(run_diag, lambda: run_diag.mark_failed(None, e))
+    finally:
+        # 진단 저장은 랭킹 흐름 밖에서, 결과와 무관하게 마지막에 1회 시도한다.
+        _finalize_diagnostics(run_diag)
 
 
 if __name__ == "__main__":
@@ -627,6 +874,6 @@ if __name__ == "__main__":
     elif mode == "news_top_only":
         logger.info("[mode] news_top_only — 커뮤니티 수집 생략, 포털 키워드+news_top 갱신")
         _collect_keyword_caches({})
-        run_news_briefing()
+        run_news_briefing(run_type="news_top_only")
     else:
         raise SystemExit(f"Unknown mode: {mode!r} (allowed: full, news_top_only)")
