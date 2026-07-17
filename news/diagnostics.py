@@ -17,9 +17,22 @@ NO_REPRESENTATIVE는 selected의 부분집합이며 별도 합산하지 않는�
 
 import logging
 import os
+import time
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
+
+# 랭킹/게이트 판정 규칙의 버전(사용자 확정 2026-07-17). git_sha(어느 커밋이 실행됐는지)와는
+# 별개 개념 — 이 값은 규칙의 "의미"가 바뀔 때만 사람이 수동으로 올린다.
+# bump 기준(단일 권위 출처, 다른 곳에 복제하지 않는다):
+#   MAJOR: 기존 Admin 해석과 호환 안 되는 계약 변경(result_status 의미 변경,
+#          기존 reason_code 삭제·의미 변경, candidate_count 산식 변경)
+#   MINOR: 기존 계약 유지 + 새 판정 규칙/reason_code 추가, 임계값 변경으로 결과
+#          분포가 의미 있게 달라지는 경우
+#   PATCH: 규칙 의미는 유지한 채 판정 구현 오류 수정, 진단 기록 정확성만 보정
+#   변경 없음: 로그/테스트/리팩터링/성능 개선/source 매핑처럼 판정 결과와 규칙
+#              의미가 변하지 않는 작업(이번 PR 전체가 여기 해당 — bump 없이 최초 도입만)
+RULES_VERSION = "1.0.0"
 
 # 결과 상태 — 배포 SQL CHECK와 1:1
 # (news_keyword_decisions.result_status IN ('selected','not_selected','selected_no_representative'))
@@ -61,8 +74,22 @@ def _norm_key(keyword):
 
 
 def _safe_article(article):
-    """기사 메타를 allowlist로 축소한다. 본문/description은 애초에 담지 않는다."""
-    return {f: article.get(f) for f in _ARTICLE_FIELDS if article.get(f) is not None}
+    """기사 메타를 allowlist로 축소한다. 본문/description은 애초에 담지 않는다.
+
+    source 매핑(2026-07-17): article dict는 news/normalizer.py가 만들며 "press"
+    필드만 갖는다("source" 키는 오늘 코드 어디서도 만들지 않는다 — 전수 확인됨).
+    저장 컬럼명은 기존 스키마상 "source"로 고정돼 있어(랭킹 계층의 signals["news"]
+    sources 개념과는 무관한, diagnostics 전용 표시명) 여기서만 press->source로
+    투영한다. 우선순위(방어적, 현재 데이터엔 충돌 케이스가 없다): article에 실제
+    "source" 값이 있으면(향후 upstream 확장 대비) 그것을 쓰고, 없으면 "press"로
+    폴백한다. ranking/representative 선정/display_articles 구성에는 영향 없음
+    (이 함수는 진단 전용 투영이며 main.py의 issues payload에 되먹임되지 않는다).
+    """
+    source = article.get("source") or article.get("press")
+    safe = {f: article.get(f) for f in _ARTICLE_FIELDS if f != "source" and article.get(f) is not None}
+    if source:
+        safe["source"] = source
+    return safe
 
 
 class PassSnapshot:
@@ -199,6 +226,9 @@ class RunDiagnostics:
             raise ValueError(f"invalid run_type: {run_type!r}")
         self.run_type = run_type
         self.started_at = _now_iso()
+        # duration_ms 계산 전용 — 시스템 시각 보정(NTP 등)에 영향받지 않는 단조 시계.
+        # started_at(표시/저장용 wall-clock)과 별개로 둔다.
+        self._started_monotonic = time.monotonic()
         self.status = "success"
         self.skip_reason = None
         self.error_summary = None
@@ -266,6 +296,7 @@ class RunDiagnostics:
             "skip_reason": self.skip_reason,
             "started_at": self.started_at,
             "finished_at": _now_iso(),
+            "duration_ms": self._compute_duration_ms(),
             "git_sha": git_sha,
             "rules_version": rules_version,
             "thresholds": thresholds,
@@ -274,6 +305,20 @@ class RunDiagnostics:
         }
         run.update(counts)
         return run, decisions
+
+    def _compute_duration_ms(self):
+        """monotonic clock 기준 경과 시간(ms). success/failed/skipped 전부 동일하게 계산된다
+        (build_payload는 결과와 무관하게 항상 finally에서 1회 호출됨 — main.py 참조).
+
+        음수만 방어(시계 역행 등 이론상 이상 케이스, monotonic이라 정상 경로에선 발생하지
+        않는다) — 상한 클램프는 두지 않는다. 실제로 오래 걸린 정상 실행을 NULL로 지워버리면
+        이번 PR이 메우려는 관측 공백을 다시 만드는 셈이다(Codex diff review P2).
+        """
+        try:
+            elapsed_ms = round((time.monotonic() - self._started_monotonic) * 1000)
+        except Exception:      # noqa: BLE001 — duration은 부가 정보, 실패해도 진단은 계속.
+            return None
+        return elapsed_ms if elapsed_ms >= 0 else None
 
 
 def _int_or_none(v):

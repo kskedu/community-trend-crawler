@@ -12,6 +12,7 @@
 import json
 import os
 import sys
+import time
 import unittest
 from unittest.mock import patch
 
@@ -172,6 +173,38 @@ class SnapshotContractTest(unittest.TestCase):
         self.assertNotIn("전체 본문", stored)
         self.assertIn("제목", stored)
 
+    def test_press_mapped_to_source_when_source_absent(self):
+        """article dict가 실제로 갖는 필드는 press뿐(source는 오늘 코드가 만들지 않음).
+        진단 저장 컬럼명은 source로 고정돼 있어 여기서만 press->source로 투영한다."""
+        snap = diagnostics.PassSnapshot("pass1")
+        snap.record(
+            "A", diagnostics.STATUS_SELECTED, "SELECTED",
+            articles=[{"title": "제목", "url": "u", "press": "조선일보"}],
+        )
+        stored = snap.payload_decisions()[0]["articles"][0]
+        self.assertEqual(stored["source"], "조선일보")
+        self.assertNotIn("press", stored)  # allowlist 밖 원본 키는 담기지 않는다
+
+    def test_explicit_source_field_wins_over_press(self):
+        """방어적 우선순위: article에 실제 source 값이 있으면(향후 upstream 확장 대비)
+        그것을 쓰고, press로 덮어쓰지 않는다."""
+        snap = diagnostics.PassSnapshot("pass1")
+        snap.record(
+            "A", diagnostics.STATUS_SELECTED, "SELECTED",
+            articles=[{"title": "제목", "url": "u", "source": "명시적소스", "press": "조선일보"}],
+        )
+        stored = snap.payload_decisions()[0]["articles"][0]
+        self.assertEqual(stored["source"], "명시적소스")
+
+    def test_article_without_press_or_source_omits_source_key(self):
+        snap = diagnostics.PassSnapshot("pass1")
+        snap.record(
+            "A", diagnostics.STATUS_SELECTED, "SELECTED",
+            articles=[{"title": "제목", "url": "u"}],
+        )
+        stored = snap.payload_decisions()[0]["articles"][0]
+        self.assertNotIn("source", stored)
+
     def test_counts_invariant(self):
         snap = diagnostics.PassSnapshot("pass1")
         snap.record("a", diagnostics.STATUS_SELECTED, "SELECTED")
@@ -253,6 +286,63 @@ class PayloadTest(unittest.TestCase):
         with patch.dict(os.environ, {"GITHUB_RUN_ID": "16999", "GITHUB_RUN_ATTEMPT": "2"}):
             second = diagnostics.build_run_key()
         self.assertNotEqual(first, second)
+
+    def test_rules_version_passed_through_to_payload(self):
+        run = diagnostics.RunDiagnostics()
+        run.commit(diagnostics.PassSnapshot("pass1"))
+        payload, _ = run.build_payload("ts:x", rules_version=diagnostics.RULES_VERSION)
+        self.assertEqual(payload["rules_version"], "1.0.0")
+
+    def test_rules_version_defaults_to_none_when_not_passed(self):
+        """호출부가 실수로 인자를 빼먹으면 예전처럼 조용히 NULL — 회귀를 명시적으로 남긴다."""
+        run = diagnostics.RunDiagnostics()
+        run.commit(diagnostics.PassSnapshot("pass1"))
+        payload, _ = run.build_payload("ts:x")
+        self.assertIsNone(payload["rules_version"])
+
+    def test_main_module_passes_rules_version(self):
+        """main.py의 실제 호출부가 RULES_VERSION을 빠뜨리지 않는지 회귀 방지."""
+        run = diagnostics.RunDiagnostics()
+        run.commit(diagnostics.PassSnapshot("pass1"))
+        with patch.object(main_module, "record_news_diagnostics", return_value=True) as rpc:
+            main_module._finalize_diagnostics(run)
+            payload = rpc.call_args[0][0]
+            self.assertEqual(payload["rules_version"], diagnostics.RULES_VERSION)
+
+    def test_duration_ms_is_nonnegative_integer(self):
+        run = diagnostics.RunDiagnostics()
+        run.commit(diagnostics.PassSnapshot("pass1"))
+        time.sleep(0.01)
+        payload, _ = run.build_payload("ts:x")
+        self.assertIsInstance(payload["duration_ms"], int)
+        self.assertGreaterEqual(payload["duration_ms"], 0)
+
+    def test_duration_ms_populated_on_failed_run(self):
+        run = diagnostics.RunDiagnostics()
+        run.mark_failed("NEWS_TOP_UPSERT_FAILED")
+        run.commit(diagnostics.PassSnapshot("pass1"))
+        time.sleep(0.01)
+        payload, _ = run.build_payload("ts:x")
+        self.assertIsInstance(payload["duration_ms"], int)
+        self.assertGreaterEqual(payload["duration_ms"], 0)
+
+    def test_duration_ms_populated_on_skipped_run(self):
+        run = diagnostics.RunDiagnostics()
+        run.mark_skipped("NO_CANDIDATES")
+        run.commit(diagnostics.PassSnapshot("pass1"))
+        time.sleep(0.01)
+        payload, _ = run.build_payload("ts:x")
+        self.assertIsInstance(payload["duration_ms"], int)
+        self.assertGreaterEqual(payload["duration_ms"], 0)
+
+    def test_duration_ms_uses_monotonic_not_wall_clock(self):
+        """시스템 시각이 뒤로 감겨도(NTP 보정 등) duration이 음수로 새지 않는다."""
+        run = diagnostics.RunDiagnostics()
+        run.commit(diagnostics.PassSnapshot("pass1"))
+        with patch("news.diagnostics._now_iso", return_value="2000-01-01T00:00:00+00:00"):
+            payload, _ = run.build_payload("ts:x")
+        self.assertIsInstance(payload["duration_ms"], int)
+        self.assertGreaterEqual(payload["duration_ms"], 0)
 
 
 class DegradedGateTest(unittest.TestCase):
@@ -607,6 +697,56 @@ class BriefingPassFlowTest(unittest.TestCase):
                 expected_url = (entries[k].get("representative_article") or {}).get("url")
                 self.assertEqual(rows[k]["representative_url"], expected_url)
                 self.assertTrue(rows[k]["representative_url"])
+
+    def test_news_top_payload_identical_with_diagnostics_on_and_off(self):
+        """PR B-1 필수 테스트: 진단 RPC가 성공/실패해도 news_top 발행 payload는
+        동일해야 한다(_safe_diag 경계, PR B-1은 이 경계를 약화하지 않는다).
+
+        builder.py가 issues["generated_at"]에 실행 시각(datetime.now())을 매번 새로
+        찍으므로 그 필드만 제외하고 비교한다 — 이건 진단과 무관한 기존 동작이라
+        diag ON/OFF 비교 대상이 아니다.
+        """
+        published_with_rpc, published_without_rpc = [], []
+
+        with _BriefingHarness(self), \
+             patch.object(main_module, "upsert_news_issues",
+                          side_effect=lambda i, source="news_top": published_with_rpc.append(i) or True), \
+             patch.object(main_module, "record_news_diagnostics", return_value=True):
+            main_module.run_news_briefing()
+
+        with _BriefingHarness(self), \
+             patch.object(main_module, "upsert_news_issues",
+                          side_effect=lambda i, source="news_top": published_without_rpc.append(i) or True), \
+             patch.object(main_module, "record_news_diagnostics", side_effect=RuntimeError("rpc down")):
+            main_module.run_news_briefing()
+
+        def without_generated_at(issues):
+            return {k: v for k, v in issues.items() if k != "generated_at"}
+
+        self.assertEqual(
+            json.dumps(without_generated_at(published_with_rpc[0]), sort_keys=True, default=str),
+            json.dumps(without_generated_at(published_without_rpc[0]), sort_keys=True, default=str),
+        )
+
+    def test_all_three_fields_populate_on_real_run(self):
+        """PR B-1 필수 테스트: rules_version/duration_ms/article.source가 실제
+        run_news_briefing() 경로에서 함께 적재되는지(단위 테스트가 아닌 통합 경로)."""
+        with _BriefingHarness(self), \
+             patch.object(main_module, "upsert_news_issues", return_value=True), \
+             patch.object(main_module, "record_news_diagnostics", return_value=True) as rpc:
+            main_module.run_news_briefing()
+            payload, decisions = rpc.call_args[0]
+
+            self.assertEqual(payload["rules_version"], diagnostics.RULES_VERSION)
+            self.assertIsInstance(payload["duration_ms"], int)
+            self.assertGreaterEqual(payload["duration_ms"], 0)
+
+            articles_with_source = [
+                a for d in decisions for a in (d.get("articles") or []) if a.get("source")
+            ]
+            self.assertTrue(articles_with_source, "articles에 source가 채워진 항목이 없다")
+            for a in articles_with_source:
+                self.assertTrue(a["source"].startswith("press"))  # _candidates fixture 값
 
     def test_count_invariant_holds_on_real_run(self):
         with _BriefingHarness(self), \
