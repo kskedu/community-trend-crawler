@@ -239,6 +239,7 @@ def _finalize_diagnostics(run_diag):
             run, decisions = run_diag.build_payload(
                 diagnostics.build_run_key(),
                 git_sha=diagnostics.resolve_git_sha(),
+                rules_version=diagnostics.RULES_VERSION,
             )
         except Exception as e:            # noqa: BLE001
             # payload 조립 오류 = run 전역 degraded(§3-1 계약 5) → 저장하지 않는다.
