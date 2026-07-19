@@ -192,6 +192,11 @@ def _quality_gate_reason(keyword: str, news_meta: Dict) -> Optional[str]:
     - 관련 기사는 있으나 전부 오래됨(FRESH_RELEVANCE_HOURS 이내 고관련 0건)이면 stale_only.
     - keyword/기사 다수가 오늘의 운세류 반복 콘텐츠면 horoscope_content(2026-07-05) —
       기사 수/freshness가 충분해도 실시간 이슈가 아니므로 위 두 조건보다 먼저 판정한다.
+    - entity 키워드 cohesion(E, 2026-07): keyword_kind=='entity'인데 고관련 기사가 실제로
+      같은 사건이 아니면(has_dominant_event=False AND same_event_burst=False) low_quality_news.
+      단일 엔티티 토큰("한화")만 공유하고 야구/그룹/오션 등 서로 다른 사건인 기사 2건으로
+      gate를 통과하던 문제를 막는다. event/unknown 키워드에는 적용하지 않는다(산불/폭우 등
+      사건·현상 단독어와 다토큰 키워드의 정상 이슈 오탈락 방지 — 사용자 지시).
     """
     if _is_horoscope_candidate(keyword, news_meta):
         return "horoscope_content"
@@ -201,6 +206,10 @@ def _quality_gate_reason(keyword: str, news_meta: Dict) -> Optional[str]:
         return "low_quality_news"
     if news_meta.get("fresh_high_relevance_count", 0) < 1:
         return "stale_only"
+    # entity 전용 cohesion gate — 정제(candidates C) 후 신호 소비.
+    if news_meta.get("keyword_kind") == "entity":
+        if not (news_meta.get("has_dominant_event") or news_meta.get("same_event_burst")):
+            return "low_quality_news"
     return None
 
 
@@ -1237,6 +1246,46 @@ def _boost_short_generic_singleton_display(item: Dict, kw: str) -> Dict:
     return item
 
 
+def _specify_entity_singleton_display(item: Dict, kw: str) -> Optional[Dict]:
+    """entity 단독어를 "엔티티 + 지배적 사건"으로 구체화한다(G, 2026-07). 근거 부족 시 None.
+
+    조건(모두 만족해야 구체화):
+    - news_meta.keyword_kind == 'entity' (한화/신천지류 단일 엔티티).
+    - has_dominant_event=True 이고 dominant_event_tokens(keyword 제외 공통 사건토큰) 존재.
+    - 대표기사 title에 그 사건토큰이 실제 등장(근거 없는 조합 방지).
+    구체화 결과는 "엔티티 사건토큰1[ 사건토큰2]"(상한 DISPLAY_KEYWORD_MAX_LEN). 만들 수
+    없으면 None을 반환해 호출부가 기존 경로를 타게 한다(억지 대체 없음 — 사용자 지시:
+    충분한 근거 없으면 구체화하지 않고, 근거가 아예 없으면 B2가 Top10에서 제외).
+    """
+    from news.summarizer import _tokens
+
+    news_meta = item.get("news_meta") or {}
+    if news_meta.get("keyword_kind") != "entity":
+        return None
+    if not news_meta.get("has_dominant_event"):
+        return None
+    event_tokens = news_meta.get("dominant_event_tokens") or []
+    if not event_tokens:
+        return None
+
+    representative = news_meta.get("representative_article") or {}
+    rep_toks = [t for t in _tokens(representative.get("title") or "") if t in set(event_tokens)]
+    if not rep_toks:
+        return None  # 대표기사 title에 사건토큰이 없으면 근거 부족 → 구체화 안 함.
+
+    # 대표 title 등장 순서로 최대 2개 사건토큰을 붙인다.
+    picked = list(dict.fromkeys(rep_toks))[:2]
+    candidate = f"{kw} {' '.join(picked)}".strip()
+    if len(candidate) > DISPLAY_KEYWORD_MAX_LEN:
+        candidate = f"{kw} {picked[0]}".strip()
+    if len(candidate) > DISPLAY_KEYWORD_MAX_LEN or candidate == kw:
+        return None
+
+    result = dict(item)
+    result["display_keyword"] = candidate
+    return result
+
+
 def _resolve_singleton_display(item: Dict) -> Dict:
     """단독(merge 안 된) item의 display_keyword를 sense-mixing 관점에서 재검토한다.
 
@@ -1257,6 +1306,12 @@ def _resolve_singleton_display(item: Dict) -> Dict:
         item = dict(item)
         item["display_keyword"] = kw
     if not _ends_with_search_intent_suffix(kw):
+        # entity 단독어(한화/신천지 등)가 dominant event를 가지면 "엔티티 + 사건"으로
+        # 구체화한다(G, 2026-07: 한화 → 한화 7연패). 근거가 충분할 때만(has_dominant_event
+        # AND dominant_event_tokens 존재) 시도하고, 실패하면 아래 기존 보강 경로로 넘어간다.
+        specified = _specify_entity_singleton_display(item, kw)
+        if specified is not None:
+            return specified
         # 검색의도 suffix가 아니면 "짧은 일반 생활명사 단독" 보강 경로를 시도한다
         # (2026-07: "안경" 단독 → "AI 안경"). 대상이 아니면 원형 그대로 반환.
         return _boost_short_generic_singleton_display(item, kw)
@@ -1811,30 +1866,24 @@ DISPLAY_ARTICLES_MIN = 2
 def exclude_insufficient_display_articles(items: List[Dict]) -> tuple:
     """display_articles(사용자 노출 전용)가 DISPLAY_ARTICLES_MIN 미만(<=1)인 후보를 제외.
 
-    builder가 issues를 조립할 때 계산하는 display_articles와 동일한 입력
-    (news_meta.articles → dedup → filter_articles_for_display → build_display_articles)으로
-    노출 개수를 미리 산출해, build 이전에 제외한다. build 이전에 적용해야 run_news_briefing의
-    recent guard / partial publish 판단과 저장 로그가 실제 발행 개수와 정합한다
-    (Codex review-only P2, 2026-07-05: builder 단계에서 줄이면 이미 끝난 recent guard/
-    로그와 어긋남). articles 원본/ranking gate/quality·fresh·PR gate는 건드리지 않는다 —
-    이 gate는 "사용자 노출 품질" 방어용이며, 제외로 개수가 줄어도 filler는 넣지 않는다.
+    canonical_evidence helper(candidates.py)로 builder와 완전 동일한 정제 기사 집합을 얻어
+    display 개수를 산출한다(F, 2026-07: drift 방지 단일 진실원).
 
-    dedupe_and_merge()/generic·PR gate/enforce_display_article_consistency 이후,
-    select_top() 이후에 적용한다(최종 노출 후보 확정 단계).
+    **select_top() 이전, 전체 merged 리스트에 적용한다(2026-07 변경, Codex 계획리뷰 P1-4)** —
+    이전엔 select_top 이후 적용이라 Top10 통과분이 display 부족으로 빠지면 하위 backfill 없이
+    9개가 됐다. select_top 전에 제외하면 그 자리를 하위 정상후보가 채운다. 제외로 개수가
+    줄어도 filler는 넣지 않는다. articles 원본/ranking gate/quality·fresh·PR gate는 불변.
     반환: (kept, excluded_keywords).
     """
-    from news.dedup import dedup_articles
-    from news.builder import ARTICLES_MIN, ARTICLES_MAX
-    from news.candidates import build_display_articles, filter_articles_for_display
+    from news.candidates import build_display_articles, canonical_evidence
 
     kept: List[Dict] = []
     excluded: List[str] = []
     for item in items:
         news_meta = item.get("news_meta") or {}
-        articles = filter_articles_for_display(
-            dedup_articles(news_meta.get("articles") or []), min_count=ARTICLES_MIN
-        )[:ARTICLES_MAX]
-        effective_keyword = item.get("display_keyword") or item.get("keyword")
+        keyword = item.get("keyword", "")
+        articles, _, _ = canonical_evidence(news_meta, keyword)
+        effective_keyword = item.get("display_keyword") or keyword
         display = build_display_articles(
             effective_keyword, articles, news_meta.get("representative_article")
         )
@@ -1843,7 +1892,38 @@ def exclude_insufficient_display_articles(items: List[Dict]) -> tuple:
                 "[news] drop %s: insufficient_display_articles(%d<%d)",
                 effective_keyword, len(display), DISPLAY_ARTICLES_MIN,
             )
-            excluded.append(item.get("keyword", ""))
+            excluded.append(keyword)
+            continue
+        kept.append(item)
+    return kept, excluded
+
+
+def exclude_no_representative(items: List[Dict]) -> tuple:
+    """정제(candidates C) 후 canonical evidence set으로도 대표 사건을 만들 수 없는(summary_type
+    =='no_representative') 후보를 Top10에서 제외한다(B2 최종 안전망, F).
+
+    subject/entity-role 정제·cohesion gate를 다 거친 뒤에도 공통 하위주제가 없어 대표기사를
+    만들 수 없으면, summary는 비는데 키워드만 Top10에 노출되는 정책 불일치가 생긴다. 이를
+    막는 최종 게이트다. **select_top() 이전, 전체 merged에 적용**(하위 정상후보 backfill 보장).
+
+    canonical_evidence helper로 builder와 동일한 (articles, summary_type)을 얻는다 — 사전 판정과
+    실제 발행 summary_type이 어긋나지 않는다(Codex 계획리뷰 P1-5). summarize는 canonical
+    keyword로 호출(helper 내부). representative 판정은 select_representative가 이미 최선 시도
+    (정제된 primary cluster 기준)이므로 그 결과(summary_type)가 canonical이다 — 별도 재시도 없음.
+
+    반환: (kept, excluded_keywords).
+    """
+    from news.candidates import canonical_evidence
+
+    kept: List[Dict] = []
+    excluded: List[str] = []
+    for item in items:
+        news_meta = item.get("news_meta") or {}
+        keyword = item.get("keyword", "")
+        _, _, summary_type = canonical_evidence(news_meta, keyword)
+        if summary_type == "no_representative":
+            logger.warning("[news] drop %s: no_representative(정제 후 대표 사건 없음)", keyword)
+            excluded.append(keyword)
             continue
         kept.append(item)
     return kept, excluded

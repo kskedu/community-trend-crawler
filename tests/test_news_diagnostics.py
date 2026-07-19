@@ -30,15 +30,18 @@ class _Suffixes(dict):
 
 
 # 키워드 간 토큰이 겹치지 않아야 same_article_cluster로 merge되지 않는다.
+# 또한 각 키워드의 2개 suffix는 공통 사건 토큰 2개+를 공유해야 대표기사가 생성된다
+# (summarizer._SUBTOPIC_MIN_TOKENS=2). 그래야 B2(no_representative gate, 2026-07)를 통과한다.
+# 키워드 자체(및 파생)는 subtopic에서 제외되므로 suffix의 공통어로 사건을 표현한다.
 _TITLE_SUFFIXES = _Suffixes({
-    "민경욱": ["측근 발언 파문", "법원 출석 예정"],
-    "코스피": ["장중 상승 마감", "외국인 순매수 전환"],
-    "환율": ["당국 개입 관측", "달러 강세 지속"],
-    "폭염": ["온열질환 주의보", "낮 최고 39도"],
-    "지진": ["여진 이어져", "진앙 인근 대피"],
-    "태풍": ["북상 경로 변경", "강풍 반경 확대"],
-    "백신접종": ["예약 시작 안내", "이상반응 신고"],
-    "국제유가": ["배럴당 급등", "감산 합의 여파"],
+    "민경욱": ["측근 발언 파문 확산", "측근 발언 파문 반응"],
+    "코스피": ["장중 상승 마감 랠리", "장중 상승 마감 지속"],
+    "환율": ["당국 개입 관측 확대", "당국 개입 관측 여파"],
+    "폭염": ["온열질환 주의보 발령", "온열질환 주의보 확대"],
+    "지진": ["여진 대피 이어져", "여진 대피 계속"],
+    "태풍": ["북상 경로 변경 예고", "북상 경로 변경 확대"],
+    "백신접종": ["예약 접종 시작 안내", "예약 접종 시작 혼선"],
+    "국제유가": ["배럴당 급등 감산 여파", "배럴당 급등 감산 지속"],
 })
 
 
@@ -56,6 +59,20 @@ def _news_meta(keyword="키워드", recent=3, age=1.0, diversity=3, relevance=0.
     두 경우 모두 top이 비어 실행이 NO_RANKING_RESULT로 조기 종료되고, 테스트는 의도한
     계약이 아니라 엉뚱한 이유로 통과/실패한다.
     """
+    articles = [
+        {
+            "title": f"{keyword} {suffix}",
+            "url": f"https://news.example.com/{keyword}/{i}",
+            "source": f"press{i}",
+            "press": f"press{i}",
+            "published_at": "2026-07-16T00:00:00+00:00",
+            "relevance_score": 0.9,
+            "is_incidental": False,
+            "is_primary_cluster": True,
+            "description": "본문 요약 — 저장되면 안 되는 필드",
+        }
+        for i, suffix in enumerate(_TITLE_SUFFIXES[keyword])
+    ]
     return {
         "recent_count": recent,
         "latest_age_hours": age,
@@ -66,26 +83,16 @@ def _news_meta(keyword="키워드", recent=3, age=1.0, diversity=3, relevance=0.
         "fresh_high_relevance_count": fresh_high_rel,
         "fresh_quality_cluster_size": fresh_cluster,
         "latest_relevant_age_hours": latest_relevant_age,
+        # entity-role 정제(2026-07) 신규 필드: 이 fixture는 다양한 사건·현상 키워드라
+        # unknown/정상 이슈로 취급 — cohesion gate 미적용, 대표 생성 가능.
+        "keyword_kind": "unknown",
+        "has_dominant_event": True,
+        "same_event_burst": True,
+        "representative_article": articles[0] if articles else None,
         # 제목은 keyword를 포함해야 display anchor를 통과하고(build_display_articles),
         # 동시에 키워드 간 공통 상용구가 없어야 same_article_cluster merge를 피한다.
-        # 기존 tests/test_news_ranking.py의 검증된 패턴과 동일한 형태.
-        # is_primary_cluster는 운영에서 compute_news_signal이 미리 표시한다. 이 fixture는
-        # 그 단계를 건너뛰므로 직접 세팅한다 — 없으면 build_display_articles가 anchor
-        # 재확인에서 전부 떨어뜨려 display_articles<2로 최종 제외된다.
-        "articles": [
-            {
-                "title": f"{keyword} {suffix}",
-                "url": f"https://news.example.com/{keyword}/{i}",
-                "source": f"press{i}",
-                "press": f"press{i}",
-                "published_at": "2026-07-16T00:00:00+00:00",
-                "relevance_score": 0.9,
-                "is_incidental": False,
-                "is_primary_cluster": True,
-                "description": "본문 요약 — 저장되면 안 되는 필드",
-            }
-            for i, suffix in enumerate(_TITLE_SUFFIXES[keyword])
-        ],
+        # is_primary_cluster는 운영에서 compute_news_signal이 미리 표시한다.
+        "articles": articles,
     }
 
 
@@ -291,7 +298,7 @@ class PayloadTest(unittest.TestCase):
         run = diagnostics.RunDiagnostics()
         run.commit(diagnostics.PassSnapshot("pass1"))
         payload, _ = run.build_payload("ts:x", rules_version=diagnostics.RULES_VERSION)
-        self.assertEqual(payload["rules_version"], "1.0.0")
+        self.assertEqual(payload["rules_version"], diagnostics.RULES_VERSION)
 
     def test_rules_version_defaults_to_none_when_not_passed(self):
         """호출부가 실수로 인자를 빼먹으면 예전처럼 조용히 NULL — 회귀를 명시적으로 남긴다."""
@@ -548,7 +555,8 @@ class _BriefingHarness:
     def __enter__(self):
         m = main_module
         p = [
-            patch.object(m, "_collect_home_seeds", return_value={"daum_home": self.PASS1}),
+            patch.object(m, "_collect_home_seeds",
+                         return_value=({"daum_home": self.PASS1}, {"daum_home": "ok"})),
             patch.object(m.google_adapter, "fetch_candidates", return_value=[]),
             patch.object(m, "_cache_google_keywords"),
             patch.object(m.cand, "derive_aux_keywords", return_value=[]),

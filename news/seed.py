@@ -130,10 +130,13 @@ def _extract_ranked(keywords_field, limit: int) -> List[dict]:
     return result
 
 
-def fetch_ranked_seed(source: str, limit: int = CANDIDATE_SEED_MAX) -> Tuple[List[dict], bool]:
-    """keyword_cache(source) 행에서 [{keyword, rank}] 와 freshness 를 read-only 조회.
+def fetch_ranked_seed_status(source: str, limit: int = CANDIDATE_SEED_MAX):
+    """keyword_cache(source) → (ranked, is_fresh, status). 관측성(H)용 status 구분 버전.
 
-    candidates 후보 pool용. daum/danawa 공용. 실패 시 ([], False).
+    status: 'ok'(행 있음·fresh) | 'stale'(행 있으나 오래됨) | 'empty'(행 없음/빈 keywords)
+            | 'fetch_failed'(조회 예외). source_status 진단에 fetch 실패와 empty/stale을
+            구분하기 위해 도입(Codex 계획리뷰 P1-6). fetch_ranked_seed(2-tuple)는 하위호환
+            래퍼로 유지한다.
     """
     try:
         from db.supabase import get_client
@@ -149,13 +152,25 @@ def fetch_ranked_seed(source: str, limit: int = CANDIDATE_SEED_MAX) -> Tuple[Lis
         data = getattr(res, "data", None)
         if not data:
             logger.warning("[news] candidates: keyword_cache(%s) 행 없음", source)
-            return [], False
+            return [], False, "empty"
         ranked = _extract_ranked(data.get("keywords"), limit)
+        if not ranked:
+            return [], False, "empty"
         is_fresh = _is_fresh(data.get("updated_at"))
-        return ranked, is_fresh
+        return ranked, is_fresh, ("ok" if is_fresh else "stale")
     except Exception as e:
         logger.warning("[news] candidates: keyword_cache(%s) 조회 실패: %s", source, e)
-        return [], False
+        return [], False, "fetch_failed"
+
+
+def fetch_ranked_seed(source: str, limit: int = CANDIDATE_SEED_MAX) -> Tuple[List[dict], bool]:
+    """keyword_cache(source) 행에서 [{keyword, rank}] 와 freshness 를 read-only 조회.
+
+    candidates 후보 pool용. daum/danawa 공용. 실패 시 ([], False).
+    (하위호환 래퍼 — status가 필요하면 fetch_ranked_seed_status를 쓴다.)
+    """
+    ranked, is_fresh, _status = fetch_ranked_seed_status(source, limit)
+    return ranked, is_fresh
 
 
 def ranked_seed_from_fixture(fixture: dict, limit: int = CANDIDATE_SEED_MAX) -> List[dict]:
