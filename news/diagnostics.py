@@ -15,6 +15,7 @@
 NO_REPRESENTATIVE는 selected의 부분집합이며 별도 합산하지 않는다.
 """
 
+import json
 import logging
 import os
 import time
@@ -32,7 +33,15 @@ logger = logging.getLogger(__name__)
 #   PATCH: 규칙 의미는 유지한 채 판정 구현 오류 수정, 진단 기록 정확성만 보정
 #   변경 없음: 로그/테스트/리팩터링/성능 개선/source 매핑처럼 판정 결과와 규칙
 #              의미가 변하지 않는 작업(이번 PR 전체가 여기 해당 — bump 없이 최초 도입만)
-RULES_VERSION = "1.0.0"
+RULES_VERSION = "1.1.0"  # 1.0.0→1.1.0(MINOR): entity-role 정제·cohesion·B2 gate 추가(2026-07).
+
+# selection_diagnostics_v1: thresholds JSONB에 버전 격리 namespace로 싣는 실행단위 진단.
+# 기존 thresholds 필드(collected_candidate_count 등)와 평면 혼합하지 않는다(하위호환).
+# migration 없이 기존 JSONB 컬럼만 확장한다. byte 상한 초과/직렬화 실패 시 이 namespace만
+# 제거하고 진단 본체는 보존한다(build_payload). Admin에서 빈번한 필터·집계·인덱싱이 실제
+# 필요해지면 그때 전용 컬럼 migration을 후속 과제로 분리한다.
+SELECTION_DIAG_NS = "selection_diagnostics_v1"
+SELECTION_DIAG_MAX_BYTES = 8192  # UTF-8 직렬화 byte 상한(초과 시 namespace 생략).
 
 # 결과 상태 — 배포 SQL CHECK와 1:1
 # (news_keyword_decisions.result_status IN ('selected','not_selected','selected_no_representative'))
@@ -105,6 +114,8 @@ class PassSnapshot:
         self.degraded = False
         self.errors = []             # type name만 보관(메시지 금지)
         self.closed = False
+        # B2(no_representative)로 제외된 수 — 진단에서 cohesion 탈락과 분리(Codex 최종리뷰 P3).
+        self.no_representative_excluded_count = 0
 
     # -- 상태 --------------------------------------------------------------
 
@@ -234,6 +245,10 @@ class RunDiagnostics:
         self.error_summary = None
         self.collected_candidate_count = 0
         self.thresholds = {}
+        self.selection_diagnostics = None  # selection_diagnostics_v1 payload(dict) 또는 None
+        # 채택 pass에서 B2(no_representative)로 제외된 수 — LOW_QUALITY_NEWS(cohesion 탈락)와
+        # 진단상 섞이므로 selection_diagnostics에서 별도 집계하기 위해 보관(Codex 최종리뷰 P3).
+        self.no_representative_excluded_count = 0
         self.final_snapshot = None
         self.degraded = False         # run 전역(공통 초기화/payload 조립 오류)
         self.errors = []
@@ -247,6 +262,22 @@ class RunDiagnostics:
 
     def mark_collected(self, count):
         self.collected_candidate_count = count
+
+    def mark_selection_diagnostics(self, *, underfill_reason=None, counts=None,
+                                   source_status=None, rejection_counts=None):
+        """실행단위 selection 진단을 selection_diagnostics_v1 payload로 적재한다(순수 관찰).
+
+        counts: {raw, deduped, clusters, eligible, selected} 정수 맵.
+        source_status: {family: 'ok'|'fetch_failed'|'empty'|'stale'}.
+        rejection_counts: {reason_code: N} (단계별 제외 수). set 등 비직렬화 값 금지 —
+        호출부에서 정수/문자열만 넣는다(build_payload가 최종 직렬화 검증). 실패해도 랭킹 무관.
+        """
+        self.selection_diagnostics = {
+            "underfill_reason": underfill_reason,
+            "counts": dict(counts or {}),
+            "source_status": dict(source_status or {}),
+            "rejection_counts": dict(rejection_counts or {}),
+        }
 
     def mark_skipped(self, skip_reason):
         self.status = "skipped"
@@ -262,6 +293,9 @@ class RunDiagnostics:
     def commit(self, snapshot):
         """채택 확정된 snapshot만 승격. degraded/errors도 이 시점에 함께 넘어온다."""
         self.final_snapshot = snapshot
+        # 채택 pass의 B2 제외 수를 run 레벨로 승격(selection_diagnostics 별도 집계용).
+        if snapshot is not None:
+            self.no_representative_excluded_count = snapshot.no_representative_excluded_count
 
     # -- 판정 --------------------------------------------------------------
 
@@ -286,6 +320,22 @@ class RunDiagnostics:
         # 수집 원시 후보 수는 카운트 invariant 합계에 넣지 않는 별도 메타값(§8-1).
         # DB 컬럼 추가 없이 thresholds JSON에 담는다.
         thresholds["collected_candidate_count"] = self.collected_candidate_count
+
+        # selection_diagnostics_v1 격리 적재(H, 2026-07): json.dumps 사전검증 + UTF-8 byte
+        # 상한. 직렬화 실패(비직렬화 값)나 상한 초과 시 이 namespace만 생략하고 진단 본체는
+        # 보존한다 — 관측 편의가 진단 저장 자체를 깨지 않게 한다(fail-open, 랭킹 무관).
+        if self.selection_diagnostics is not None:
+            try:
+                encoded = json.dumps(self.selection_diagnostics, ensure_ascii=False)
+                if len(encoded.encode("utf-8")) <= SELECTION_DIAG_MAX_BYTES:
+                    thresholds[SELECTION_DIAG_NS] = self.selection_diagnostics
+                else:
+                    logger.warning(
+                        "[news-diag] %s 생략 — byte 상한 초과(%d>%d)",
+                        SELECTION_DIAG_NS, len(encoded.encode("utf-8")), SELECTION_DIAG_MAX_BYTES,
+                    )
+            except (TypeError, ValueError) as e:
+                logger.warning("[news-diag] %s 생략 — 직렬화 실패: %s", SELECTION_DIAG_NS, type(e).__name__)
 
         run = {
             "run_key": run_key,

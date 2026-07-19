@@ -30,23 +30,44 @@ import main as main_module
 def _news(recent_count, age, diversity, relevance, articles=None,
           high_relevance_count=2, quality_cluster_size=2,
           fresh_high_relevance_count=1, fresh_quality_cluster_size=1,
-          latest_relevant_age_hours=1.0):
+          latest_relevant_age_hours=1.0,
+          keyword_kind="unknown", has_dominant_event=True, same_event_burst=True,
+          representative_article=None, summary_type_hint=None):
     # high_relevance_count/quality_cluster_size/fresh_* 기본값은 keyword-level quality
     # gate(ranker._passes_keyword_quality_gate, fresh relevance gate 포함)를 통과하도록
     # 채운다 — 이 헬퍼를 쓰는 기존 테스트들은 quality gate 자체가 아니라 score/penalty/
     # 정규화 로직을 검증 대상으로 하므로, 신규 gate 때문에 무관하게 회귀하지 않아야 한다.
+    #
+    # entity-role 정제(2026-07) 이후 신규 필드 기본값:
+    # - keyword_kind='unknown'(cohesion gate 미적용 — 기존 테스트는 대부분 다토큰/일반 키워드).
+    # - has_dominant_event/same_event_burst=True(정상 이슈로 취급 — cohesion gate 통과).
+    # - articles에 relevance_score/is_primary_cluster가 없으면 실제 파이프처럼 자동 부여해
+    #   B2(no_representative gate)/canonical_evidence가 정상 대표로 판정하게 한다.
+    arts = articles or [{"title": "t", "url": "https://x.com/a", "snippet": "s",
+                         "press": "x", "published_at": None, "thumbnail": None}]
+    enriched = []
+    for a in arts:
+        b = dict(a)
+        b.setdefault("relevance_score", 0.9)
+        b.setdefault("relevance_reason", "keyword_main_topic")
+        b.setdefault("is_incidental", False)
+        b.setdefault("is_primary_cluster", True)
+        enriched.append(b)
     return {
         "recent_count": recent_count,
         "latest_age_hours": age,
         "domain_diversity": diversity,
         "title_relevance": relevance,
-        "articles": articles or [{"title": "t", "url": "https://x.com/a", "snippet": "s",
-                                  "press": "x", "published_at": None, "thumbnail": None}],
+        "articles": enriched,
+        "representative_article": representative_article or (enriched[0] if enriched else None),
         "high_relevance_count": high_relevance_count,
         "quality_cluster_size": quality_cluster_size,
         "fresh_high_relevance_count": fresh_high_relevance_count,
         "fresh_quality_cluster_size": fresh_quality_cluster_size,
         "latest_relevant_age_hours": latest_relevant_age_hours,
+        "keyword_kind": keyword_kind,
+        "has_dominant_event": has_dominant_event,
+        "same_event_burst": same_event_burst,
     }
 
 
@@ -552,7 +573,10 @@ def _stale_iso(days_ago: float = 120.0) -> str:
 
 
 def _article(title, url, snippet="", published_at=None):
-    return {"title": title, "url": url, "press": "x", "snippet": snippet,
+    # 주의: compute_news_signal은 normalize_article을 거치며 press를 originallink/url host에서
+    # guess_press로 재파생한다(여기서 press를 넣어도 무시됨). entity cohesion의 dominant/burst는
+    # 서로 다른 언론사를 요구하므로, 다른 언론사가 필요한 fixture는 url host를 다르게 준다.
+    return {"title": title, "url": url, "originallink": url, "press": "x", "snippet": snippet,
             "published_at": published_at, "thumbnail": None}
 
 
@@ -1412,10 +1436,12 @@ class TestKeywordQualityGate(unittest.TestCase):
         self.assertEqual(sig["quality_cluster_size"], 0)
 
     def test_high_relevance_keyword_passes_gate(self):
+        # 같은 사건(신형 노트북 출시)을 서로 다른 표현으로 다룬 2건 — entity cohesion gate
+        # (2026-07)를 통과하도록 공통 사건 토큰("신형","출시")을 공유한다.
         good_articles = [
-            _article("AI 노트북 시장 성장", "https://x.com/good1", "노트북 수요가 늘고 있다.",
+            _article("삼성 신형 노트북 출시", "https://x.com/good1", "신형 노트북 라인업이 공개됐다.",
                      published_at=_recent_iso()),
-            _article("신형 노트북 출시", "https://x.com/good2", "새로운 노트북 라인업이 공개됐다.",
+            _article("신형 노트북 출시 판매 돌입", "https://y.com/good2", "신형 노트북 출시 첫날.",
                      published_at=_recent_iso()),
         ]
         sig = cand.compute_news_signal("노트북", good_articles)
@@ -1431,8 +1457,8 @@ class TestKeywordQualityGate(unittest.TestCase):
         # quality gate와 무관하게, 애초에 news 신호가 없는 후보는 기존 규칙대로 제외돼야 한다
         # (quality gate 도입으로 이 기존 동작이 깨지지 않는지 확인).
         good_articles = [
-            _article("AI 노트북 시장 성장", "https://x.com/n1", published_at=_recent_iso()),
-            _article("신형 노트북 출시", "https://x.com/n2", published_at=_recent_iso()),
+            _article("삼성 신형 노트북 출시", "https://x.com/n1", "신형 노트북 출시", published_at=_recent_iso()),
+            _article("신형 노트북 출시 판매 돌입", "https://y.com/n2", "신형 노트북 출시", published_at=_recent_iso()),
         ]
         sig = cand.compute_news_signal("노트북", good_articles)
         candidates = [{"keyword": "노트북", "sources": {"daum": 1}}, {"keyword": "무관", "sources": {"daum": 2}}]
@@ -1513,14 +1539,18 @@ class TestFreshRelevanceGate(unittest.TestCase):
     def test_backfill_skips_stale_candidate_for_next(self):
         # 앞 후보가 fresh gate로 제거된 뒤, 다음 후보가 stale이면 건너뛰고 그 다음이
         # 승격돼야 한다(억지로 Top10을 채우기 위해 stale 후보를 넣지 않음).
+        # 공통 사건 토큰("신제품","출시")을 공유해 entity cohesion gate는 통과하되,
+        # stale은 fresh gate로만 걸러지도록 구성한다(cohesion과 무관한 검증).
         stale_articles = [
-            _article("노트북 신제품 리뷰", "https://x.com/b-old1", published_at=_stale_iso(days_ago=20)),
-            _article("노트북 스펙 정리", "https://x.com/b-old2", published_at=_stale_iso(days_ago=25)),
+            _article("노트북 신제품 출시 리뷰", "https://x.com/b-old1", "노트북 신제품 출시",
+                     published_at=_stale_iso(days_ago=20)),
+            _article("노트북 신제품 출시 스펙", "https://y.com/b-old2", "노트북 신제품 출시",
+                     published_at=_stale_iso(days_ago=25)),
         ]
         fresh_articles = [
-            _article("모니터 신제품 출시 화제", "https://x.com/b-new1",
+            _article("모니터 신제품 출시 화제", "https://x.com/b-new1", "모니터 신제품 출시",
                      published_at=_recent_iso(hours_ago=2)),
-            _article("모니터 할인 행사 시작", "https://x.com/b-new2",
+            _article("모니터 신제품 출시 행사", "https://y.com/b-new2", "모니터 신제품 출시",
                      published_at=_recent_iso(hours_ago=5)),
         ]
         sig_stale = cand.compute_news_signal("노트북", stale_articles)
@@ -2477,16 +2507,16 @@ class TestRankAndSelectDiversityLogging(unittest.TestCase):
         ]
 
     def _signals(self):
-        # display_articles >= DISPLAY_ARTICLES_MIN(2)를 만족하도록 각 키워드에 기사 2건씩.
+        # display >= DISPLAY_ARTICLES_MIN(2) + 공통 사건 토큰(대표 생성 가능)으로 각 2건.
         return {
             "news": {
                 "금리 인상": _news(3, 1, 2, 0.9, articles=[
-                    _article("금리 인상 전망 확산", "https://x.com/a1"),
-                    _article("금리 인상 폭 관심 집중", "https://x.com/a2"),
+                    _article("금리 인상 단행 발표 충격", "https://x.com/a1", "금리 인상 단행 발표"),
+                    _article("금리 인상 단행 발표 반응", "https://x.com/a2", "금리 인상 단행 발표"),
                 ]),
                 "반도체 수출": _news(3, 1, 2, 0.9, articles=[
-                    _article("반도체 수출 증가 발표", "https://x.com/b1"),
-                    _article("반도체 수출 호조 지속", "https://x.com/b2"),
+                    _article("반도체 수출 증가 발표 호조", "https://x.com/b1", "반도체 수출 증가 발표"),
+                    _article("반도체 수출 증가 발표 지속", "https://x.com/b2", "반도체 수출 증가 발표"),
                 ]),
             },
             "datalab": {}, "google": {},
@@ -2536,9 +2566,13 @@ class TestBackfillPassIntegration(unittest.TestCase):
         recent = _recent_iso(1.0)
         news_by_kw = {}
         for i in range(10):
+            # 공통 사건 토큰("긴급","대책")을 3건이 공유해 entity cohesion gate·B2를 통과한다
+            # (제목이 전부 달라 대표를 못 뽑던 fixture를 정상 이슈 형태로 정정, 2026-07).
             news_by_kw[f"daum{i}"] = [
-                {"title": f"daum{i} 강한아ux단어{j} 발생", "originallink": "", "link": f"https://x.com/{i}-{j}",
-                 "description": "", "pubDate": recent}
+                # 서로 다른 host로 3개 언론사 → entity cohesion dominant event 충족(2026-07).
+                {"title": f"daum{i} 긴급 대책 발표 {j}보", "originallink": f"https://press{j}.example.com/{i}",
+                 "link": f"https://press{j}.example.com/{i}-{j}",
+                 "description": f"daum{i} 긴급 대책", "pubDate": recent}
                 for j in range(3)
             ]
         fetch = self._news_fixture_fetch(news_by_kw)
@@ -2658,9 +2692,9 @@ class TestPRClusterExclude(unittest.TestCase):
         arts = [
             _article("세라젬, KLPGA 롯데오픈 공식 후원", "https://x.com/s1",
                      "세라젬이 공식 후원사로 나섰다", _recent_iso()),
-            _article("세라젬 롯데오픈 체험존 운영", "https://x.com/s2",
+            _article("세라젬 롯데오픈 체험존 운영", "https://y.com/s2",
                      "세라젬 체험존에서 헬스케어 체험", _recent_iso()),
-            _article("세라젬 브랜드 캠페인 확대", "https://x.com/s3",
+            _article("세라젬 브랜드 캠페인 확대", "https://z.com/s3",
                      "세라젬 브랜드 캠페인", _recent_iso()),
         ]
         if extra:
@@ -3266,8 +3300,8 @@ class TestHoroscopeContentGate(unittest.TestCase):
     def test_source_family_candidates_unaffected_by_horoscope_gate(self):
         # 운세와 무관한 후보의 source family 판정(google/nate/bing/daum)은 그대로 유지된다.
         good_articles = [
-            _article("AI 노트북 시장 성장", "https://x.com/g1", published_at=_recent_iso()),
-            _article("신형 노트북 출시", "https://x.com/g2", published_at=_recent_iso()),
+            _article("삼성 신형 노트북 출시", "https://x.com/g1", "신형 노트북 출시", published_at=_recent_iso()),
+            _article("신형 노트북 출시 판매 돌입", "https://y.com/g2", "신형 노트북 출시", published_at=_recent_iso()),
         ]
         sig = cand.compute_news_signal("노트북", good_articles)
         candidates = [

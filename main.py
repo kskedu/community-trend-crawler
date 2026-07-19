@@ -37,7 +37,7 @@ from db.supabase import (
 )
 from news.movement import apply_movement
 from news.thumbnail import enrich_issue_thumbnails
-from news.seed import fetch_ranked_seed
+from news.seed import fetch_ranked_seed, fetch_ranked_seed_status
 from news.naver_news import search_news
 from news import candidates as cand
 from news import datalab as datalab_adapter
@@ -200,6 +200,72 @@ def _finalize_selected(run_diag, issues):
         snap.finalize_selected((issues or {}).get("keywords") or [])
 
 
+# selection_diagnostics_v1 underfill_reason 우선순위(위일수록 지배적). 제외 reason_code →
+# 기계 판독 가능한 단일 underfill 사유. candidate 부족과 게이트 탈락을 구분한다(개선목표 A).
+_UNDERFILL_REASON_PRIORITY = (
+    ("NO_NEWS_EVIDENCE", "source_or_parse_failure"),
+    ("PR_CLUSTER", "pr_excluded"),
+    ("LOW_QUALITY_NEWS", "quality_gate"),          # cohesion 미달·B2 no_representative 포함
+    ("STALE_ONLY", "stale_only"),
+    ("HOROSCOPE_CONTENT", "horoscope"),
+    ("INSUFFICIENT_DISPLAY_ARTICLES", "display_insufficient"),
+    ("GENERIC_SINGLETON", "generic_singleton"),
+    ("DISPLAY_GENERIC_ONLY", "generic_singleton"),
+    ("DISPLAY_ARTICLE_INCONSISTENT", "display_inconsistent"),
+    ("MERGED_INTO_OTHER", "merged"),
+    ("RANK_CUTOFF", "rank_cutoff"),
+)
+
+
+def _record_selection_diagnostics(run_diag, issues, seed_status_map, candidate_count):
+    """selection_diagnostics_v1 payload를 계산해 run_diag에 mark한다(순수 관찰).
+
+    - counts: raw(수집 원시 후보), deduped(선정 후보 수), selected(발행 개수),
+      eligible(제외 전 판정된 후보 수 근사). clusters는 run 단위로 단일값이 아니라 생략
+      대신 keyword별 primary_cluster_size는 decisions에 이미 있음 → run 레벨엔 안 넣는다.
+    - source_status: _collect_home_seeds가 넘긴 family별 fetch 상태.
+    - rejection_counts: 채택 snapshot decisions의 not_selected reason_code별 집계.
+    - underfill_reason: selected < TOP_N 일 때만, 지배적 제외 사유(우선순위) 1개. 충족 시 'none'.
+    """
+    snap = run_diag.final_snapshot
+    decisions = snap.payload_decisions() if snap else []
+    selected = sum(1 for d in decisions if d.get("result_status") in diagnostics._SELECTED_STATUSES)
+
+    rejection_counts = {}
+    for d in decisions:
+        if d.get("result_status") == diagnostics.STATUS_NOT_SELECTED:
+            rc = d.get("reason_code") or "UNKNOWN"
+            rejection_counts[rc] = rejection_counts.get(rc, 0) + 1
+    # B2(no_representative) 제외는 decisions에서 LOW_QUALITY_NEWS로 기록돼 cohesion 탈락과
+    # 섞인다. selection_diagnostics에는 별도 세부 키로 분리 노출한다(Codex 최종리뷰 P3).
+    no_rep_count = getattr(run_diag, "no_representative_excluded_count", 0)
+    if no_rep_count:
+        rejection_counts["no_representative"] = no_rep_count
+
+    published = len((issues or {}).get("keywords") or [])
+    if published >= ranker.TOP_N:
+        underfill_reason = "none"
+    else:
+        underfill_reason = "candidate_shortage"  # 제외가 전혀 없으면 애초 후보 부족.
+        for code, reason in _UNDERFILL_REASON_PRIORITY:
+            if rejection_counts.get(code):
+                underfill_reason = reason
+                break
+
+    counts = {
+        "raw": run_diag.collected_candidate_count,
+        "deduped": candidate_count,
+        "eligible": selected + rejection_counts.get("RANK_CUTOFF", 0),
+        "selected": published,
+    }
+    run_diag.mark_selection_diagnostics(
+        underfill_reason=underfill_reason,
+        counts=counts,
+        source_status=dict(seed_status_map or {}),
+        rejection_counts=rejection_counts,
+    )
+
+
 def _new_snapshot(run_diag, pass_name):
     """PassSnapshot 생성 실패는 run 전역 degraded다 — 빈 성공 이력을 남기지 않는다.
 
@@ -282,7 +348,8 @@ def _diag_gate_reason_code(keyword, signals):
 
 
 def _diag_record_pass(diag, candidates, signals, ranked, pr_excluded, merged,
-                      generic_excluded, selected_pre_display, top, display_excluded):
+                      generic_excluded, selected_pre_display, top, display_excluded,
+                      no_rep_excluded=None):
     """pass의 최종 판정을 후보별 1건씩 기록한다(순수 관찰).
 
     _rank_and_select의 단계별 지역변수만으로 재구성하므로 ranker 시그니처를 바꾸지 않는다.
@@ -298,6 +365,9 @@ def _diag_record_pass(diag, candidates, signals, ranked, pr_excluded, merged,
     pr_keys = {nk(k) for k in pr_excluded}
     generic_keys = {nk(k) for k in generic_excluded}
     display_keys = {nk(k) for k in display_excluded}
+    no_rep_keys = {nk(k) for k in (no_rep_excluded or [])}
+    # B2 제외 수를 snapshot에 기록(진단에서 cohesion 탈락과 분리, Codex 최종리뷰 P3).
+    diag.no_representative_excluded_count = len(no_rep_keys)
     pre_display_keys = {nk(t["keyword"]) for t in selected_pre_display}
     merged_keys = {nk(m["keyword"]) for m in merged}
     # merge로 흡수된 후보 → canonical 대표. related_keywords가 원본 keyword를 보존한다.
@@ -326,6 +396,12 @@ def _diag_record_pass(diag, candidates, signals, ranked, pr_excluded, merged,
 
         if key in display_keys:
             status, reason = diagnostics.STATUS_NOT_SELECTED, "INSUFFICIENT_DISPLAY_ARTICLES"
+        elif key in no_rep_keys:
+            # B2 제외(정제 후 대표 사건 없음). 배포 read RPC canonical 13개에 전용 코드가
+            # 없어(REPRESENTATIVE_MISSING 미존재 → Admin에서 'unknown'으로 빠짐) 의미상
+            # 가장 가까운 canonical LOW_QUALITY_NEWS('제외' 카테고리)로 기록한다. 세부
+            # 구분은 selection_diagnostics_v1.rejection_counts.no_representative에 별도 집계.
+            status, reason = diagnostics.STATUS_NOT_SELECTED, "LOW_QUALITY_NEWS"
         elif key in pre_display_keys:
             # select_top을 통과했지만 display 제외도 아닌데 top에 없다 = 이론상 도달 불가.
             status, reason = diagnostics.STATUS_NOT_SELECTED, "RANK_CUTOFF"
@@ -380,17 +456,24 @@ def _rank_and_select(candidates, signals, pass_name, diag=None):
     kept, generic_excluded = ranker.exclude_generic_singletons(merged)
     if generic_excluded:
         logger.warning("[news] %s: generic singleton 제외 %s", pass_name, generic_excluded)
-    selected_pre_display = ranker.select_top(kept)
-    # display_articles <= 1 후보 제외(2026-07-05) — build 이전에 적용해 recent guard/
-    # partial publish 판단과 저장 로그가 실제 발행 개수와 정합하게 한다.
-    top, display_excluded = ranker.exclude_insufficient_display_articles(selected_pre_display)
+    # display 부족 / no_representative 제외를 select_top *이전* 전체 리스트에 적용한다
+    # (2026-07 변경, Codex 계획리뷰 P1-4). 이전엔 select_top 이후라 Top10 통과분이 빠지면
+    # 하위 backfill 없이 개수가 줄었다. 이제 제외 후 select_top이 슬라이스만 하므로 하위
+    # 정상후보가 자연히 그 자리를 채운다. 순서: generic → display부족 → no_rep → select_top.
+    kept, display_excluded = ranker.exclude_insufficient_display_articles(kept)
     if display_excluded:
         logger.warning("[news] %s: display_articles 부족 제외 %s", pass_name, display_excluded)
+    kept, no_rep_excluded = ranker.exclude_no_representative(kept)
+    if no_rep_excluded:
+        logger.warning("[news] %s: no_representative 제외 %s", pass_name, no_rep_excluded)
+    # selected_pre_display = 모든 제외 완료 후 리스트(진단 재구성 호환용 이름 유지).
+    selected_pre_display = kept
+    top = ranker.select_top(kept)
     logger.info(
         "[news] %s: candidates=%d gate통과=%d PR제외=%d merge후=%d generic제외=%d "
-        "display부족제외=%d final=%d",
+        "display부족제외=%d no_rep제외=%d final=%d",
         pass_name, len(candidates), gate_passed, len(pr_excluded), len(merged),
-        len(generic_excluded), len(display_excluded), len(top),
+        len(generic_excluded), len(display_excluded), len(no_rep_excluded), len(top),
     )
     # source family diversity 관찰 로깅(2026-07, 순수 관찰 — ranking 결과에 영향 없음).
     # 각 단계에서 어느 source family가 후보를 만들고 어느 단계에서 사라지는지 추적한다.
@@ -421,6 +504,7 @@ def _rank_and_select(candidates, signals, pass_name, diag=None):
     _safe_diag(diag, lambda: _diag_record_pass(
         diag, candidates, signals, ranked, pr_excluded, merged,
         generic_excluded, selected_pre_display, top, display_excluded,
+        no_rep_excluded,
     ))
     return top
 
@@ -466,20 +550,24 @@ _HOME_SEED_SPEC = (
 def _collect_home_seeds():
     """홈 seed(daum/nate/bing)를 keyword_cache에서 read-only 조회.
 
-    반환: {family: ranked(list, 최대 20)}. fresh 하지 않거나 조회 실패한 family는
-    제외하고 drop_reason 로그를 남긴다(전체 pipeline은 죽이지 않는다).
+    반환: (fulls, status_map).
+    - fulls: {family: ranked(list, 최대 20)}. fresh 하지 않거나 조회 실패한 family는 제외.
+    - status_map: {family: 'ok'|'stale'|'empty'|'fetch_failed'} — source_status 진단(H)용.
+      fetch 실패와 empty/stale을 구분한다(Codex 계획리뷰 P1-6).
     """
     fulls = {}
+    status_map = {}
     for source, family, short in _HOME_SEED_SPEC:
-        ranked, fresh = fetch_ranked_seed(source)
+        ranked, fresh, status = fetch_ranked_seed_status(source)
+        status_map[family] = status
         if not ranked:
-            logger.warning("[news] %s seed 없음/조회 실패 → drop(%s_fetch_failed)", family, short)
+            logger.warning("[news] %s seed 없음/조회 실패 → drop(%s)", family, status)
             continue
         if not fresh:
             logger.warning("[news] %s seed stale → drop(stale_only)", family)
             continue
         fulls[family] = ranked
-    return fulls
+    return fulls, status_map
 
 
 def _seed_sources_from(home_fulls, google_cands, home_top):
@@ -705,7 +793,7 @@ def run_news_briefing(run_type="full"):
 
     try:
         # 1) 홈/트렌드 seed 수집
-        home_fulls = _collect_home_seeds()  # {family: ranked(≤20)}
+        home_fulls, seed_status_map = _collect_home_seeds()  # ({family: ranked(≤20)}, status)
         google_cands = google_adapter.fetch_candidates()  # 비활성/실패 시 [] (내부 로그)
         # google_trends 원천 Top을 출처별 보기(keyword_cache)에도 노출 — 랭킹과 무관, 저장만.
         _cache_google_keywords(google_cands)
@@ -840,6 +928,11 @@ def run_news_briefing(run_type="full"):
         # (_rank_and_select 시점에는 builder가 아직 안 돌아 존재하지 않는다).
         # 실제 발행되는 payload 그대로 진단에 반영해 둘이 어긋나지 않게 한다.
         _safe_diag(run_diag, lambda: _finalize_selected(run_diag, issues))
+
+        # selection_diagnostics_v1(H) 적재 — 실행단위 관측 정보(순수 관찰, 랭킹 무관).
+        _safe_diag(run_diag, lambda: _record_selection_diagnostics(
+            run_diag, issues, seed_status_map, len(candidates),
+        ))
 
         # upsert_news_issues는 예외가 아니라 False를 반환한다(db/supabase.py) —
         # False를 성공으로 기록하지 않는다.

@@ -18,7 +18,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional
 
-from news.normalizer import normalize_article
+from news.normalizer import normalize_article, PRESS_UNKNOWN
 from news.summarizer import _tokens, summarize  # 기존 토크나이저/요약 로직 재사용(신규 의존성 없음)
 
 logger = logging.getLogger(__name__)
@@ -608,6 +608,262 @@ _GENERIC_SINGLE_TOKENS = {
     "공유", "조사", "수사", "계획", "지원", "성과", "호황", "반등", "논란", "관련", "발표",
 }
 
+# ============================================================================
+# 키워드 유형 분류(A) + subject/entity-role 판정(B) — 넓은 단일 엔티티 오염 방어
+# ----------------------------------------------------------------------------
+# 배경(2026-07): "신천지"가 교단 사건과 정치 수사("반명·신천지와의 대결")에 동시 등장,
+# "한화"가 야구단/그룹/오션 등 서로 다른 사건에 각각 등장하는데도 제목에 키워드 문자열만
+# 있으면 relevance 0.9로 quality gate·primary cluster를 통과해 오염/무근거 이슈가 발생.
+# 정책(사용자 확정): 관련성 최우선. entity 키워드에 한해 subject/entity-role로 오염 기사를
+# 정제한 뒤(compute_news_signal 내부, return 전) 모든 news_meta 값을 재계산한다.
+# event(산불/폭우/지진 등 사건·현상 단독어)는 강화 gate 미적용(정상 기사 오탈락 방지).
+# 판별 불가는 unknown → 과잉 제외 금지(기존 경로 보존).
+#
+# 경량 규칙 기반 tri-state이며 100% 정확하지 않다. 강한 신호만 hard 판정하고 나머지는
+# unknown으로 보수 처리한다(단독 정규식 hard gate 금지 — 사용자 지시).
+# ============================================================================
+
+# event(사건·현상) 화이트리스트 — 단일 토큰이라도 keyword 자체가 사건을 뜻하므로
+# entity 전용 cohesion 강화 대상에서 제외한다(정상 기사 보호). 하드코딩된 "결과"가 아니라
+# entity 오분류로부터 event 키워드를 보호하기 위한 최소 보호 집합이다.
+_EVENT_KEYWORDS = {
+    # 자연재해·사고
+    "산불", "폭우", "지진", "태풍", "홍수", "침수", "정전", "폭발", "화재", "붕괴",
+    "파업", "지진해일", "쓰나미", "가뭄", "한파", "폭염", "미세먼지", "장마", "낙뢰",
+    "총격", "테러", "지진동", "여진", "산사태", "누출", "감전", "폭설", "산불진화",
+    # 정치·사회 현상어(단일 토큰이지만 특정 엔티티가 아니라 사건·현상 — entity cohesion
+    # 강화 대상에서 제외해 정상 이슈 오탈락 방지, Codex 최종리뷰 P2). 여러 주체가 등장하는
+    # 것이 정상인 이슈들이라 "단일 엔티티 사건 응집"을 요구하면 안 된다.
+    "대선", "총선", "탄핵", "개각", "인사청문회", "국정감사", "전당대회", "경선",
+    "집회", "시위", "파병", "휴전", "종전", "정상회담", "선거",
+    # 경제 현상어
+    "환율", "금리", "물가", "인플레이션", "증시", "주가", "유가", "코스피", "코스닥",
+    "부동산", "집값", "전세", "대출", "감세", "증세",
+    # 보건·기타
+    "코로나", "독감", "폭동", "내전", "쿠데타",
+}
+
+# subject 신호: keyword 뒤에 자주 붙는 주격/속격 조사(보조 신호 — 단독 hard gate 아님).
+_SUBJECT_JOSA = ("이", "가", "은", "는", "의", "을", "를", "에게", "께서")
+
+# non_subject 신호: keyword가 "비교/대결/구도" 대상으로 쓰이는 수사적 문맥 마커.
+# "반명·신천지와의 대결"처럼 keyword가 사건 주체가 아니라 비유/정치 수사로 언급되는 경우.
+# keyword 바로 뒤(조사 포함) 근접 위치에 이 마커가 오는지로 판정한다(위치 무관 any-match는
+# "신천지 재판 대결" 같은 정상 기사를 오탐할 수 있어 근접 조건을 둔다).
+_RHETORIC_SUFFIX_MARKERS = (
+    "와의 대결", "과의 대결", "와의 전쟁", "과의 전쟁", "와의 대회전", "과의 대회전",
+    "와의 대립", "과의 대립", "와의 구도", "과의 구도", "와의 갈등", "과의 갈등",
+    "와의 전면전", "과의 전면전",
+)
+# 나열/비유 접속 문맥(keyword가 다른 개체와 병렬 나열되는 정치 수사).
+_RHETORIC_LIST_MARKERS = ("위장", "반명", "친명", "적통", "계파", "계승")
+
+
+def classify_keyword_kind(keyword: str, news_meta: Optional[Dict] = None) -> str:
+    """키워드 유형 tri-state: 'event' | 'entity' | 'unknown'.
+
+    - event: _EVENT_KEYWORDS(사건·현상 단독어). cohesion 강화 미적용.
+    - entity: 단일 non-generic 토큰이면서 event 아님(인물/기업/조직/구단/종교/작품/브랜드
+      후보). cohesion 강화 적용 대상.
+    - unknown: 다토큰이거나 generic 토큰이 섞여 단일 엔티티로 확정 불가 → 보수적 경로.
+
+    news_meta는 현재 미사용(향후 사건 분산 신호 확장 여지). 시그니처만 열어둔다.
+    """
+    kw = (keyword or "").strip()
+    if not kw:
+        return "unknown"
+    toks = _tokens(kw)
+    if kw in _EVENT_KEYWORDS or (len(toks) == 1 and toks[0] in _EVENT_KEYWORDS):
+        return "event"
+    # 단일 토큰 + non-generic 이면 entity 후보. 다토큰/ generic 은 unknown(보수).
+    if len(toks) == 1 and toks[0] not in _GENERIC_SINGLE_TOKENS:
+        return "entity"
+    return "unknown"
+
+
+def _keyword_pos_in_title(keyword: str, title: str) -> int:
+    """title에서 keyword(첫 토큰 기준) 위치 index. 없으면 -1."""
+    toks = _tokens(keyword or "")
+    if not toks:
+        return -1
+    return (title or "").find(toks[0])
+
+
+def classify_entity_role(keyword: str, article: Dict) -> tuple:
+    """기사에서 keyword의 역할 tri-state: ('subject'|'non_subject'|'unknown', reason_code).
+
+    단독 정규식 hard gate 금지(사용자 지시). 여러 신호를 조합하되 강한 패턴만 확정 판정하고
+    애매하면 unknown으로 둔다.
+
+    strong non_subject(제외 대상):
+    - NONSUBJECT_RHETORIC: keyword 바로 뒤에 "~와의 대결/전쟁/구도" 등 수사 마커 근접.
+    - NONSUBJECT_LIST_RHETORIC: keyword가 정치 나열 문맥(위장/반명/친명/적통…)과 근접 병렬.
+    - NONSUBJECT_SNIPPET_ONLY: title에 keyword 없고 snippet에만 등장(이미 relevance 낮음).
+
+    strong subject(보존 대상):
+    - SUBJECT_JOSA_PREDICATE: keyword 뒤 주격/속격 조사(+ title 주제) → 행위 주체.
+    - SUBJECT_LEADING: keyword가 title 앞부분(첫 절)에서 사건 명사와 결합, incidental 아님.
+
+    그 외 unknown(UNKNOWN_AMBIGUOUS): 한국어 주어생략/도치 등으로 확정 불가.
+    """
+    title = article.get("title") or ""
+    snippet = article.get("clean_description") or article.get("snippet") or ""
+    kw_toks = _tokens(keyword)
+    if not kw_toks:
+        return "unknown", "UNKNOWN_NO_KEYWORD"
+    kw0 = kw_toks[0]
+
+    title_low = title.lower()
+    in_title = kw0.lower() in title_low or _has_keyword_token(keyword, title)
+
+    # snippet-only: 제목에 keyword 없음 → non_subject(정치 계파 기사 snippet 언급 등).
+    if not in_title:
+        if _has_keyword_token(keyword, snippet) or kw0.lower() in (snippet or "").lower():
+            return "non_subject", "NONSUBJECT_SNIPPET_ONLY"
+        return "unknown", "UNKNOWN_AMBIGUOUS"
+
+    pos = title.find(kw0)
+    tail = title[pos + len(kw0):] if pos >= 0 else ""
+
+    # strong non_subject: keyword 바로 뒤 수사 마커(조사 붙은 형태 포함, 근접 판정).
+    tail_head = tail[:12]  # keyword 직후 근접 구간
+    for m in _RHETORIC_SUFFIX_MARKERS:
+        if m in tail_head or m.lstrip("와과") in tail_head:
+            return "non_subject", "NONSUBJECT_RHETORIC"
+    # 정치 나열 수사: keyword 근처(앞뒤 근접)에 나열 마커.
+    near = title[max(0, pos - 12):pos + len(kw0) + 12]
+    if any(m in near for m in _RHETORIC_LIST_MARKERS):
+        return "non_subject", "NONSUBJECT_LIST_RHETORIC"
+
+    # incidental/side-mention 기사는 subject 아님(대표 자격 없음) — 기존 신호 재사용.
+    if article.get("is_incidental"):
+        return "unknown", "UNKNOWN_INCIDENTAL"
+
+    # strong subject: keyword 뒤 주격/속격 조사.
+    tail_stripped = tail.lstrip()
+    if any(tail.startswith(j) or tail_stripped.startswith(j) for j in _SUBJECT_JOSA):
+        return "subject", "SUBJECT_JOSA_PREDICATE"
+    # 콤마/공백 뒤 술어 절이 이어지는 선두 주체("장동건, ~했다" / "장동건 별세").
+    if pos <= 6 and article.get("relevance_reason") == "keyword_main_topic":
+        return "subject", "SUBJECT_LEADING"
+
+    return "unknown", "UNKNOWN_AMBIGUOUS"
+
+
+# === entity cohesion 신호(E) — dominant event / same-event burst ===
+# BURST_HOURS: 서로 다른 언론사의 "같은 속보" 인정 시간창(published_at 간격 상한).
+BURST_HOURS = 6.0
+# 사건 토큰 판정에서 제외할 generic 서술어(cohesion 근거로 부적합). summarizer 생성어와
+# 별개로 여기선 keyword cohesion 전용 최소 집합만 둔다(_GENERIC_SINGLE_TOKENS 재사용 + 확장).
+_EVENT_TOKEN_STOPWORDS = _GENERIC_SINGLE_TOKENS | {
+    "오늘", "내일", "어제", "기자", "종합", "속보", "단독", "인터뷰", "포토", "영상",
+}
+
+
+def _keyword_derived(tok: str, kw_tokens: set) -> bool:
+    low = tok.lower()
+    return any(k in low or low in k for k in kw_tokens)
+
+
+def _dominant_event_tokens(keyword: str, high_articles: List[Dict]) -> set:
+    """고관련 기사군에서 서로 다른 기사 2건+ 이 실제로 공유하는(DF>=2) 사건 토큰
+    (keyword 파생/generic 제외).
+
+    핵심(2026-07): dominant cluster 하나의 토큰이 아니라 "전체 고관련 기사에서 문서빈도
+    >=2인 공통 토큰"을 본다. 이래야 한화(야구 vs 그룹, 공통 토큰 없음)는 빈 집합이 되고
+    세라젬(3건이 '롯데오픈' 공유)이나 한화 7연패(여러 기사가 '7연패/탈출' 공유)는 사건
+    토큰이 남는다. cluster 하나만 보면 단건 cluster의 기사 토큰이 전부 잡혀 다중사건도
+    통과하는 오류가 생긴다(회귀 발견 2026-07). summarizer.subtopic_tokens와 같은 원리다.
+    """
+    if len(high_articles) < 2:
+        return set()
+    kw_tokens = {t.lower() for t in _tokens(keyword or "")}
+    df: Dict[str, int] = {}
+    for a in high_articles:
+        text = f"{a.get('title', '')} {a.get('clean_description') or a.get('snippet', '')}"
+        for tok in set(_tokens(text)):
+            df[tok] = df.get(tok, 0) + 1
+    return {
+        t for t, c in df.items()
+        if c >= 2 and not _keyword_derived(t, kw_tokens) and t not in _EVENT_TOKEN_STOPWORDS
+    }
+
+
+# dominant event 인정에 필요한 최소 독립 언론사 수(일반 이슈 기준). 속보 예외는
+# _same_event_burst로 2개 언론사까지 별도 완화한다(사용자 지시: 일반 3곳+, 속보 2곳 예외).
+DOMINANT_EVENT_MIN_PRESS = 3
+
+
+def _has_dominant_event(keyword: str, high_articles: List[Dict]) -> bool:
+    """고관련 기사군에 "지배적 단일 사건"이 있는가 — keyword 제외 공통 사건 토큰을
+    공유하는 기사가 **서로 다른 언론사 DOMINANT_EVENT_MIN_PRESS(3)곳 이상**이면 True.
+
+    단순히 DF>=2 토큰 존재만 보면(구 구현) 같은 언론사 연속보도나 timestamp 없는 2건도
+    통과해 _same_event_burst의 press/시간 계약이 무의미해진다(Codex 최종리뷰 P1). 일반
+    이슈는 서로 다른 언론사 3곳+의 직접관련 기사를 요구하고(사용자 지시), 그 미만이라도
+    시간근접·사건일치가 충분한 속보는 _same_event_burst가 별도로 통과시킨다.
+
+    한화 다중사건(야구/그룹, 공통 사건토큰 없음)은 dominant도 burst도 아니어서 False.
+    표현이 달라 Jaccard cluster가 쪼개진 정상 이슈도 사건토큰 공유 언론사 3곳+면 구제된다.
+    """
+    event_tokens = _dominant_event_tokens(keyword, high_articles)
+    if not event_tokens:
+        return False
+    kw_tokens = {t.lower() for t in _tokens(keyword or "")}
+    # 토큰별 독립 언론사 수를 센다. event_tokens 합집합의 press union이 아니라, **하나의
+    # 사건 토큰**이 서로 다른 언론사 3곳+에서 등장해야 dominant로 인정한다(Codex 최종리뷰 P1
+    # 잔여: alpha/beta가 press를 나눠 가지면 합집합은 3곳이어도 단일 사건이 아님). 이래야
+    # "같은 사건을 3개 언론사가 보도"만 통과하고, 서로 다른 사건이 토큰 브리징으로 합산되는
+    # 오탐을 막는다.
+    token_presses: Dict[str, set] = {t: set() for t in event_tokens}
+    for a in high_articles:
+        press = a.get("press")
+        if not press or press == PRESS_UNKNOWN:
+            continue
+        toks = {
+            t for t in _tokens(f"{a.get('title', '')} {a.get('clean_description') or a.get('snippet', '')}")
+            if not _keyword_derived(t, kw_tokens) and t not in _EVENT_TOKEN_STOPWORDS
+        }
+        for t in (toks & event_tokens):
+            token_presses[t].add(press)
+    return any(len(p) >= DOMINANT_EVENT_MIN_PRESS for p in token_presses.values())
+
+
+def _same_event_burst(keyword: str, high_articles: List[Dict]) -> bool:
+    """속보 예외 독립 신호(Codex P2-E): 고관련 기사쌍 중 (a) keyword 제외 공통 non-generic
+    사건 토큰 1개+ 공유 AND (b) 서로 다른 press(PRESS_UNKNOWN 제외) AND (c) published_at
+    파싱되고 시간차 <= BURST_HOURS 인 쌍이 존재하면 True.
+
+    "한화"만 공유(사건 토큰 없음)/같은 press 연속보도/timestamp 누락은 자격 없음(보수적).
+    cluster_articles Jaccard와 무관한 독립 신호라, 표현이 달라 cluster가 쪼개진 정상 속보를
+    구제한다.
+    """
+    kw_tokens = {t.lower() for t in _tokens(keyword or "")}
+
+    def event_toks(a):
+        toks = set(_tokens(f"{a.get('title','')} {a.get('clean_description') or a.get('snippet','')}"))
+        return {t for t in toks if not _keyword_derived(t, kw_tokens) and t not in _EVENT_TOKEN_STOPWORDS}
+
+    enriched = []
+    for a in high_articles:
+        age = _age_hours(a.get("published_at"))
+        press = a.get("press")
+        if age is None or not press or press == PRESS_UNKNOWN:
+            continue
+        enriched.append((a, event_toks(a), age, press))
+
+    for i in range(len(enriched)):
+        for j in range(i + 1, len(enriched)):
+            a1, t1, age1, p1 = enriched[i]
+            a2, t2, age2, p2 = enriched[j]
+            if p1 == p2:
+                continue
+            if not (t1 & t2):
+                continue
+            if abs(age1 - age2) <= BURST_HOURS:
+                return True
+    return False
+
 
 def _matched_tokens(tokens: set, text: str, text_tokens: set) -> set:
     """tokens 중 text에 실제 등장하는 것 — 정확 토큰 매칭 또는 substring 포함(조사/어미
@@ -655,6 +911,14 @@ def _display_anchor_allowed(effective_keyword: str, article: Dict, representativ
     # len(kw_non_generic)==1만 보면 "여행 공유"/"지원 발표"처럼 generic을 뺀 뒤 1개만
     # 남는 다토큰 키워드까지 anchor 검증 없이 예외를 타 오염이 다시 샌다. 원래 키워드가
     # 단일 토큰("장동건")이고 그 토큰이 generic이 아닐 때로 좁힌다.
+    # entity-role 게이트(D, 2026-07): entity 키워드 정제로 부여된 entity_role이 있으면,
+    # single_token_exception(장동건류 보존 경로)은 role이 non_subject가 "아닐" 때만 탄다.
+    # non_subject(정치 수사/비교 대상)는 keyword_main_topic(0.9)이어도 예외를 못 탄다 —
+    # 신천지 정치 기사가 단일토큰 예외로 새는 것을 차단(Codex 계획리뷰 P1-1/2). role이
+    # 없는(event/unknown 키워드) 기사는 기존 동작 유지.
+    role = article.get("entity_role")
+    if role == "non_subject":
+        return False
     single_token_exception = (
         len(kw_tokens) == 1
         and not (kw_tokens & _GENERIC_SINGLE_TOKENS)
@@ -684,6 +948,28 @@ def _display_anchor_allowed(effective_keyword: str, article: Dict, representativ
     return False
 
 
+def canonical_evidence(news_meta: Dict, keyword: str, max_articles: Optional[int] = None) -> tuple:
+    """canonical evidence set 단일 진실원(F, 2026-07). builder·B2·display-min gate가 모두
+    이 helper를 호출해 "동일한 정제 후 기사 집합 + summary_type"을 얻는다.
+
+    반환: (articles, summary, summary_type).
+    - articles = dedup_articles(news_meta.articles) → filter_articles_for_display(min=ARTICLES_MIN)
+      → [:max_articles]. (builder.build_ranked_entry:92-93와 동일 파이프)
+    - summarize(**canonical keyword**, articles) — display_keyword가 아니라 keyword.
+      builder(builder.py:94)가 keyword로 summarize하므로, drift 방지를 위해 여기서도 keyword.
+
+    ARTICLES_MIN/ARTICLES_MAX는 builder에서 import(순환 회피 위해 함수 내부 지역 import).
+    """
+    from news.dedup import dedup_articles
+    from news.builder import ARTICLES_MIN, ARTICLES_MAX
+    if max_articles is None:
+        max_articles = ARTICLES_MAX
+    deduped = dedup_articles(news_meta.get("articles") or [])
+    articles = filter_articles_for_display(deduped, min_count=ARTICLES_MIN)[:max_articles]
+    summary, summary_type = summarize(keyword, articles)
+    return articles, summary, summary_type
+
+
 def build_display_articles(
     effective_keyword: str, articles: List[Dict], representative: Optional[Dict] = None
 ) -> List[Dict]:
@@ -696,6 +982,12 @@ def build_display_articles(
     """
     out = []
     for a in articles or []:
+        # primary cluster 기사도 entity-role이 non_subject면 제외한다(D, 2026-07). 정제(C)가
+        # non_subject를 이미 걸러내지만, 전부 non_subject라 정제가 되돌려진 방어 케이스나
+        # cluster 재계산 결과 non_subject가 primary에 남는 경우까지 이중으로 막는다 —
+        # "primary면 무조건 통과"가 신천지 정치기사를 노출시켰던 근본 경로(Codex P1-1).
+        if a.get("entity_role") == "non_subject":
+            continue
         if a.get("is_primary_cluster"):
             out.append(a)
             continue
@@ -952,6 +1244,29 @@ def compute_news_signal(keyword: str, raw_items: List[dict], require_all_tokens:
     # relevance 산출(개선4/5) → articles는 relevance 내림차순으로 재배열됨
     scored_articles = score_articles_relevance(keyword, normalized, require_all_tokens=require_all_tokens)
 
+    # ── entity-role 정제(C, 2026-07): 넓은 단일 엔티티 키워드에서 keyword가 사건 주체가
+    #    아닌 오염 기사(정치 수사·snippet-only 등)를 제거한 뒤 clustering/representative/
+    #    quality gate 신호를 "정제된 집합"으로 계산한다. 이 정제를 여기(cluster 계산 이전)에
+    #    두어야 primary/representative/title_relevance/high_relevance_count/quality_cluster_size
+    #    등 return dict의 모든 값이 정제본 기반이 된다(Codex 계획리뷰 P1-C: score/gate가
+    #    news_meta를 즉시 소비하므로 ranker 단계 정제는 늦음). event/unknown 키워드는 정제를
+    #    건너뛰어 기존 동작을 100% 보존한다(회귀 방어).
+    keyword_kind = classify_keyword_kind(keyword)
+    entity_role_reasons: Dict[int, str] = {}
+    if keyword_kind == "entity":
+        for a in scored_articles:
+            role, reason = classify_entity_role(keyword, a)
+            a["entity_role"] = role
+            a["entity_role_reason"] = reason
+            entity_role_reasons[id(a)] = reason
+        # strong non_subject 기사만 canonical evidence set에서 제외한다. unknown은 보존
+        # (과잉 제외 금지 — 장동건류 단일 인물 다사건 보존). 정제 후 기사가 하나도 없으면
+        # (전부 non_subject) 정제를 되돌린다 — 이 경우는 아래 gate/B2가 자연히 걸러낸다.
+        refined = [a for a in scored_articles if a.get("entity_role") != "non_subject"]
+        if refined:
+            scored_articles = refined
+    keyword_kind_effective = keyword_kind
+
     # clustering(개선2) → primary cluster 기준 representative 선택
     clusters = cluster_articles(scored_articles)
     primary = select_primary_cluster(clusters)
@@ -1011,6 +1326,14 @@ def compute_news_signal(keyword: str, raw_items: List[dict], require_all_tokens:
     ]
     latest_relevant_age_hours = min(high_relevance_ages) if high_relevance_ages else None
 
+    # dominant event / same-event burst 신호(E, 2026-07) — entity 키워드 cohesion gate용.
+    # entity 키워드에서 "고관련 2건이 실제로 같은 사건인가"를 판정한다. 단일 엔티티 토큰만
+    # 공유하고 사건이 다른 기사(한화 야구 vs 한화그룹)는 dominant도 burst도 아니어서 gate
+    # 미달이 된다. event/unknown 키워드는 이 신호를 gate에서 소비하지 않는다(ranker 판단).
+    has_dominant_event = _has_dominant_event(keyword, high_relevance_articles)
+    same_event_burst = _same_event_burst(keyword, high_relevance_articles)
+    dominant_event_tokens = sorted(_dominant_event_tokens(keyword, high_relevance_articles))
+
     # PR/광고성 집계(문제 B). 분모 = 이슈 정의 기사 전체 pool(_is_issue_defining_article).
     # primary cluster로 좁히면 relevance score 합 기준 primary 선택의 약점 때문에 "PR 소수지만
     # relevance 높은 클러스터"가 primary가 되어 정상 keyword를 오제외할 수 있어(Codex review-only
@@ -1046,6 +1369,13 @@ def compute_news_signal(keyword: str, raw_items: List[dict], require_all_tokens:
         "issue_article_count": issue_article_count,
         "commercial_pr_ratio": round(commercial_pr_ratio, 4),
         "off_primary_sense_count": off_primary_sense_count,
+        # entity-role 정제 결과(E/G/진단용). event/unknown은 정제 미적용.
+        "keyword_kind": keyword_kind_effective,
+        "refined_article_count": len(scored_articles),
+        # cohesion 신호(E) — ranker._quality_gate_reason이 entity 키워드에만 소비.
+        "has_dominant_event": has_dominant_event,
+        "same_event_burst": same_event_burst,
+        "dominant_event_tokens": dominant_event_tokens,
     }
 
 
