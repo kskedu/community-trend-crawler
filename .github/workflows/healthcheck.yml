@@ -63,7 +63,40 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "🔄 크롤러 재실행 트리거 (status=${{ steps.check.outputs.status }})"
+          set -euo pipefail
+          # 중복 dispatch 완화(check-then-act): 이미 crawl.yml 이 queued/in_progress 면
+          # 재촉발하지 않는다. stale 로 보이는 건 실행 지연일 수 있어, 이미 도는 run 을
+          # 기다리는 편이 이중 실행보다 안전하다. cron-job.org 정기 dispatch 와도 겹칠 수
+          # 있으므로 이 방어를 둔다.
+          #
+          # ※ 원자적 보장이 아니다: 두 healthcheck/수동 호출이 동시에 "run 없음"을 관측하면
+          #   둘 다 dispatch할 수 있고, dispatch 직후 API 리스팅 전파 지연 창도 있다.
+          #   "정상 케이스 중복 완화"이며 0건 보장은 아니다(후속 concurrency/DB guard 과제).
+          #
+          # fail-closed: run 조회가 실패하면(네트워크/권한/일시 오류) dispatch 하지 않는다.
+          #   조회 불가 상태에서 무작정 재촉발하면 이중 실행 위험이 더 크기 때문이다.
+          #   이때는 다음 정기 cron-job.org dispatch 또는 다음 healthcheck 주기가 복구한다.
+          # gh run list 의 --status 는 단수 문자열이라 queued/in_progress 를 각각 조회해
+          # 합산한다. --workflow 는 표시 이름이 아니라 파일명(crawl.yml)으로 정확히 겨냥한다.
+          # 어느 한 조회라도 실패하면 fail-closed 로 dispatch 를 생략한다.
+          if ! QUEUED="$(gh run list --repo "${{ github.repository }}" \
+                --workflow crawl.yml --status queued \
+                --json databaseId --jq 'length' 2>/dev/null)"; then
+            echo "⚠️ crawl.yml queued 조회 실패 → fail-closed: dispatch 생략(다음 주기 복구)"
+            exit 0
+          fi
+          if ! RUNNING="$(gh run list --repo "${{ github.repository }}" \
+                --workflow crawl.yml --status in_progress \
+                --json databaseId --jq 'length' 2>/dev/null)"; then
+            echo "⚠️ crawl.yml in_progress 조회 실패 → fail-closed: dispatch 생략(다음 주기 복구)"
+            exit 0
+          fi
+          ACTIVE=$(( ${QUEUED:-0} + ${RUNNING:-0} ))
+          if [ "$ACTIVE" != "0" ]; then
+            echo "⏭️ crawl.yml 이 이미 실행 중/대기 중(queued=${QUEUED} in_progress=${RUNNING}) → dispatch 생략(중복 방지)"
+            exit 0
+          fi
+          echo "🔄 크롤러 재실행 트리거 (status=${{ steps.check.outputs.status }}, active=0)"
           gh workflow run "Community Trend Crawler" --ref main \
             --repo ${{ github.repository }}
 
