@@ -899,5 +899,214 @@ class BriefingPassFlowTest(unittest.TestCase):
             diagnostics.RunDiagnostics(run_type="scheduled")
 
 
+class FreshnessCompareTest(unittest.TestCase):
+    """freshness guard 순수 helper — _is_stale_news_top_write / _parse_generated_at.
+
+    new < previous 일 때만 stale(True). 그 외(같음/최신/결측/비문자열/파싱실패)는 전부
+    write 허용(False, fail-open) — 정상 신선 실행을 막지 않는다.
+    """
+
+    @staticmethod
+    def _p(gen):
+        return {"generated_at": gen}
+
+    def test_1_new_older_than_previous_is_stale(self):
+        self.assertTrue(main_module._is_stale_news_top_write(
+            self._p("2026-07-20T05:00:00+00:00"), self._p("2026-07-20T04:00:00+00:00")))
+
+    def test_2_new_newer_allows_write(self):
+        self.assertFalse(main_module._is_stale_news_top_write(
+            self._p("2026-07-20T04:00:00+00:00"), self._p("2026-07-20T05:00:00+00:00")))
+
+    def test_3_equal_instant_allows_write(self):
+        self.assertFalse(main_module._is_stale_news_top_write(
+            self._p("2026-07-20T04:00:00+00:00"), self._p("2026-07-20T04:00:00+00:00")))
+
+    def test_4_z_and_offset_mixed(self):
+        # previous=Z(=+00:00) 05:00, new=+00:00 04:00 → new older → stale
+        self.assertTrue(main_module._is_stale_news_top_write(
+            self._p("2026-07-20T05:00:00Z"), self._p("2026-07-20T04:00:00+00:00")))
+
+    def test_5_different_offset_same_absolute_instant(self):
+        # 04:00+00:00 == 13:00+09:00 (동일 절대시각) → 같음 → 허용
+        self.assertFalse(main_module._is_stale_news_top_write(
+            self._p("2026-07-20T04:00:00+00:00"), self._p("2026-07-20T13:00:00+09:00")))
+
+    def test_6_previous_naive_treated_as_utc(self):
+        # previous naive 05:00(=UTC), new 04:00Z → new older → stale
+        self.assertTrue(main_module._is_stale_news_top_write(
+            self._p("2026-07-20T05:00:00"), self._p("2026-07-20T04:00:00Z")))
+
+    def test_6b_new_naive_treated_as_utc(self):
+        # new naive 06:00(=UTC), previous 05:00Z → new newer → 허용
+        self.assertFalse(main_module._is_stale_news_top_write(
+            self._p("2026-07-20T05:00:00Z"), self._p("2026-07-20T06:00:00")))
+
+    def test_7_missing_generated_at_allows_write(self):
+        self.assertFalse(main_module._is_stale_news_top_write({}, {}))
+        self.assertFalse(main_module._is_stale_news_top_write(
+            self._p("2026-07-20T05:00:00Z"), {}))
+        self.assertFalse(main_module._is_stale_news_top_write(
+            {}, self._p("2026-07-20T04:00:00Z")))
+
+    def test_8_non_string_allows_write(self):
+        for bad in (12345, {"a": 1}, ["x"], object()):
+            self.assertFalse(main_module._is_stale_news_top_write(
+                self._p(bad), self._p("2026-07-20T04:00:00Z")))
+            self.assertFalse(main_module._is_stale_news_top_write(
+                self._p("2026-07-20T05:00:00Z"), self._p(bad)))
+
+    def test_8b_previous_not_dict_allows_write(self):
+        for bad in (None, "x", 5, ["l"]):
+            self.assertFalse(main_module._is_stale_news_top_write(
+                bad, self._p("2026-07-20T04:00:00Z")))
+
+    def test_9_parse_failure_allows_write(self):
+        self.assertFalse(main_module._is_stale_news_top_write(
+            self._p("not-a-date"), self._p("2026-07-20T04:00:00Z")))
+        self.assertFalse(main_module._is_stale_news_top_write(
+            self._p("2026-07-20T05:00:00Z"), self._p("garbage")))
+
+
+def _future_issues_previous(minutes_ahead=30):
+    """harness 의 news_top 발행 payload(generated_at=now)보다 미래인 previous 를 만든다.
+
+    builder 가 issues.generated_at 에 datetime.now(UTC) 를 찍으므로, 그보다 미래의
+    previous 를 fetch_news_issues 가 반환하면 새 실행은 stale 로 판정된다.
+    """
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    future = (_dt.now(_tz.utc) + _td(minutes=minutes_ahead)).isoformat()
+    return {"generated_at": future, "keywords": []}
+
+
+class FreshnessGuardBriefingTest(unittest.TestCase):
+    """run_news_briefing 통합 — stale skip 계약 + 정상 계약 (fetch/upsert/record mock).
+
+    '실제 read→write 경합'이 아니라 '이미 관측된 최신값(previous)보다 오래된 실행의
+    후행 write 차단'을 검증한다(TOCTOU 는 별도 후속 과제).
+    """
+
+    def test_stale_run_skips_upsert_but_records_skipped(self):
+        """stale: news_top upsert 0회, 진단 1회, status=skipped/STALE_WRITE_SKIPPED,
+        decisions·근거 보존, NEWS_TOP_UPSERT_FAILED 오분류 아님."""
+        prev = _future_issues_previous(30)
+        with _BriefingHarness(self), \
+             patch.object(main_module, "fetch_news_issues", return_value=prev), \
+             patch.object(main_module, "upsert_news_issues", return_value=True) as up, \
+             patch.object(main_module, "record_news_diagnostics", return_value=True) as rpc:
+            main_module.run_news_briefing(run_type="news_top_only")
+
+            up.assert_not_called()                 # (10) upsert 0회
+            rpc.assert_called_once()               # (11) 진단 1회
+            payload, decisions = rpc.call_args[0]
+            self.assertEqual(payload["status"], "skipped")               # (12)
+            self.assertEqual(payload["skip_reason"], "STALE_WRITE_SKIPPED")  # (13)
+            self.assertNotEqual(payload["status"], "success")            # (17/21)
+            self.assertNotEqual(payload["skip_reason"], "NEWS_TOP_UPSERT_FAILED")  # (19)
+            # (14~16) candidates·decisions·rejection 보존
+            self.assertGreater(payload["candidate_count"], 0)
+            self.assertGreater(len(decisions), 0)
+            # (18) selection_diagnostics_v1 보존 + (17) stale_write_v1 근거
+            thr = payload["thresholds"]
+            self.assertIn("selection_diagnostics_v1", thr)
+            self.assertIn("stale_write_v1", thr)
+            sw = thr["stale_write_v1"]
+            self.assertEqual(sw["action"], "skip_stale_write")
+            self.assertEqual(sw["mode"], "news_top_only")
+            self.assertEqual(sw["comparison"], "new_older_than_previous")
+            self.assertEqual(sw["previous_generated_at"], prev["generated_at"])
+            self.assertTrue(sw["new_generated_at"])
+            # (20) 근거에 secret/payload 전문 없음 — 키 집합이 고정 화이트리스트뿐
+            self.assertEqual(set(sw.keys()), {
+                "action", "previous_generated_at", "new_generated_at",
+                "mode", "run_id", "comparison", "result"})
+
+    def test_stale_run_id_from_github_env(self):
+        """run_id: GITHUB_RUN_ID 있으면 그 값, 없으면 None(로컬)."""
+        prev = _future_issues_previous(30)
+        # (a) 환경값 있음
+        with _BriefingHarness(self), \
+             patch.object(main_module, "fetch_news_issues", return_value=prev), \
+             patch.object(main_module, "upsert_news_issues", return_value=True), \
+             patch.object(main_module, "record_news_diagnostics", return_value=True) as rpc, \
+             patch.dict(main_module.os.environ, {"GITHUB_RUN_ID": "987654"}):
+            main_module.run_news_briefing(run_type="news_top_only")
+            payload, _ = rpc.call_args[0]
+            self.assertEqual(payload["thresholds"]["stale_write_v1"]["run_id"], "987654")
+        # (b) 환경값 없음 → None
+        with _BriefingHarness(self), \
+             patch.object(main_module, "fetch_news_issues", return_value=prev), \
+             patch.object(main_module, "upsert_news_issues", return_value=True), \
+             patch.object(main_module, "record_news_diagnostics", return_value=True) as rpc:
+            with patch.dict(main_module.os.environ, {}, clear=False):
+                main_module.os.environ.pop("GITHUB_RUN_ID", None)
+                main_module.run_news_briefing(run_type="news_top_only")
+            payload, _ = rpc.call_args[0]
+            self.assertIsNone(payload["thresholds"]["stale_write_v1"]["run_id"])
+
+    def test_stale_skip_logs_without_secret(self):
+        """(20) stale skip 로그가 남고, payload 전문·secret 없이 generated_at/mode 만."""
+        prev = _future_issues_previous(30)
+        with _BriefingHarness(self), \
+             patch.object(main_module, "fetch_news_issues", return_value=prev), \
+             patch.object(main_module, "upsert_news_issues", return_value=True), \
+             patch.object(main_module, "record_news_diagnostics", return_value=True):
+            with self.assertLogs("main", level="WARNING") as cm:
+                main_module.run_news_briefing(run_type="news_top_only")
+        joined = "\n".join(cm.output)
+        self.assertIn("skip_stale_write", joined)
+        self.assertNotIn("apikey", joined.lower())
+        self.assertNotIn("bearer", joined.lower())
+
+    def test_fresh_run_upserts_and_records_success(self):
+        """(22~24) 최신 실행: news_top upsert 1회, status=success, skip_reason 없음."""
+        # previous 없음(None) → fresh 로 간주 → 정상 발행
+        with _BriefingHarness(self), \
+             patch.object(main_module, "upsert_news_issues", return_value=True) as up, \
+             patch.object(main_module, "record_news_diagnostics", return_value=True) as rpc:
+            main_module.run_news_briefing(run_type="news_top_only")
+            up.assert_called_once()                # (22)
+            payload, _ = rpc.call_args[0]
+            self.assertEqual(payload["status"], "success")     # (23)
+            self.assertIsNone(payload["skip_reason"])          # (24)
+            self.assertNotIn("stale_write_v1", payload["thresholds"])
+
+    def test_older_previous_allows_write(self):
+        """(25) previous.generated_at 이 새 payload 보다 과거면 write 허용(정상 발행).
+
+        ※ 동일 절대시각(equal instant) 자체는 helper 단위(FreshnessCompareTest.test_3/5)에서
+          정밀 검증한다. 이 통합 테스트는 briefing 경로에서 '과거 previous → 정상 upsert'만 본다.
+        """
+        published = []
+        past = {"generated_at": "2000-01-01T00:00:00+00:00", "keywords": []}
+        with _BriefingHarness(self), \
+             patch.object(main_module, "fetch_news_issues", return_value=past), \
+             patch.object(main_module, "upsert_news_issues",
+                          side_effect=lambda i, source="news_top": published.append(i) or True) as up, \
+             patch.object(main_module, "record_news_diagnostics", return_value=True):
+            main_module.run_news_briefing(run_type="news_top_only")
+            up.assert_called_once()
+
+    def test_reversed_order_older_run_blocked_newer_preserved(self):
+        """(27~29) 이미 저장된 최신값 B(previous) 이후 오래된 실행 A 가 저장 시도 →
+        A 의 upsert 차단, A 진단은 skipped 1회, B 의 news_top 유지(덮이지 않음).
+
+        ※ 실제 동시성이 아니라 '관측된 최신값보다 오래된 후행 write 차단' 검증.
+        """
+        b_generated = _future_issues_previous(60)   # B = 미래(=이미 저장된 더 최신)
+        with _BriefingHarness(self), \
+             patch.object(main_module, "fetch_news_issues", return_value=b_generated), \
+             patch.object(main_module, "upsert_news_issues", return_value=True) as up, \
+             patch.object(main_module, "record_news_diagnostics", return_value=True) as rpc:
+            main_module.run_news_briefing(run_type="full")   # A 실행(new=now < B)
+            up.assert_not_called()                            # (27) A upsert 차단
+            rpc.assert_called_once()                          # (28) A 진단 1회
+            payload, _ = rpc.call_args[0]
+            self.assertEqual(payload["status"], "skipped")
+            self.assertEqual(payload["skip_reason"], "STALE_WRITE_SKIPPED")
+            self.assertEqual(payload["thresholds"]["stale_write_v1"]["mode"], "full")
+        # (29) B(previous)는 upsert 가 호출되지 않았으므로 그대로 유지됨(덮이지 않음).
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -63,6 +63,15 @@ MAX_DECISIONS = 200
 # 단위 테스트로는 잡히지 않음 — Codex diff review P1).
 RUN_TYPES = ("full", "news_top_only", "baseline")
 
+# skip_reason 단일 권위 상수 — main.py freshness guard(오래된 실행이 최신 news_top 을 덮지
+# 않게 upsert skip)가 그 실행을 mark_skipped(...) 할 때 쓴다. 문자열을 여러 곳에 흩뿌리지
+# 않고 여기 한 곳에서만 정의한다.
+#   ⚠️ skip_reason 은 클라이언트에서 화이트리스트로 강제하지 않는다(RUN_TYPES 와 달리).
+#      허용값 계약의 유일한 권위는 **배포 SQL 의 news_keyword_runs.skip_reason CHECK** 이고,
+#      이 값은 그 CHECK 에 STALE_WRITE_SKIPPED 로 등록돼 있어야 한다(migration 으로 관리).
+#      미등록 상태에서 이 값을 보내면 RPC INSERT 가 CHECK 위반으로 진단 적재 전체가 실패한다.
+SKIP_REASON_STALE_WRITE = "STALE_WRITE_SKIPPED"
+
 # 기사 메타 allowlist — 본문/description 저장 금지(사용자 확정).
 _ARTICLE_FIELDS = (
     "title", "url", "source", "published_at",

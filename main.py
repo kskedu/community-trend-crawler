@@ -3,7 +3,9 @@
 GitHub Actions에서 주기적으로 실행됨
 """
 import logging
+import os
 import sys
+from datetime import datetime, timezone
 from urllib.parse import quote_plus
 from scrapers.clien import ClienScraper
 from scrapers.ruliweb import RuliwebScraper
@@ -52,6 +54,49 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger(__name__)
+
+
+def _parse_generated_at(value):
+    """issues['generated_at'] 문자열 → tz-aware datetime(UTC 기준). 실패 시 None.
+
+    - 문자열이 아니면 None(비교 불가 → 상위에서 write 허용).
+    - 'Z'는 '+00:00'으로 변환해 fromisoformat 파싱.
+    - naive(timezone 없음)면 UTC로 간주(builder 는 항상 UTC ISO 를 넣지만 방어적).
+    - ValueError/TypeError 등 파싱 실패는 None(상위에서 write 허용, fail-open).
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _is_stale_news_top_write(previous, new_issues):
+    """새 news_top payload 가 이미 저장된 previous 보다 '명확히 과거'인지 판정.
+
+    True 를 반환할 때만 상위에서 upsert 를 skip 한다(오래된 실행이 최신을 덮는 것 방지).
+    fail-open 원칙: 아래 애매/이상 케이스는 전부 False(=write 허용)로, 정상 신선 실행을
+    막지 않는다.
+      - previous 가 dict 아님 / generated_at 누락·비문자열·파싱실패 → False
+      - new 의 generated_at 누락·비문자열·파싱실패 → False
+      - 두 시각이 같거나 new 가 더 최신 → False
+    오직 두 값이 모두 정상 파싱되고 new < previous 일 때만 True.
+
+    ※ 한계: previous 는 실행 시작 시점(main.py read)의 스냅샷이라, read~write 사이
+      다른 run 이 더 최신을 write 하면 이 가드는 그 값을 못 본다(순수 TOCTOU).
+      완전 방어가 아니라 '이미 관측한 최신을 덮는 것'만 막는 best-effort 다.
+    """
+    if not isinstance(previous, dict) or not isinstance(new_issues, dict):
+        return False
+    prev_dt = _parse_generated_at(previous.get("generated_at"))
+    new_dt = _parse_generated_at(new_issues.get("generated_at"))
+    if prev_dt is None or new_dt is None:
+        return False
+    return new_dt < prev_dt
 
 # 활성화된 스크래퍼 목록
 SCRAPERS = [
@@ -934,9 +979,44 @@ def run_news_briefing(run_type="full"):
             run_diag, issues, seed_status_map, len(candidates),
         ))
 
+        # freshness guard(best-effort last-write-wins 완화): 이미 저장된 previous 보다
+        # 새 payload 의 generated_at 이 '명확히 과거'면 upsert 를 건너뛴다. 큐 정체 등으로
+        # 오래된 실행이 뒤늦게 완료돼 최신 news_top 을 덮는 것을 막는다.
+        # fail-open: 값 누락/비문자열/파싱실패/동시각/최신 은 전부 정상 write(정상 신선 실행
+        # 을 막지 않는다). 완전 원자성 아님(read~write 사이 TOCTOU 는 후속 RPC 과제).
+        if _is_stale_news_top_write(previous, issues):
+            # 추적용 비-secret 값만 뽑는다(generated_at·mode·run_id 등 관측 메타뿐, 기사
+            # 본문/payload 전문/토큰은 남기지 않는다).
+            prev_gen = previous.get("generated_at") if isinstance(previous, dict) else None
+            new_gen = issues.get("generated_at") if isinstance(issues, dict) else None
+            run_id = os.getenv("GITHUB_RUN_ID")
+            # secret/payload 전문 없이 추적용 정보만 구조화 로그로 남긴다.
+            logger.warning(
+                "[news] source=news_top action=skip_stale_write "
+                "previous_generated_at=%s new_generated_at=%s run_type=%s "
+                "→ 오래된 실행이 최신을 덮지 않도록 upsert 생략",
+                prev_gen, new_gen, run_type,
+            )
+            # 진단: 발행 성공(success)이 아니라 skipped 로 남긴다(Admin 성공 집계에서 제외).
+            # skip_reason 은 배포 SQL CHECK 에 등록된 STALE_WRITE_SKIPPED(단일 권위 상수).
+            # candidates/decisions/selection_diagnostics 는 이미 위에서 확정돼 보존된다.
+            _safe_diag(run_diag, lambda: run_diag.mark_skipped(
+                diagnostics.SKIP_REASON_STALE_WRITE))
+            # 추적 근거를 thresholds JSONB 의 별도 최상위 namespace 로 적재(selection_
+            # diagnostics_v1 등 기존 키를 덮지 않는다). 고정 소수 필드라 8KB 상한 무관.
+            _safe_diag(run_diag, lambda: run_diag.thresholds.__setitem__(
+                "stale_write_v1", {
+                    "action": "skip_stale_write",
+                    "previous_generated_at": prev_gen,
+                    "new_generated_at": new_gen,
+                    "mode": run_type,
+                    "run_id": run_id,
+                    "comparison": "new_older_than_previous",
+                    "result": "skipped",
+                }))
         # upsert_news_issues는 예외가 아니라 False를 반환한다(db/supabase.py) —
         # False를 성공으로 기록하지 않는다.
-        if upsert_news_issues(issues, source="news_top"):
+        elif upsert_news_issues(issues, source="news_top"):
             logger.info(
                 "[news] news_top 저장 완료 (%d개, sources=%s)",
                 len(issues["keywords"]), data_sources,
