@@ -750,6 +750,351 @@ def classify_entity_role(keyword: str, article: Dict) -> tuple:
     return "unknown", "UNKNOWN_AMBIGUOUS"
 
 
+# === crime-attribution safety gate(G, 2026-07-21) — 명예·법적 위험 방어 =============
+# 배경(운영 재현): "박나래 공갈미수 구속"이 실시간 이슈에 노출됐다. 실제 기사는 "박나래를
+# 협박한 전 매니저가 공갈미수로 구속"이라, 범죄·처분의 주체는 박나래가 아니라 전 매니저다.
+# 이름과 범죄어를 직결한 키워드는 유명인을 범죄 주체로 오인시키는 명예·법적 위험이 있다.
+#
+# 기존 entity-role 정제는 (1) 다토큰 키워드(kind=unknown)엔 미적용이고 (2) "키워드 엔티티가
+# 기사 주제/주어인가"만 봐서 제목 앞머리 인물명은 통과했다. "범죄·처분의 실제 대상이
+# 누구인가"를 보는 게이트가 없었다.
+#
+# 설계 원칙(fail-closed): 범죄·처분어를 포함한 키워드는 **기본 위험**으로 두고, 고관련
+# 기사들이 "이름 엔티티가 실제 범죄 주체"임을 적극 입증할 때만 안전(노출)한다. 입증 못
+# 하면 drop. 경량 규칙(근접·조사·관계명사)만 쓰고 형태소 분석·인물명 하드코딩·금칙어
+# 사전은 쓰지 않는다. 100% 정확이 아니라, 위험 쪽으로 보수적(과소차단보다 과잉차단 선호)
+# 이다 — 정상 본인 사건은 verified_self 경로로 보존한다.
+# ============================================================================
+
+# 처분·수사어(법적 처리 신호). 이 토큰 없이 범죄어만 있으면 사건성이 약해 트리거하지 않는다.
+_DISPOSITION_TOKENS = (
+    "구속", "송치", "기소", "체포", "구인", "입건", "구속영장", "압수수색", "피의자", "실형",
+)
+# 범죄어(혐의 종류).
+_CRIME_TOKENS = (
+    "공갈", "협박", "사기", "횡령", "배임", "폭행", "성폭행", "성추행", "마약", "뇌물",
+    "스토킹", "살인", "절도", "강도", "밀수", "도박", "음주운전", "불법촬영", "감금", "유괴",
+)
+# 이름 엔티티에 종속된 "제3자 관계명사". 이름 직후 근접에 오면 그 관계인이 별개 주체.
+# 주의: 이 명사가 이름과 근접하지 않고 단독 주체로 등장하면(예: "남편 살인 구속") crime
+# gate 는 그 키워드에서 유명인 이름 anchor 가 없어 애초에 트리거되지 않는다(정상 이슈 보존).
+_RELATION_PERSON_MARKERS = (
+    "전 매니저", "전매니저", "前 매니저", "前매니저", "매니저", "소속사", "대표", "직원",
+    "지인", "친구", "동생", "형", "누나", "오빠", "언니", "가족", "부모", "아들", "딸",
+    "남편", "아내", "부인", "전 남친", "전 여친", "前 남친", "前 여친", "전 남자친구",
+    "전 여자친구", "내연남", "내연녀", "측근", "동업자", "투자자", "운전기사", "경호원",
+    "팬", "유튜버", "연인", "교제 상대", "일당",
+)
+# 익명 주체(이름과 별개로 등장하는 실제 범죄 주체). "이유명 협박한 40대 남성 구속" → 남성.
+_CRIME_SUBJECT_GENERIC = (
+    "남성", "여성", "남자", "여자", "40대", "30대", "20대", "50대", "60대", "10대",
+    "일당", "일가", "A씨", "B씨", "C씨", "무직", "회사원",
+)
+# victim-context 마커: 기사 제목에서 이름이 피해자·상대방임을 시사(기사 role 판정용,
+# subject 판정보다 우선). "협박한"(관형형)은 "A를 협박한 B" 구조라 victim 신호지만,
+# bare "협박"은 범죄어 자체라 아래 keyword-level 억제에는 쓰지 않는다(P1-A).
+_VICTIM_CONTEXT_MARKERS = (
+    "협박한", "협박당한", "상대로", "피해", "고소한", "고소당한", "고발한", "고발당한",
+    "법적공방", "법적 공방", "스토킹당한", "노린", "노려", "노렸다",
+)
+# keyword 문자열 자체에 이미 관계·피해 맥락이 담겨 "안전명"임을 뜻하는 마커(트리거
+# 억제 전용). bare 범죄어("협박"/"고소")는 제외한다 — "박나래 협박 구속"처럼 범죄어+
+# 처분어 조합은 오히려 위험 키워드라 반드시 트리거돼야 한다(Codex P1-A). 관형형/명사구
+# ("협박한"/"협박당한"/"법적공방"/"상대로")만 안전 맥락으로 인정한다.
+_KEYWORD_SAFE_CONTEXT_MARKERS = (
+    "협박한", "협박당한", "상대로", "법적공방", "법적 공방", "스토킹당한", "당한",
+    "피해자",
+)
+# crime keyword 선두 토큰이 사람/엔티티 anchor 가 아님을 뜻하는 non-person 명사(범죄
+# 도구·행위·직업 카테고리·익명 주체). 이런 토큰이 선두면 "이름+범죄어" 구조가 아니라
+# 사건 자체가 키워드이므로 crime-attribution gate 를 트리거하지 않는다(예: "흉기 난동
+# 구속", "배우 마약 구속"의 '배우'). 인물명 하드코딩이 아니라, 사람 anchor 배제용
+# 일반 명사 집합이다(_EVENT_KEYWORDS 와 같은 역할).
+_NON_PERSON_LEAD_TOKENS = (
+    "흉기", "난동", "칼", "차량", "차", "총", "총기", "방화", "화재", "사고", "폭행",
+    "성폭행", "성추행", "음주운전", "보이스피싱", "전세사기", "마약", "도박",
+    "남성", "여성", "남자", "여자", "일당", "부부", "모녀", "부자", "형제",
+)
+# 직업/신분 접두어. 키워드 선두에 오면 사람 anchor 가 아니라 그 "다음 토큰"이 실제 이름
+# anchor 다("배우 김유명 공갈 구속" → 김유명). 접두어 뒤 이름을 건너뛰지 않고 anchor 를
+# 한 칸 전진시킨다(Codex P1-B). 이름 없이 접두어 단독이면 anchor 없음 처리된다.
+_OCCUPATION_PREFIX_TOKENS = (
+    "배우", "가수", "감독", "의원", "시장", "지사", "회장", "사장", "대표", "교수",
+    "목사", "판사", "검사", "변호사", "경찰", "군인", "소방관", "학생", "교사", "아이돌",
+    "래퍼", "코미디언", "개그맨", "방송인", "유튜버", "전 의원", "前 의원", "가수 겸",
+)
+# name~crime 사이의 약한 연결어(주체 확정 보류). "A 관련 수사", "A 연루 의혹"처럼
+# 이름이 사건에 언급될 뿐 주체임이 확정되지 않는 문맥.
+_WEAK_LINKAGE_MARKERS = ("관련", "연루", "연관", "언급", "거론", "의혹")
+# 기관·직함·수사주체 등 "이름 사이에 흔히 끼는 비-피의자 명사". subject 확정 시 이름과
+# 처분어 사이에 이런 토큰이 있으면 그 자체로는 다른 주체 신호가 아니지만(수사 주체),
+# 이 목록 밖의 2~4자 한글 토큰이 끼면 "다른 실명 주체"일 수 있어 본인 확정을 보류한다.
+_INSTITUTION_ROLE_TOKENS = (
+    "특검", "검찰", "경찰", "법원", "공수처", "검찰청", "경찰청", "지검", "지청", "수사팀",
+    "수사본부", "합수단", "국수본", "전 대통령", "대통령", "전 장관", "장관", "총리",
+    "위원장", "이사장", "구속영장", "체포영장", "압수수색", "영장", "혐의", "사건", "재판",
+)
+
+
+# 이름·주체와 무관한 흔한 서술/명사 토큰(other-name 오탐 방지). 범죄 기사 제목에 자주
+# 등장하지만 인물명이 아닌 일반어. lexicon 밖 2~4자 한글이라도 이 목록이면 이름 후보에서
+# 제외한다(보수적 fail-closed 유지하되, "투약/혐의/조사/수사/투자/사건" 같은 일반어가
+# 다른 인물명으로 오인돼 본인 실제 사건을 unknown 으로 떨구는 회귀를 막는다).
+_COMMON_NONNAME_TOKENS = (
+    "투약", "혐의", "조사", "수사", "투자", "사건", "재판", "판결", "선고", "송치", "적발",
+    "검거", "적용", "청구", "발부", "신청", "기각", "인정", "부인", "주장", "진술", "출석",
+    "소환", "압수", "증거", "피해", "가해", "공범", "일부", "결국", "당시", "이후", "관련",
+    "혐의로", "상대로", "대상", "행위", "범행", "수법", "정황", "의심", "포착", "확인",
+    # 마약·범죄 기사 일반어(인명 오인 방지, Codex 3R P2). 이름처럼 2~4자 한글이라 lexicon
+    # 밖이면 other-name 후보로 잡혀 본인 실제 사건이 과잉 차단된다.
+    "필로폰", "대마", "코카인", "케타민", "엑스터시", "마약류", "상습", "판매", "유통",
+    "밀반입", "구매", "복용", "흡입", "구입", "성범죄", "촬영물", "동영상", "불법", "혐의점",
+    "구속기소", "불구속", "재범", "초범", "가담", "모의", "은닉", "도주", "잠적",
+)
+
+
+def _looks_like_person_name(tok: str) -> bool:
+    """tok 이 한국 인물명 후보로 보이는가(NER 없이 근사, 보수적)."""
+    if not (2 <= len(tok) <= 4):
+        return False
+    if not all("가" <= ch <= "힣" for ch in tok):
+        return False  # 순수 한글만
+    if tok in _COMMON_NONNAME_TOKENS:
+        return False
+    return True
+
+
+def _has_other_name_candidate(segment: str, anchor: str) -> bool:
+    """segment(이름 anchor 와 처분어 사이 구간)에 anchor 와 다른 "실명 후보" 토큰이 있는가.
+
+    NER 없이 근사한다: 인물명처럼 보이는(_looks_like_person_name) 2~4자 순수 한글 토큰 중
+    anchor 가 아니고 알려진 lexicon(기관·직함·관계·익명주체·범죄·처분·약한연결·직업접두·
+    일반 서술어)에 속하지 않는 토큰이 있으면 "다른 인물명일 수 있음"으로 본다(보수적 —
+    애매하면 본인 확정 보류해 fail-closed). "김건희 특검 윤석열 구속영장 청구"에서
+    anchor=김건희, 구간의 '윤석열'이 걸려 subject 확정을 막는다.
+    """
+    _known = (
+        set(_INSTITUTION_ROLE_TOKENS) | set(_RELATION_PERSON_MARKERS)
+        | set(_CRIME_SUBJECT_GENERIC) | set(_CRIME_TOKENS) | set(_DISPOSITION_TOKENS)
+        | set(_WEAK_LINKAGE_MARKERS) | set(_OCCUPATION_PREFIX_TOKENS)
+        | set(_NON_PERSON_LEAD_TOKENS)
+    )
+    for tok in _tokens(segment or ""):
+        if tok == anchor or not _looks_like_person_name(tok):
+            continue
+        if tok in _known or any(tok in k or k in tok for k in _known):
+            continue
+        return True
+    return False
+# 주격/속격 조사(subject 판정용, 이름 직후).
+_CRIME_SUBJECT_JOSA = ("이", "가", "은", "는", "의", "을", "를", "에게", "께서", ",")
+
+
+def _kw_name_anchor(keyword: str) -> str:
+    """keyword 에서 이름/엔티티 anchor 토큰을 고른다.
+
+    선두 토큰이 직업/카테고리 접두어(_OCCUPATION_PREFIX_TOKENS: 배우/가수/의원 등)면 그
+    다음 토큰을 anchor 로 쓴다("배우 김유명 공갈 구속" → 김유명, Codex P1-B). 다음 토큰도
+    없거나 그 자체가 범죄·처분·익명주체 토큰이면 anchor 없음(빈 문자열).
+    """
+    toks = _tokens(keyword or "")
+    if not toks:
+        return ""
+    idx = 0
+    if toks[0] in _OCCUPATION_PREFIX_TOKENS and len(toks) >= 2:
+        idx = 1
+    anchor = toks[idx]
+    # anchor 가 사람 고유명이 아니면(사건·익명주체·도구·범죄·처분·관계명사) anchor 없음.
+    # 관계명사 단독 선두("남편 음주운전 입건")는 유명인 이름이 아니라 그 관계인 본인
+    # 사건이므로 crime gate 대상이 아니다(정상 이슈 보존).
+    if (anchor in _EVENT_KEYWORDS or anchor in _CRIME_SUBJECT_GENERIC
+            or anchor in _NON_PERSON_LEAD_TOKENS
+            or anchor in _RELATION_PERSON_MARKERS
+            or any(anchor == t or anchor in t for t in (_CRIME_TOKENS + _DISPOSITION_TOKENS))):
+        return ""
+    return anchor
+
+
+def _kw_lead_token(keyword: str) -> str:
+    """호환용 별칭 — 이름 anchor 추출은 _kw_name_anchor 를 쓴다."""
+    return _kw_name_anchor(keyword)
+
+
+def crime_keyword_requires_check(keyword: str) -> bool:
+    """crime-attribution 검증이 필요한 키워드 후보인가(트리거 전용, 최종 판정 아님).
+
+    조건: (a) 처분·수사어 토큰 포함 AND (b) 범죄어 OR 처분어가 사건성을 갖추고
+    (c) 표기에 관계명사·victim 맥락이 아직 없다(있으면 안전명이라 검증 불필요).
+
+    이 predicate 는 "검증 대상"만 고른다. True 라고 해서 위험(unsafe)이 아니다 — 최종
+    판정은 기사 증거 기반 has_unsafe_crime_attribution 이 한다(본인 실제 사건은 통과).
+    """
+    kw = keyword or ""
+    has_disp = any(t in kw for t in _DISPOSITION_TOKENS)
+    if not has_disp:
+        return False
+    # 이름 anchor 가 없으면(선두가 사건·도구·익명주체·범죄어이고 뒤에 이름 없음) 트리거
+    # 안 함 — "흉기 난동 구속" 처럼 사건 자체가 키워드인 경우. 직업 접두어 뒤 이름은
+    # _kw_name_anchor 가 한 칸 전진해 잡는다("배우 김유명 공갈 구속" → 김유명, P1-B).
+    anchor = _kw_name_anchor(kw)
+    if not anchor:
+        return False
+    # 안전명 억제: 관계명사가 이름 anchor "뒤"에 올 때만 안전명으로 본다("박나래 전
+    # 매니저 …" → 전 매니저가 제3자). 이름 "앞"의 관계·직업 다의어(대표/유튜버)는 접두어일
+    # 뿐이라 억제하지 않는다(Codex P1: "유튜버 김유명 사기 구속"이 우회하던 문제). anchor
+    # 위치 이후 부분 문자열에서만 관계명사를 찾는다.
+    anchor_pos = kw.find(anchor)
+    after_anchor = kw[anchor_pos + len(anchor):] if anchor_pos >= 0 else ""
+    if any(m in after_anchor for m in _RELATION_PERSON_MARKERS):
+        return False
+    # 안전 맥락(관형형 victim 표현: 협박한/상대로/법적공방 등) → 검증 불필요.
+    # bare 범죄어("협박"/"고소")는 여기에 포함하지 않는다(P1-A): "박나래 협박 구속"처럼
+    # 범죄어+처분어 조합은 오히려 위험 키워드라 반드시 트리거돼야 한다.
+    if any(m in kw for m in _KEYWORD_SAFE_CONTEXT_MARKERS):
+        return False
+    return True
+
+
+def classify_crime_subject_role(keyword: str, article: Dict) -> str:
+    """기사에서 keyword 선두 엔티티(이름)가 실제 범죄·처분 주체인가.
+
+    반환: 'subject' | 'victim_or_bystander' | 'unknown'.
+
+    우선순위(경량 규칙, 단독 정규식 hard gate 금지):
+    1. victim-context 마커가 이름 근처 → victim_or_bystander (이름이 피해자/상대방).
+    2. 이름 직후 근접(≤6자)에 관계명사 → 그 관계인이 제3자 주체 → victim_or_bystander.
+    3. 이름과 별개로 익명 주체(_CRIME_SUBJECT_GENERIC)가 범죄·처분어와 결합 → victim.
+    4. 이름 직후 주격/속격 조사 + 범죄·처분어 직결 & 관계·victim 마커 없음 → subject(본인).
+    5. 그 외 → unknown (과잉판정 금지).
+    """
+    title = article.get("title") or ""
+    snippet = article.get("clean_description") or article.get("snippet") or ""
+    text = f"{title} {snippet}"
+    low = text.lower()
+    lead = _kw_lead_token(keyword)
+    if not lead:
+        return "unknown"
+    # 선두 토큰이 사람 anchor 가 아니면(도구·직업 카테고리·익명 주체 등) 이름 기준 주체
+    # 판정 자체가 성립하지 않는다 → unknown(중립). 트리거 단계에서 이미 걸러지지만,
+    # 함수 단독 호출·다른 경로 재사용 대비 방어적으로 둔다.
+    if lead in _NON_PERSON_LEAD_TOKENS or lead in _CRIME_SUBJECT_GENERIC:
+        return "unknown"
+
+    lead_spans = _find_all(lead, title) or _find_all(lead, text)
+    if not lead_spans:
+        return "unknown"
+    # 이름의 가장 앞 등장을 anchor 로 삼는다.
+    anchor_start, anchor_end = lead_spans[0]
+
+    has_crime = any(t in text for t in (_CRIME_TOKENS + _DISPOSITION_TOKENS))
+    if not has_crime:
+        return "unknown"
+
+    # (1) victim-context 마커 근접(앞뒤 24자) → 이름은 피해자/상대방.
+    victim_spans = _marker_positions_in(low, [m.lower() for m in _VICTIM_CONTEXT_MARKERS])
+    for vs, ve in victim_spans:
+        if _interval_distance(anchor_start, anchor_end, vs, ve) <= 24:
+            return "victim_or_bystander"
+
+    # (2) 이름 직후 근접(≤6자)에 관계명사 → 종속 제3자가 주체.
+    tail = title[anchor_end:anchor_end + 14] if anchor_end <= len(title) else ""
+    tail_stripped = tail.lstrip(" 의,·")
+    for rel in _RELATION_PERSON_MARKERS:
+        if tail_stripped.startswith(rel) or rel in tail[:8]:
+            return "victim_or_bystander"
+
+    # (3) 이름과 별개로 익명 주체 + 범죄·처분어 결합 → 익명 주체가 실제 주체.
+    #     이름 뒤 구간에 익명 주체가 등장하고 그 뒤/근처에 처분어가 있으면 victim.
+    after = title[anchor_end:]
+    if any(g in after for g in _CRIME_SUBJECT_GENERIC) and any(
+        d in after for d in _DISPOSITION_TOKENS
+    ):
+        return "victim_or_bystander"
+
+    # 약한 연결어("관련"/"연루"/"의혹")가 이름 근처에 있으면 주체 확정 보류(unknown).
+    # "최유명 관련 수사 계속…구속영장 검토"처럼 이름이 사건에 언급될 뿐 주체가 아님.
+    weak_spans = _marker_positions_in(low, _WEAK_LINKAGE_MARKERS)
+    for ws, we in weak_spans:
+        if _interval_distance(anchor_start, anchor_end, ws, we) <= 10:
+            return "unknown"
+
+    # (4) subject(본인) 확정은 보수적으로 — 이름이 범죄·처분어와 **직접 결합**할 때만.
+    #     lead_is_early "단독"으로는 확정하지 않는다(Codex P1-C): "김건희 특검, 윤석열
+    #     전 대통령 구속영장 청구"처럼 이름이 선두 수식어/기관명이고 실제 처분 대상은
+    #     다른 인물인 경우 subject 오확정 → verified_self 오통과를 막는다.
+    josa_tail = title[anchor_end:anchor_end + 3]
+    has_josa = any(josa_tail.startswith(j) or tail_stripped[:2].startswith(j)
+                   for j in _CRIME_SUBJECT_JOSA)
+    # 이름과 처분어 사이 절 구분자(",", "…", "·" 등)가 있으면 다른 절의 주체일 수 있어
+    # 본인 확정 보류. 이름 직후~처분어 구간에 clause break 가 없어야 한다.
+    disp_spans = _marker_positions_in(title, _DISPOSITION_TOKENS)
+    nearest_disp = min((ds for ds, de in disp_spans if ds >= anchor_end), default=None)
+    name_bound_to_disp = False
+    if nearest_disp is not None:
+        between = title[anchor_end:nearest_disp]
+        # 이름과 처분어 사이가 짧고(≤16자) 절 구분자·관계명사·익명주체·다른 실명 후보가
+        # 끼지 않음. 다른 실명 후보(_has_other_name_candidate)가 끼면 그 인물이 실제 처분
+        # 대상일 수 있어 본인 확정을 보류한다(Codex P1-C: "김건희 특검 윤석열 구속영장").
+        if (len(between) <= 16
+                and not any(b in between for b in _TITLE_CLAUSE_BREAKS)
+                and not any(rel in between for rel in _RELATION_PERSON_MARKERS)
+                and not any(g in between for g in _CRIME_SUBJECT_GENERIC)
+                and not _has_other_name_candidate(between, lead)):
+            name_bound_to_disp = True
+    # 제목 전체(처분어 이전)에 관계명사·익명 주체·다른 실명 후보가 이름과 별개로 있으면
+    # 본인 확정 보류. 처분어 이후는 "청구/발부" 등 절차어라 주체 판단에 무의미하므로 제외.
+    head = title[:nearest_disp] if nearest_disp is not None else title
+    other_subject_present = (
+        any(rel in title for rel in _RELATION_PERSON_MARKERS)
+        or any(g in after for g in _CRIME_SUBJECT_GENERIC)
+        or _has_other_name_candidate(head[anchor_end:], lead)
+    )
+    if (has_josa or name_bound_to_disp) and not other_subject_present:
+        return "subject"
+
+    return "unknown"
+
+
+def aggregate_crime_attribution(keyword: str, high_articles: List[Dict]) -> Dict:
+    """고관련 기사군에서 이름 엔티티의 crime subject role 집계 → 안전 판정 신호.
+
+    반환 dict:
+    - crime_check_triggered: crime_keyword_requires_check(keyword)
+    - crime_subject_count / crime_victim_count / crime_role_unknown_count
+    - crime_attribution_verified_self: 이름이 실제 주체임이 적극 입증됐는가.
+        (subject>=2 AND subject>victim AND victim<=1)
+    - has_unsafe_crime_attribution: triggered AND NOT verified_self (fail-closed).
+    """
+    triggered = crime_keyword_requires_check(keyword)
+    if not triggered:
+        return {
+            "crime_check_triggered": False,
+            "crime_subject_count": 0,
+            "crime_victim_count": 0,
+            "crime_role_unknown_count": 0,
+            "crime_attribution_verified_self": False,
+            "has_unsafe_crime_attribution": False,
+        }
+    subject = victim = unknown = 0
+    for a in high_articles:
+        role = classify_crime_subject_role(keyword, a)
+        if role == "subject":
+            subject += 1
+        elif role == "victim_or_bystander":
+            victim += 1
+        else:
+            unknown += 1
+    verified_self = subject >= 2 and subject > victim and victim <= 1
+    return {
+        "crime_check_triggered": True,
+        "crime_subject_count": subject,
+        "crime_victim_count": victim,
+        "crime_role_unknown_count": unknown,
+        "crime_attribution_verified_self": verified_self,
+        "has_unsafe_crime_attribution": not verified_self,
+    }
+
+
 # === entity cohesion 신호(E) — dominant event / same-event burst ===
 # BURST_HOURS: 서로 다른 언론사의 "같은 속보" 인정 시간창(published_at 간격 상한).
 BURST_HOURS = 6.0
@@ -1334,6 +1679,14 @@ def compute_news_signal(keyword: str, raw_items: List[dict], require_all_tokens:
     same_event_burst = _same_event_burst(keyword, high_relevance_articles)
     dominant_event_tokens = sorted(_dominant_event_tokens(keyword, high_relevance_articles))
 
+    # crime-attribution safety(G, 2026-07-21) — 이름+범죄어 직결 키워드에서 실제 범죄
+    # 주체가 이름 엔티티인지 기사 증거로 판정한다. crime keyword 아니면 필드가 전부
+    # 무해한 기본값(triggered=False, unsafe=False)이라 비범죄 이슈에 영향이 없다.
+    # 고관련 기사가 부족할 때도 판정이 가능하도록, 고관련이 2건 미만이면 정제된 전체
+    # 기사(scored_articles)로 fallback 한다(fail-closed 를 위해 증거를 넓게 본다).
+    crime_articles = high_relevance_articles if len(high_relevance_articles) >= 2 else scored_articles
+    crime_signal = aggregate_crime_attribution(keyword, crime_articles)
+
     # PR/광고성 집계(문제 B). 분모 = 이슈 정의 기사 전체 pool(_is_issue_defining_article).
     # primary cluster로 좁히면 relevance score 합 기준 primary 선택의 약점 때문에 "PR 소수지만
     # relevance 높은 클러스터"가 primary가 되어 정상 keyword를 오제외할 수 있어(Codex review-only
@@ -1376,6 +1729,13 @@ def compute_news_signal(keyword: str, raw_items: List[dict], require_all_tokens:
         "has_dominant_event": has_dominant_event,
         "same_event_burst": same_event_burst,
         "dominant_event_tokens": dominant_event_tokens,
+        # crime-attribution safety(G) — ranker._quality_gate_reason이 fail-closed 소비.
+        "crime_check_triggered": crime_signal["crime_check_triggered"],
+        "crime_subject_count": crime_signal["crime_subject_count"],
+        "crime_victim_count": crime_signal["crime_victim_count"],
+        "crime_role_unknown_count": crime_signal["crime_role_unknown_count"],
+        "crime_attribution_verified_self": crime_signal["crime_attribution_verified_self"],
+        "has_unsafe_crime_attribution": crime_signal["has_unsafe_crime_attribution"],
     }
 
 

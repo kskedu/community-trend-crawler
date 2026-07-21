@@ -372,6 +372,14 @@ _GATE_REASON_CODES = {
     "horoscope_content": "HOROSCOPE_CONTENT",
     "low_quality_news": "LOW_QUALITY_NEWS",
     "stale_only": "STALE_ONLY",
+    # crime-attribution safety(G, 2026-07-21) — 이름+범죄어 오귀속 fail-closed drop.
+    # ⚠️ 선행조건: StartHub news_keyword_decisions.reason_code CHECK 에
+    # 'UNSAFE_CRIME_ATTRIBUTION' 이 등록돼 있어야 한다(migration
+    # supabase-news-diag-reason-crime-*.sql). 이 CHECK 없이 이 코드를 emit 하면 진단
+    # INSERT 가 CHECK 위반으로 조용히 실패한다(STALE_WRITE_SKIPPED 선례). 그래서
+    # migration 을 먼저 운영 적용한 뒤 이 크롤러 변경을 merge 하는 순서 게이트를 지킨다.
+    # LOW_QUALITY_NEWS 로 왜곡 emit 하지 않는다 — 실제 drop 사유를 정확히 남긴다.
+    "unsafe_crime_attribution": "UNSAFE_CRIME_ATTRIBUTION",
 }
 
 
