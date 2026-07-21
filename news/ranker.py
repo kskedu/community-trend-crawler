@@ -200,6 +200,14 @@ def _quality_gate_reason(keyword: str, news_meta: Dict) -> Optional[str]:
     """
     if _is_horoscope_candidate(keyword, news_meta):
         return "horoscope_content"
+    # crime-attribution safety(G, 2026-07-21) — 이름+범죄어 직결 키워드가 실제 범죄
+    # 주체를 이름 엔티티로 입증하지 못하면 fail-closed 로 제외한다("박나래 공갈미수
+    # 구속"처럼 유명인을 범죄 주체로 오인시키는 명예·법적 위험 방어). crime keyword
+    # 아니면 has_unsafe_crime_attribution 이 항상 False 라 비범죄 이슈에 무영향이고,
+    # 본인 실제 사건(주체 입증)은 verified_self 경로로 통과한다. horoscope 다음, 기존
+    # 저품질 판정보다 먼저 둔다 — 의미 왜곡·법적 위험이 품질 미달보다 상위 우려다.
+    if news_meta.get("has_unsafe_crime_attribution"):
+        return "unsafe_crime_attribution"
     hrc = news_meta.get("high_relevance_count", 0)
     qcs = news_meta.get("quality_cluster_size", 0)
     if not (hrc >= 2 or qcs >= 2):
