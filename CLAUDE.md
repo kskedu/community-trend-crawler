@@ -49,8 +49,16 @@ cron-job.org 설정은 코드로 검증 불가. 재활성화 전 **사용자가 
 
 ### 잔여 P2 후속 과제 (이번 단일화로 미해소)
 1. **healthcheck 중복 확인의 비원자성**: check-then-act 라 두 호출 동시 관측 시 이중 dispatch 가능(정상 케이스 완화일 뿐, 0건 보장 아님).
-2. **full ↔ news_top_only shared news_top 경합**: :17 full 이 지연돼 :47 news_top_only 와 겹치면 같은 `source="news_top"` 행을 last-write-wins 로 덮는 race 잔존(schedule 제거로도 미해소).
-3. **DB optimistic guard / 실행 세대 보호**: upsert 직전 `updated_at` 비교로 순서 역전·교차 race 를 막는 근본 해법. concurrency(모드별 group, `cancel-in-progress:false`)와 함께 후속 PR 로 분리.
+2. **full ↔ news_top_only shared news_top 경합 — 앱단 freshness guard 로 완화 완료 (2026-07-20, `e7240e3`)**: 아래 "news_top freshness guard" 절 참조. **완전 원자화는 미해소**(TOCTOU 잔존, 항목 3 참조).
+3. **DB optimistic guard / 실행 세대 보호 — 근본(원자) 해결은 미착수**: 현재는 앱단에서 "실행 시작 시점에 읽은 previous" 와 비교하는 **best-effort** 뿐이라, read~write 사이 다른 run 이 더 최신을 write 하는 순수 TOCTOU 는 못 막는다. 근본 해결은 upsert 를 **DB RPC 조건부 write**(`generated_at` compare-and-set)로 바꾸는 것 — service_role/migration 동반하는 별도 PR. concurrency(모드별 group, `cancel-in-progress:false`)는 **healthcheck 복구 dispatch 의 pending 취소(유실) 위험** 때문에 채택하지 않기로 결정함(2026-07-20 계획 리뷰, GitHub Actions 표준 concurrency 는 새 pending 이 기존 pending 을 취소).
+
+### news_top freshness guard (2026-07-20, `e7240e3`)
+`run_news_briefing()` 이 upsert 직전 새 payload 의 `generated_at` 을 직전에 읽은 `previous.generated_at` 과 비교해, **새 값이 previous 보다 명확히 과거일 때만** upsert 를 건너뛴다(오래된 실행이 최신 news_top 을 덮어쓰는 것 방지). 동일 시각·최신·결측·비문자열·파싱 실패는 전부 write 허용(fail-open) — 정상 신선 실행을 막지 않는다.
+- helper: `main.py` `_parse_generated_at` / `_is_stale_news_top_write` (순수 함수, 테스트 가능).
+- stale 시: news_top upsert 만 생략. `keyword_cache`·`community_posts` 경로는 영향 없음. 후보/decisions/rejection_counts 는 그대로 진단 DB 에 보존되고, `status=skipped` / `skip_reason=STALE_WRITE_SKIPPED`(`news/diagnostics.py` `SKIP_REASON_STALE_WRITE`) 로 기록돼 **발행 성공 집계에서 제외**된다.
+- 근거는 `thresholds` JSONB 의 `stale_write_v1` namespace 에 저장(`previous_generated_at`/`new_generated_at`/`mode`/`run_id`/`comparison`/`result`, secret·기사 본문 없음).
+- **선행조건**: StartHub `news_keyword_runs.skip_reason` CHECK 에 `STALE_WRITE_SKIPPED` 가 등록돼 있어야 한다(StartHub PR #73, migration `docs/migrations/supabase-news-diag-skip-reason-stale-*.sql`, 운영 적용·postcheck 통과 완료). 이 CHECK 없이 guard 가 이 값을 보내면 RPC INSERT 가 CHECK 위반으로 **진단 적재 전체가 조용히 실패**한다 — 그래서 migration 을 먼저 적용하고 crawler guard(`e7240e3`, PR #14) 를 나중에 merge하는 순서 게이트를 지켰다.
+- **한계**: 완전한 원자적 경합 해결이 아니다("실제 경합 축소"가 아니라 "이미 관측된 최신값보다 오래된 실행의 후행 write 차단"). 위 항목 3 참조.
 
 ## 구조
 
