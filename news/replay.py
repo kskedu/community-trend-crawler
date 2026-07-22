@@ -43,6 +43,7 @@ def replay_selection(replay_input: Dict, fetch_news: Optional[Callable[[str], Li
     흐름은 main._rank_and_select와 동일한 게이트 순서를 재사용한다:
       compute_scores(quality gate) → exclude_pr_clusters → dedupe_and_merge →
       resolve_singleton_displays → enforce_display_article_consistency →
+      enforce_display_source_grounding →
       exclude_generic_singletons → exclude_insufficient_display_articles →
       exclude_no_representative → select_top.
 
@@ -96,6 +97,7 @@ def replay_selection(replay_input: Dict, fetch_news: Optional[Callable[[str], Li
     merged = ranker.dedupe_and_merge(ranked)
     merged = ranker.resolve_singleton_displays(merged)
     merged = ranker.enforce_display_article_consistency(merged)
+    merged = ranker.enforce_display_source_grounding(merged)
     kept, generic_excluded = ranker.exclude_generic_singletons(merged)
     kept, display_excluded = ranker.exclude_insufficient_display_articles(kept)
     kept, no_rep_excluded = ranker.exclude_no_representative(kept)

@@ -424,6 +424,84 @@ def _institution_alias_forms(keyword: str) -> set:
     return forms
 
 
+# 문맥 alias 최소 증거(같은 확장형이 최소 몇 개 표시 기사에서 반복돼야 하는지).
+_CONTEXTUAL_ALIAS_MIN_ARTICLES = 2
+
+
+def _contextual_alias_forms(canonical_tokens, articles) -> dict:
+    """기사 묶음 안에서만 검증되는 문맥 기반 약칭↔정식명칭 alias 매핑을 산출한다
+    (ChatGPT P1 사전검토, 2026-07-21). 특정 기업명 하드코딩·무제한 접두 허용 없이,
+    "이 기사 묶음에서 확장형이 하나로 우세하게 수렴할 때만" alias로 인정한다.
+
+    반환: {canonical_token: {expansion, ...}} — grounding/comparison 경로에 alias_forms로
+    주입되어 canonical '삼성'이 기사 '삼성전자'로 grounded 되게 한다. 수렴하지 않으면 그
+    토큰은 매핑에 넣지 않아 기존 fail-closed 계약이 그대로 유지된다.
+
+    계약(요약):
+    - exact·조사결합·정상 붙여쓰기 복합은 _word_contains_token이 이미 처리하므로 여기선
+      **확장형(정식명칭)** 만 대상으로 한다: 기사 어절 E가 canonical token T로 시작하되
+      len(E)-len(T) >= 2 인 진짜 확장(조사 1글자 결합이 아님).
+    - 동일 확장형 E가 표시 기사 최소 _CONTEXTUAL_ALIAS_MIN_ARTICLES 건에서 반복될 것.
+    - E가 등장한 기사들에서 canonical의 **나머지 의미 토큰**(다른 canonical_tokens)도 함께
+      근거를 가질 것(사건 토큰이 서로 다른 기사에 분산되면 alias 불인정).
+    - 같은 접두 T를 갖는 **경쟁 확장형이 둘 이상 혼재**하면(삼성전자/삼성물산/삼성중공업)
+      단일 alias로 확정하지 않는다(충돌 → fail-closed 유지).
+    - 확장형이 정확히 하나로 수렴할 때만 {T: {E}} 인정.
+    """
+    from news.summarizer import _tokens
+
+    canon = {t for t in (canonical_tokens or set()) if t and len(t) >= 2}
+    if not canon or not articles:
+        return {}
+
+    # 기사별 어절 집합(제목+스니펫)을 미리 계산.
+    art_tokens = []
+    for a in articles:
+        text = f"{a.get('title', '')} {a.get('snippet', '')}"
+        art_tokens.append(set(_tokens(text)))
+
+    alias_map: dict = {}
+    for t in canon:
+        others = canon - {t}
+        # T로 시작하는 진짜 확장형 후보 수집. '삼성전자'/'삼성전자가'처럼 조사만 다른 표면형은
+        # base(1글자 조사·어미 제거)로 묶어 하나의 확장형으로 본다(조사 변이를 '경쟁 확장형'으로
+        # 오판해 alias를 잃지 않도록). 기사 인덱스와 표면형(surface)을 base별로 누적한다.
+        by_base: Dict[str, Dict[str, set]] = {}  # base -> {"arts": set(idx), "forms": set(surface)}
+        for idx, toks in enumerate(art_tokens):
+            for w in toks:
+                if w != t and w.startswith(t) and len(w) - len(t) >= 2:
+                    base = w[:-1] if (len(w) >= 3 and w[-1] in _ONE_CHAR_JOSA_EOMI) else w
+                    entry = by_base.setdefault(base, {"arts": set(), "forms": set()})
+                    entry["arts"].add(idx)
+                    entry["forms"].add(w)
+        # 최소 증거(>=N개 기사)를 만족하는 확장형 base만.
+        qualified = {b: e for b, e in by_base.items() if len(e["arts"]) >= _CONTEXTUAL_ALIAS_MIN_ARTICLES}
+        if len(qualified) != 1:
+            # 0개(증거 부족) 또는 2개 이상(경쟁 확장형 base 혼재) → 단일 alias 확정 금지.
+            continue
+        base, entry = next(iter(qualified.items()))
+        arts_with_e = entry["arts"]
+        # 나머지 canonical 의미 토큰도 확장형 등장 기사에서 함께 근거를 가질 것.
+        # 이때 각 토큰 o 검증에도 _word_contains_token의 sibling exact-composition 계약을
+        # 그대로 쓴다(Codex P1, 2026-07-22): o의 siblings로 canonical의 다른 토큰들(canon-{o})을
+        # 넘겨, 기사에서 붙여쓰기된 복합('갤럭시카드')을 '갤럭시'/'카드'의 정당 근거로 인정한다.
+        # sibling 없이 호출하면 '삼성 갤럭시 카드'가 '삼성전자 갤럭시카드' 기사에서 alias를 못
+        # 얻어 과잉 drop된다. 단순 substring·무제한 접두는 여전히 인정하지 않는다.
+        if others:
+            supported = any(
+                all(
+                    any(_word_contains_token(w, o, canon - {o}) for w in art_tokens[i])
+                    for o in others
+                )
+                for i in arts_with_e
+            )
+            if not supported:
+                continue
+        # base와 관측된 표면형(조사 결합 포함)을 모두 alias로 등록.
+        alias_map[t] = {base} | entry["forms"]
+    return alias_map
+
+
 def _is_similar_keyword(a: str, b: str) -> bool:
     """유사 키워드 판정(개선1). 완전 일치/정규화 일치/기관명 축약/substring/token 유사 순으로 확인."""
     a, b = (a or "").strip(), (b or "").strip()
@@ -933,6 +1011,54 @@ def _is_generic_only_display(keyword: str) -> bool:
     return toks <= _all_display_generic()
 
 
+# display 조합 근거로 인정할 최대 span(한 필드 안에서 검증 토큰 전부를 커버하는 토큰 윈도우).
+# 압수수색 ~ 김영환처럼 한 title 안에 근접(수식어·조사 몇 개 사이)한 정상 맥락은 통과시키고,
+# "금리 전망 ... (긴 서술) ... 인하"처럼 멀리 흩어진 토큰의 억지 결합은 배제하는 경계값.
+_COMBO_SPAN_MAX_TOKENS = 6
+
+
+def _combo_span_grounded(check_tokens: set, group_articles: List[Dict]) -> bool:
+    """display 조합 후보(check_tokens)가 어느 한 기사의 **한 필드**(title 또는 snippet) 안에서
+    **제한 거리(span) 이내**에 함께 등장하는지(ChatGPT P1 사전검토 2차, 2026-07-21).
+
+    _display_grounded_by_single_unit(단순 단일-기사 공존)과 달리, "같은 기사에 있지만 멀리
+    흩어진 토큰"만으로는 조합을 인정하지 않는다. 계약:
+    - title과 snippet을 **합치지 않고 각 필드 별도**로 검사한다(단순 연결로 연속 phrase처럼
+      취급 금지). 어느 한 필드가 span 조건을 만족하면 인정.
+    - 한 필드 토큰 시퀀스에서 각 check token을 커버하는 위치들의 최소 span(max_index -
+      min_index)이 _COMBO_SPAN_MAX_TOKENS 이내여야 한다.
+    - 토큰 매칭은 _word_contains_token(조사결합/alias/sibling 복합) 계약을 재사용한다.
+
+    이로써 "공수처 ... 김영환 지사 사무실 압수수색"(한 title 근접)은 통과하고, "금리 전망
+    발표 이후 ... 인하 가능성"(멀리 흩어짐)이나 서로 다른 기사 분산은 배제된다.
+    """
+    import itertools
+    from news.summarizer import _tokens
+
+    for a in group_articles or []:
+        for field in (a.get("title", ""), a.get("snippet", "")):
+            toks = _tokens(field or "")
+            if not toks:
+                continue
+            positions = {}
+            ok = True
+            for ct in check_tokens:
+                pos = [i for i, t in enumerate(toks) if _word_contains_token(t, ct, check_tokens)]
+                if not pos:
+                    ok = False
+                    break
+                positions[ct] = pos
+            if not ok:
+                continue
+            # 모든 토큰을 커버하는 최소 span이 상한 이내인지.
+            best_span = min(
+                max(combo) - min(combo) for combo in itertools.product(*positions.values())
+            )
+            if best_span <= _COMBO_SPAN_MAX_TOKENS:
+                return True
+    return False
+
+
 def _build_display_keyword(members: List[Dict]) -> str:
     """same-issue merge된 후보들에서 display_keyword 생성.
 
@@ -1025,9 +1151,38 @@ def _build_display_keyword(members: List[Dict]) -> str:
     if second is None:
         return _display_or_canonical(best, canonical)
 
-    candidate = f"{best} {second}"
+    # ── 중복 제거 재설계 v2(ChatGPT P1 사전검토, 2026-07-21): entity/일반명사 구분(person
+    #    판정)을 없애고, "best와 겹치는 second 토큰 제거 + 최종 조합의 단일-기사 공존 근거 검증"
+    #    단일 규칙으로 통일한다.
+    #
+    #    이전 v1은 _entity_anchor_tokens(사람명/영문 판정)로 entity 되풀이만 떼어내고 나머지는
+    #    원문 근거로 검증하려 했으나, _looks_like_person_name이 "2~4자 한글"을 거의 다 인물명으로
+    #    판정해 '금리'/'카드'/'유출' 같은 일반명사도 entity anchor로 잡혔다. 그러면 "금리 전망"+
+    #    "금리 인하"에서 '금리'가 제거된 뒤 남은 '인하'가 "순수 보완"으로 처리돼 원문 근거 검증을
+    #    건너뛰고 "금리 전망 인하"(원문에 없는 배열)가 생성될 수 있었다(설계 구멍). person 판정을
+    #    제거하면 이 구멍이 사라지고, 특정 회사명/제품명 하드코딩도 불필요하다.
+    #
+    #  규칙: second에서 best와 토큰이 겹치는 부분(되풀이)을 제거해 residual만 남긴다.
+    #    - residual이 없으면(second가 best 토큰의 되풀이뿐) 새 정보 없음 → best 단독.
+    #    - residual이 있으면 "best + residual"의 전체 검증 토큰이 **어느 한 기사의 한 필드
+    #      안에서 제한 거리(span) 이내에 함께 등장**할 때만 채택한다(_combo_span_grounded,
+    #      ChatGPT P1 사전검토 2차). 근거가 없으면 best 단독.
+    #      "같은 기사 공존"만으로는 부족하다(단순 공존이면 "금리 전망 발표 ... 인하 가능성"처럼
+    #      멀리 흩어진 토큰도 억지 결합됨). 대신 근접 span을 요구해:
+    #        · "공수처, 김영환 지사 사무실 압수수색"(한 title 근접) → 통과(어순 무관)
+    #        · "금리 전망" + "인하"(다른 기사 분리 또는 멀리 흩어짐) → 차단
+    #      title/snippet은 합치지 않고 각 필드 별도로 검사한다(단순 연결로 연속 phrase처럼
+    #      취급 금지). 원문에 없는 새 토큰 순서·의미 배열은 생성하지 않는다.
+    best_word_set = set(_tokens(best))
+    residual = [t for t in _tokens(second) if t not in best_word_set]
+    if not residual:
+        return _display_or_canonical(best, canonical)
+
+    candidate = f"{best} {' '.join(residual)}"
     if len(candidate) <= DISPLAY_KEYWORD_MAX_LEN:
-        return _display_or_canonical(candidate, canonical)
+        cand_check = _invariant_check_tokens(candidate)
+        if cand_check and _combo_span_grounded(cand_check, group_articles):
+            return _display_or_canonical(candidate, canonical)
     return _display_or_canonical(best, canonical)
 
 
@@ -1794,6 +1949,18 @@ def _invariant_check_tokens(text: str) -> set:
     return {t for t in _tokens(text) if len(t) >= 2 and t not in _INVARIANT_SKIP_TOKENS}
 
 
+def _displayed_articles(articles: List[Dict]) -> List[Dict]:
+    """실제 화면에 노출되는 기사 집합을 builder와 동일하게 산출한다(dedup → filter → [:MAX]).
+    _displayed_article_units와 문맥 alias(_contextual_alias_forms)가 **동일 노출 집합**을
+    보도록 단일 진실원으로 분리한다.
+    """
+    from news.dedup import dedup_articles
+    from news.candidates import filter_articles_for_display
+    from news.builder import ARTICLES_MIN, ARTICLES_MAX
+
+    return filter_articles_for_display(dedup_articles(articles or []), min_count=ARTICLES_MIN)[:ARTICLES_MAX]
+
+
 def _displayed_article_units(articles: List[Dict]) -> List[tuple]:
     """실제 화면에 노출되는 기사 집합을 builder와 동일하게 산출해, 기사별 (토큰집합, 원문)
     리스트로 반환한다. builder.build_ranked_entry가 dedup_articles → filter_articles_for_display
@@ -1804,12 +1971,9 @@ def _displayed_article_units(articles: List[Dict]) -> List[tuple]:
     있어도 통과하던 split-token 오탐(Codex diff 리뷰 P1: "배우B 사망"이 배우B 기사 + 원로배우
     사망 기사로 각각 존재해도 통과)을 막기 위함이다.
     """
-    from news.dedup import dedup_articles
-    from news.candidates import filter_articles_for_display
-    from news.builder import ARTICLES_MIN, ARTICLES_MAX
     from news.summarizer import _tokens
 
-    displayed = filter_articles_for_display(dedup_articles(articles or []), min_count=ARTICLES_MIN)[:ARTICLES_MAX]
+    displayed = _displayed_articles(articles)
     units = []
     for a in displayed:
         text = f"{a.get('title', '')} {a.get('snippet', '')}"
@@ -1852,6 +2016,297 @@ def enforce_display_article_consistency(items: List[Dict]) -> List[Dict]:
                 continue  # canonical조차 표시 기사와 불일치 → reject
             item = dict(item)
             item["display_keyword"] = canonical
+        result.append(item)
+    return result
+
+
+# 직함/수량 등 그 자체로는 사건 의미가 없는 부속 토큰(제거돼도 비문 아님). anchor 판정과
+# 별개로, grounding에서 "무근거여도 축약 대상이 아닌"(원래 문구 유지) 토큰이 아니라, 반대로
+# "무근거면 떼어내도 되는" 부속 토큰이다. 인물 직함·서수 등.
+_GROUNDING_DROPPABLE_TOKENS = {
+    "9단", "단", "씨", "장관", "대표", "회장", "사장", "감독", "선수", "의원", "총리",
+    "대통령", "지사", "시장", "군수", "구청장", "위원장", "청장",
+}
+
+
+def _word_contains_token(word: str, token: str, siblings=None, alias_forms=None) -> bool:
+    """원문 어절(word)이 token을 형태소 경계로 포함하는지 — 복합명사 오탐 방지 + 명시적
+    표기 변형만 인정(사용자 P1 사전검토 2차, 2026-07-21).
+
+    무제한 접두 포함(word.startswith(token))은 **인정하지 않는다**. 이전 구현은 접두면
+    무조건 약칭으로 인정했으나, 그러면 '삼성'←'삼성물산', '카드'←'카드뉴스', '애플'←
+    '애플리케이션'처럼 전혀 다른 개념까지 근거로 오인한다(ChatGPT P1 2차). "별도 근거 없는
+    단순 접두 포함은 동일 개념으로 인정하지 않는다"는 계약을 따른다.
+
+    인정 조건(모두 명시적 근거):
+    1. exact 일치(word == token).
+    2. 조사/어미 결합: token으로 시작하거나 끝나되 남는 부분이 1글자 이하('따릉이는'←'따릉이',
+       '미국은'←'미국', '카드가'←'카드'). 한국어 조사/어미는 대개 1글자라 이 근사가 안전하다.
+    3. alias 근거: word가 token의 명시적 alias form(alias_forms, 예: 교육기관 축약
+       '배재고등학교'↔'배재고')과 일치할 때. 하드코딩 기업 약칭이 아니라 기존
+       normalization이 제공하는 근거만 쓴다.
+    4. 붙여쓰기 복합(exact composition, ChatGPT P1 2차 축소 2026-07-21): 허용된 1글자
+       조사·어미만 제거한 정규화 word가 token과 canonical sibling(들)의 **정확한 연결**로
+       완전히 설명될 때만 인정한다. 부분 prefix 일치(rest.startswith(s) 등)는 인정하지
+       않는다.
+         · 2-part exact: normalized_word == token+sibling('갤럭시카드'에서 token='갤럭시',
+           sibling='카드') 또는 sibling+token('갤럭시카드'에서 token='카드', sibling='갤럭시').
+         · 다토큰 복합: normalized_word가 {token} ∪ (일부 sibling)들의 연결로 **전체가 남김없이**
+           설명될 때만. 일부만 맞물리고 잔여 문자가 남으면('갤럭시카드뉴스'의 '뉴스', '삼성카'의
+           '카') 불인정.
+       외래 복합('개인정보유출'의 '유출'은 앞의 '개인정보'가 sibling이 아님)·'삼성물산'의
+       '삼성'(뒤 '물산'이 sibling 아님)·'카드뉴스'의 '카드'(뒤 '뉴스'가 sibling 아님)·
+       '갤럭시카드뉴스'(뉴스 잔여)는 전부 배제된다.
+
+    특정 회사명/제품명 하드코딩 없이 구조(조사 길이·sibling exact 연결·명시 alias)로만 판정한다.
+    """
+    if word == token:
+        return True
+    # 2. 조사/어미 결합: 남는 1글자가 실제 한국어 조사·어미일 때만('카드가'·'미국은'). 임의
+    #    명사 조각('삼성카'의 '카')은 접두 1글자라도 인정하지 않는다(ChatGPT P1 2차: '삼성카'
+    #    불인정). 접미('한국의' 같은 조사가 앞에 붙는 경우는 드물지만 대칭 유지).
+    if word.startswith(token) and len(word) - len(token) == 1 and word[-1] in _ONE_CHAR_JOSA_EOMI:
+        return True
+    if word.startswith(token) and len(word) == len(token):
+        return True
+    if word.endswith(token) and len(word) - len(token) == 1 and word[0] in _ONE_CHAR_JOSA_EOMI:
+        return True
+    # 3. 명시적 alias form 근거(_institution_alias_forms / 문맥 alias)
+    if alias_forms and word in alias_forms:
+        return True
+    # 4. 붙여쓰기 복합: 허용된 1글자 조사·어미만 제거한 뒤 token+sibling(들)의 exact 연결로만.
+    sibs = tuple(s for s in (siblings or ()) if s and s != token)
+    if sibs:
+        # 허용 조사·어미(1글자)만 뒤에서 제거해 정규화. 정규화형이 token+sibling 조합으로
+        # 완전히 성립하는지 확인한다(부분 prefix 매칭 금지).
+        for norm in _normalized_word_forms(word):
+            if _exact_composition(norm, token, sibs):
+                return True
+    return False
+
+
+# 붙여쓰기 복합 판정 전에 제거를 허용하는 1글자 조사·어미(예: '갤럭시카드는'→'갤럭시카드').
+# _word_contains_token 4번 규칙에서만 쓰인다. 무제한 접미 1글자 제거는 '삼성카드뉴'→'삼성카드'
+# 같은 오인정을 낳으므로, 실제 한국어 1글자 조사·어미에 한정한다(임의 명사 조각 '뉴'는 불허).
+_ONE_CHAR_JOSA_EOMI = frozenset("은는이가을를의에도만과와나로랑")
+
+
+def _normalized_word_forms(word: str):
+    forms = [word]
+    if len(word) >= 3 and word[-1] in _ONE_CHAR_JOSA_EOMI:
+        forms.append(word[:-1])  # 마지막 1글자가 조사·어미일 때만 제거형 추가
+    return forms
+
+
+def _exact_composition(norm: str, token: str, sibs) -> bool:
+    """norm이 token과 sibs(일부)의 **정확한 연결**로 전체가 남김없이 설명되는지.
+
+    - token은 반드시 포함되어야 하고, 나머지 조각은 전부 sibs에 속해야 하며, 이어붙인
+      결과가 norm과 정확히 일치해야 한다(잔여 문자 불허).
+    - 2-part(token+one sibling / one sibling+token)를 우선 검사하고, 그 다음 token을
+      포함한 sibs 순열 연결로 완전 일치를 탐색한다(다토큰 복합 지원).
+    """
+    if not norm or token not in norm:
+        return False
+    # 빠른 2-part 경로
+    for s in sibs:
+        if norm == token + s or norm == s + token:
+            return True
+    # 일반 경로: norm을 앞에서부터 token 또는 sib 조각으로 완전 분해(token 최소 1회 사용).
+    pieces = {token} | set(sibs)
+
+    def _decompose(rest: str, used_token: bool) -> bool:
+        if not rest:
+            return used_token
+        for p in pieces:
+            if p and rest.startswith(p):
+                if _decompose(rest[len(p):], used_token or p == token):
+                    return True
+        return False
+
+    return _decompose(norm, False)
+
+
+def _token_grounded_in_unit(token: str, art_toks: set, art_text: str, siblings=None, alias_map=None) -> bool:
+    """token이 단일 기사(art_toks/art_text)에 어절 경계로 근거를 갖는지.
+
+    exact 토큰 매칭 우선. 없으면 원문을 공백 단위 어절로 쪼개 _word_contains_token으로
+    비교한다(전체 문자열 substring이 아니라 "어절 단위" 비교 — "정보"가 "개인정보 유출"
+    문자열 아무 데나 부분매칭되는 것을 막고, 실제 그 어절이 존재하는지만 본다).
+
+    siblings: 같은 canonical/display의 다른 검증 토큰 집합. token이 어절 접미/접두로 등장할
+    때 남는 부분이 sibling과 맞물리면(붙여쓰기 복합) 인정하기 위해 _word_contains_token에
+    전달한다(예: '삼성 갤럭시 카드'의 '카드'가 기사 '갤럭시카드'에). None이면 조사결합만.
+
+    alias_map: {canonical_token: {expansion, ...}} — 기사 묶음에서 수렴 검증된 문맥 alias
+    (_contextual_alias_forms). token에 해당하는 확장형을 _institution_alias_forms(교육기관
+    축약)와 합쳐 alias_forms로 넘긴다. 무제한 접두 인정 없이, 이 묶음에서만 검증된 약칭↔정식
+    명칭 근거를 인정한다(예: canonical '삼성'이 기사 '삼성전자'에).
+    """
+    if token in art_toks:
+        return True
+    alias_forms = set(_institution_alias_forms(token))
+    if alias_map and token in alias_map:
+        alias_forms |= alias_map[token]
+    # alias form의 exact 매칭은 이미 정규 토큰화된 art_toks에도 적용한다(Codex P1, 2026-07-22).
+    # art_text.split()(공백 어절)만 보면 '삼성전자·실적'처럼 구두점으로 붙은 원문에서 alias
+    # 확장형('삼성전자')이 한 어절에 묻혀 매칭 실패한다. _tokens는 '삼성전자'/'실적'을 정규
+    # 분리하므로, alias exact 일치는 art_toks 교집합으로 우선 확인한다(부분 substring 아님).
+    if alias_forms & art_toks:
+        return True
+    # 조사·붙여쓰기 복합 판정이 필요한 경우에만 원문 어절을 보조적으로 검사한다.
+    for word in art_text.split():
+        w = word.strip("'\"·,.")
+        if _word_contains_token(w, token, siblings, alias_forms):
+            return True
+    return False
+
+
+def _display_grounded_by_single_unit(check_tokens: set, units: List[tuple], alias_map=None) -> bool:
+    """검증 토큰 전부를 표시 기사 중 '한 기사'가 근접 문맥으로 커버하는지.
+
+    _supported_by_single_article과 동일한 단일-기사 커버리지 원칙(근접구문/phrase
+    provenance)을 grounding에도 적용한다 — 서로 다른 기사에 흩어진 토큰들이 각자
+    다른 기사에서 grounded 판정을 받아 조합 전체가 통과하는 분산 매칭을 막기 위함
+    (사용자 지적: A기사의 '정보' + B기사의 '유출'이 합쳐져 통과하면 안 됨. 두 토큰이
+    실제로 같은 기사·같은 문맥에 함께 등장해야 그 조합이 근거를 갖는다).
+
+    각 토큰 판정에 나머지 검증 토큰을 siblings로 넘겨, canonical 자신의 인접 토큰이
+    기사에서 붙여쓰기된 복합(갤럭시 카드→갤럭시카드)을 정당 근거로 인정한다(과잉 drop 방지).
+
+    alias_map: 기사 묶음에서 수렴 검증된 문맥 alias(_contextual_alias_forms). 약칭 canonical
+    토큰이 정식명칭 확장형으로 grounded 되도록 _token_grounded_in_unit에 전달한다.
+    """
+    for art_toks, art_text in units:
+        if all(
+            _token_grounded_in_unit(t, art_toks, art_text, siblings=check_tokens, alias_map=alias_map)
+            for t in check_tokens
+        ):
+            return True
+    return False
+
+
+def enforce_display_source_grounding(items: List[Dict]) -> List[Dict]:
+    """display_keyword의 주요 비-generic 의미 토큰이 표시 기사에서 근거를 갖는지 확인하고,
+    무근거 토큰은 안전하게 축약한다. 축약 후 의미가 성립하지 않으면 그 item을 drop한다.
+
+    배경(따릉이 '정보 명예', 2026-07-21): 깨진 원천 seed가 canonical/display로 유입되면
+    '명예'처럼 어느 표시 기사에도 없는(원문 무근거) 조각이 최종 표기에 남는다. 특정 문자열
+    하드코딩 없이 "표시 기사에 근거가 있는가"라는 구조로만 판정한다.
+
+    판정 단위(사용자 P1 보완, 2026-07-21): 토큰별 독립 판정이 아니라 "표시 기사 한 건이
+    검증 토큰 전부를 근접 문맥으로 커버하는가"를 1차 기준으로 삼는다
+    (_display_grounded_by_single_unit — enforce_display_article_consistency의
+    _supported_by_single_article과 동일 원칙). 어절 경계 비교(_word_contains_token)로
+    "정보"가 "개인정보"의 일부라는 이유만으로 독립 근거 취급되는 것을 막는다.
+
+    canonical 오염 방지(사용자 P1 보완, 2026-07-21): 이 함수는 원래 display_keyword만
+    교정하고 canonical(keyword)은 손대지 않았다. 하지만 canonical은 summary 생성
+    (builder.build_ranked_entry의 summarize(keyword, ...)), diagnostics 기록
+    (diagnostics.py의 row["keyword"]), movement 비교(다음 실행의 canonical 매칭)에
+    display_keyword와 무관하게 그대로 재사용된다 — display만 고쳐도 이 세 경로는 여전히
+    깨진 canonical을 본다. 그래서 **canonical 자체도 grounding 검증 대상에 포함**한다:
+    canonical의 검증 토큰이 표시 기사 어디에도 근거가 없으면(display를 canonical로
+    강등해도 구제되지 않는 경우), item 전체를 fail-closed로 drop한다 — display만 축약해
+    화면만 가리는 것으로는 진단/요약/다음 실행까지 이어지는 오염을 막을 수 없기 때문이다.
+
+    처리:
+    0. canonical의 검증 토큰이 표시 기사 어디에서도 근거가 없으면(단일 기사 기준으로도,
+       토큰 단위로도) → item 전체 drop(canonical 자체가 오염 — display 교정으로 구제 불가).
+    1. display 토큰 중 검증 대상(_invariant_check_tokens: len>=2, 약한 수식어 제외)을 뽑는다.
+    2. 전체 토큰 집합을 한 기사가 통째로 커버하면 그대로 통과(정상 — 대다수 케이스).
+    3. 통째로 커버하는 기사가 없으면, 토큰별로 "그 토큰 하나만 넣었을 때 단일 기사가
+       커버하는가"를 봐서 무근거 토큰만 골라 제거한다(부분 축약도 같은 단일-기사 원칙 유지).
+    4. 무근거 토큰 제거 후 남은 "근거 있는 의미 토큰"(비-generic·비-droppable)이 하나도
+       없으면 → drop(fail-closed). 남으면 → 그 축약본으로 display 교체(어순 유지).
+    5. 표시 기사가 없으면(근거 판정 불가) 개입하지 않는다(fail-open, 기존 보수 정책과 동일).
+
+    enforce_display_article_consistency 직후, exclude_generic_singletons 이전에 적용한다.
+    """
+    from news.summarizer import _tokens
+
+    result: List[Dict] = []
+    for item in items:
+        news_meta = item.get("news_meta") or {}
+        units = _displayed_article_units(news_meta.get("articles") or [])
+        if not units:
+            result.append(item)  # 근거 판정 불가 → fail-open
+            continue
+        canonical = item.get("keyword", "")
+        display_for_alias = item.get("display_keyword") or canonical
+        # 문맥 alias(약칭↔정식명칭) — 표시 기사 묶음에서만 수렴 검증한다(_contextual_alias_forms).
+        # canonical/display 검증 토큰 전체를 후보로 넘겨, 약칭 canonical '삼성'이 기사 '삼성전자'로
+        # grounded 되게 한다(정상 이슈 과잉 drop 방지). 확장형이 충돌·부족하면 매핑에 안 들어가
+        # 기존 fail-closed 계약이 유지된다.
+        alias_tokens = _invariant_check_tokens(canonical) | _invariant_check_tokens(display_for_alias)
+        alias_map = _contextual_alias_forms(alias_tokens, _displayed_articles(news_meta.get("articles") or []))
+        # 0. canonical 자체 grounding — display 교정 이전에 canonical 오염을 원천 차단.
+        #
+        # 계약(ChatGPT P1, 2026-07-21): canonical의 invariant 토큰 조합 "전체"가 **동일
+        # 기사(단일 unit) 안에서 함께** 근거를 가져야 한다. 즉 canonical 검증은 오직
+        # _display_grounded_by_single_unit(단일 기사가 토큰 전부를 근접 문맥으로 커버)만으로
+        # 판정하고, 이것이 false면 무조건 fail-closed drop한다.
+        #
+        # 토큰별 전체 기사 재검색(각 토큰이 "서로 다른 기사 어딘가에" 있으면 근거로 인정)은
+        # canonical 존속 근거로 **절대 쓰지 않는다** — 그렇게 하면 기사 A의 '따릉이 정보' +
+        # 기사 B의 '명예'처럼 어느 한 기사도 canonical 전체를 뒷받침하지 못하는데도 canonical이
+        # 통과하는 분산 매칭 구멍이 생긴다(ChatGPT 재검토 P1). alias·띄어쓰기·조사 차이는
+        # _token_grounded_in_unit이 "동일 기사 안에서" 정규화해 인정하므로(false-reject 방지)
+        # 별도 토큰별 재검색 없이도 정상 표기 변형은 구제된다.
+        canonical_check = _invariant_check_tokens(canonical)
+        if canonical_check and not _display_grounded_by_single_unit(canonical_check, units, alias_map):
+            logger.warning(
+                "[news] drop %s: canonical_source_grounding(canonical 토큰 조합 '%s'를 "
+                "동일 기사가 함께 뒷받침하지 못함 — 분산/무근거, display 교정으로 구제 불가)",
+                canonical, " ".join(sorted(canonical_check)),
+            )
+            continue  # fail-closed drop — 단일 기사 결합 근거 없으면 무조건 drop
+        display = item.get("display_keyword") or canonical
+        disp_tokens = _tokens(display)
+        check_tokens = _invariant_check_tokens(display)
+        if not check_tokens or _display_grounded_by_single_unit(check_tokens, units, alias_map):
+            result.append(item)
+            continue
+        # 통짜로 커버하는 기사가 없다 → 토큰별로 단일 기사 근거 여부를 재확인해 무근거만 축약.
+        ungrounded = {
+            t for t in check_tokens
+            if not any(_token_grounded_in_unit(t, art_toks, art_text, alias_map=alias_map) for art_toks, art_text in units)
+        }
+        if not ungrounded:
+            # 개별 토큰은 각자 근거가 있지만 한 기사에 다 같이 등장하지 않는 조합(분산 매칭
+            # 의심). 원 display 신뢰 대신 canonical로 강등(article_consistency와 동일 정책).
+            if _is_generic_only_display(canonical):
+                continue
+            canon_check = _invariant_check_tokens(canonical)
+            if canon_check and not _display_grounded_by_single_unit(canon_check, units, alias_map):
+                continue
+            item = dict(item)
+            item["display_keyword"] = canonical
+            result.append(item)
+            continue
+        # 무근거 토큰 제거(어순 유지). generic/약한 수식어는 유지(축약 후 자연스러움).
+        kept_seq = [t for t in disp_tokens if t not in ungrounded]
+        # 축약 후 "근거 있는 의미 토큰"(비-generic·비-droppable)이 남는지 판정.
+        generic = _all_display_generic()
+        meaningful = [
+            t for t in kept_seq
+            if len(t) >= 2 and t not in generic and t not in _GROUNDING_DROPPABLE_TOKENS
+            and t not in _INVARIANT_SKIP_TOKENS
+            and any(_token_grounded_in_unit(t, art_toks, art_text, alias_map=alias_map) for art_toks, art_text in units)
+        ]
+        if not meaningful:
+            logger.warning(
+                "[news] drop %s: display_source_grounding(무근거 조각 '%s' 제거 후 의미 소실, display=%r)",
+                canonical, ",".join(sorted(ungrounded)), display,
+            )
+            continue  # fail-closed drop
+        new_display = " ".join(kept_seq).strip()
+        item = dict(item)
+        item["display_keyword"] = new_display[:DISPLAY_KEYWORD_MAX_LEN]
+        logger.info(
+            "[news] display_source_grounding 축약: %r → %r (무근거 '%s')",
+            display, item["display_keyword"], ",".join(sorted(ungrounded)),
+        )
         result.append(item)
     return result
 
