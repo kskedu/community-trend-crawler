@@ -506,6 +506,8 @@ def _rank_and_select(candidates, signals, pass_name, diag=None):
     merged = ranker.resolve_singleton_displays(merged)
     # display_keyword/articles 정합성 invariant — merge 후, generic guard 전(문제 A).
     merged = ranker.enforce_display_article_consistency(merged)
+    # display source grounding — 무근거 조각(따릉이 '명예'류) 축약/drop. consistency 직후.
+    merged = ranker.enforce_display_source_grounding(merged)
     kept, generic_excluded = ranker.exclude_generic_singletons(merged)
     if generic_excluded:
         logger.warning("[news] %s: generic singleton 제외 %s", pass_name, generic_excluded)

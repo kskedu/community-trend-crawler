@@ -658,6 +658,150 @@ _RHETORIC_SUFFIX_MARKERS = (
 # 나열/비유 접속 문맥(keyword가 다른 개체와 병렬 나열되는 정치 수사).
 _RHETORIC_LIST_MARKERS = ("위장", "반명", "친명", "적통", "계파", "계승")
 
+# === comparison target 방어(A, 2026-07-21) — 비교/맞불 대상의 주체 오승격 방지 ===
+# 배경: "삼성전자, 첫 신용카드 출시…애플카드에 맞불" 묶음에서 비교 대상 '애플 카드'가
+# 기사에 자주 등장해 canonical(대표)로 승격됐다(Apple이 카드를 낸 이슈로 오인). keyword가
+# 비교 마커의 "대상 위치(앞)"에 오고, 같은 title에 keyword가 아닌 "별도의 실제 주체"가
+# 확인될 때만 non_subject(NONSUBJECT_COMPARISON)로 강등한다. 강한 조건이므로 event/entity/
+# unknown(다토큰 '애플 카드' 포함) 어디에나 적용해도 정상 주체를 깎지 않는다.
+#
+# 원칙(사용자 확정):
+# - 강한 대상 마커(대상 위치가 명확)만 comparison 근거로 쓴다: keyword 뒤 근접에 아래.
+# - "대결/대응/대체/라이벌/경쟁"은 단독 강등 근거로 쓰지 않는다(양측 공동 주체 가능) —
+#   이 목록에 넣지 않는다.
+# - 별도 주체가 확인되지 않으면 강등하지 않고 기존 판정(unknown 등)으로 흐른다(fail-open).
+_COMPARISON_TARGET_MARKERS = (
+    "맞불", "맞서", "맞선", "겨냥", "대항", "도전장",
+)
+# comparison-dominant(전체 강등) 최소 표본/비율(사용자 P1 보완, 2026-07-21): 기사 1건의
+# comparison 언급만으로 keyword 전체를 비주체로 확정하면 단일 기사 오탐/서술 습관에 의해
+# 정상 후보가 통째로 탈락할 위험이 크다. title에 keyword가 등장하는 기사 최소 2건 이상,
+# 그중 과반 이상이 comparison이어야만 "이 keyword는 이 묶음에서 일관되게 비교 대상"으로
+# 인정한다(애플카드 사례: title 노출 기사 다수 중 대부분이 "맞불/맞선다" 표현 — 통과.
+# 기사 1건만 comparison 표현을 쓰고 나머지는 무관하거나 subject인 경우는 강등 안 함).
+COMPARISON_DOMINANT_MIN_ARTICLES = 2
+COMPARISON_DOMINANT_MIN_RATIO = 0.5
+
+
+def _dedup_by_url_identity(articles: List[dict]) -> List[dict]:
+    """comparison-dominant 증거 모수용 URL identity dedup(Codex P2, 2026-07-22).
+
+    news.dedup.dedup_articles와 동일한 winner 계약(동일 url은 처음 1건만, 입력순서 유지)을
+    쓰되, 한 가지만 다르다: dedup_articles는 url 없는 기사를 제거하지만, comparison 모수에선
+    url 없는 기사도 각각 독립 evidence로 세야 하므로(fallback = 객체 identity) 제거하지 않고
+    그대로 남긴다. 서로 다른 url은 절대 합치지 않고, 제목이 같아도 url이 다르면 2건으로 센다.
+
+    이 dedup은 오직 comparison-dominant 최소표본/비율 계산에만 쓰고, 반환 기사 목록이나
+    다른 ranking 계약은 바꾸지 않는다.
+    """
+    seen_urls = set()
+    result: List[dict] = []
+    for a in articles:
+        url = a.get("url")
+        if url:
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+        # url 없는 기사는 dedup하지 않고 각각 독립으로 보존(뭉치지 않음).
+        result.append(a)
+    return result
+# 위 마커는 "keyword ~ 마커" 근접 구간에서만 본다(_comparison_target_role). "대응"은
+# "정부 대응/사고 대응"처럼 사건 서술로도 흔해 단독 마커에서 제외한다. "대결/대체/라이벌/
+# 경쟁"도 공동 주체 가능성이 있어 제외(사용자 확정). keyword와 마커 사이에는 keyword의
+# 잔여 토큰(예: '애플 카드'의 '카드')과 조사 정도만 허용한다.
+
+
+def _has_separate_subject(keyword: str, title: str) -> bool:
+    """title에 keyword가 아닌 "별도의 실제 주체"가 있는지(comparison 강등 전제).
+
+    보수적 판정(강한 신호만): title 선두에 keyword와 겹치지 않는 주체가
+    (a) 콤마로 끊기거나("삼성전자, ...") (b) 주격/속격 josa가 바로 붙는("네이버가 ...")
+    형태로 등장하면 True. 그 선두 주체는 keyword보다 앞(왼쪽)에 있어야 한다(비교 대상은
+    보통 뒤에 온다). keyword 토큰과 문자적으로 겹치는 선두("삼성 갤럭시 카드")는 자기
+    자신이므로 별도 주체가 아니다. 애매하면 False(fail-open — 강등 안 함).
+    """
+    if not title:
+        return False
+    kw_toks = {t.lower() for t in _tokens(keyword or "")}
+    lead_full = _title_first_clause(title)   # 첫 구분자(콤마 등) 이전
+    lead_toks = _tokens(lead_full)
+    if not lead_toks:
+        return False
+    first = lead_toks[0]
+    # 선두 토큰이 keyword 자신(또는 파생)이면 별도 주체 아님.
+    if first.lower() in kw_toks or _keyword_derived_token(first, kw_toks):
+        return False
+    # 선두 주체는 keyword보다 앞에 있어야 한다(비교 대상은 통상 문장 뒤).
+    kw0 = next(iter(_tokens(keyword or "")), "")
+    kw_pos = title.find(kw0) if kw0 else -1
+    subj_pos = title.find(first)
+    if kw_pos >= 0 and subj_pos >= 0 and subj_pos > kw_pos:
+        return False
+    # (a) 콤마 절로 끊긴 선두 주체: title이 first_clause보다 길다 = 콤마 등으로 잘렸다.
+    if len(lead_full) < len(title.strip()) and title.strip().startswith(first):
+        return True
+    # (b) 선두 주체 뒤 주격/속격 josa 근접.
+    after_first = title[subj_pos + len(first):subj_pos + len(first) + 2] if subj_pos >= 0 else ""
+    if any(after_first.startswith(j) for j in ("가", "는", "은", "이", "의", "도")):
+        return True
+    return False
+
+
+def _keyword_derived_token(tok: str, kw_toks: set) -> bool:
+    low = tok.lower()
+    return any(k in low or low in k for k in kw_toks if len(k) >= 2)
+
+
+def _keyword_is_title_subject(keyword: str, title: str) -> bool:
+    """keyword가 title의 선두 주체인지(comparison-dominant 판정 보조).
+
+    keyword 첫 토큰이 title 선두 절(첫 구분자 이전)에 있고, 그 뒤에 주격/속격 josa 또는
+    콤마가 붙거나 선두 위치(<=4자)면 True. 비교 대상이 아니라 실제 주체 신호. 애매하면
+    False(comparison-dominant 오강등 방지 쪽으로 보수).
+    """
+    kw0 = next(iter(_tokens(keyword or "")), "")
+    if not kw0:
+        return False
+    lead = _title_first_clause(title)
+    pos = lead.find(kw0)
+    if pos < 0:
+        return False
+    after = lead[pos + len(kw0):pos + len(kw0) + 2]
+    if pos <= 4:  # 선두 근접
+        return True
+    return any(after.startswith(j) for j in ("가", "는", "은", "이", "의", ",")) or "," in lead[pos:]
+
+
+def _comparison_target_role(keyword: str, title: str) -> Optional[str]:
+    """keyword가 비교 마커의 대상 위치에 오고 별도 주체가 확인되면 'NONSUBJECT_COMPARISON'.
+
+    판정(모두 충족해야 강등):
+    1. keyword가 title에 등장하고, keyword 끝 뒤 근접(<=6자)에 비교 마커가 온다. 근접
+       구간에는 keyword 잔여 토큰(예: '애플 카드'의 '카드')과 조사 정도만 낀다.
+    2. 같은 title에 _has_separate_subject(별도 실제 주체).
+    미충족이면 None(강등 안 함 — 상위 로직이 기존 판정 유지).
+    """
+    kw_toks = _tokens(keyword or "")
+    if not kw_toks:
+        return None
+    kw0 = kw_toks[0]
+    pos = title.find(kw0)
+    if pos < 0:
+        return None
+    # keyword의 마지막 토큰이 title에서 끝나는 지점을 anchor로 삼는다(다토큰 keyword 대응:
+    # '애플' 뒤 '카드'까지 소비한 위치부터 마커를 찾는다).
+    scan = pos + len(kw0)
+    for t in kw_toks[1:]:
+        nxt = title.find(t, scan)
+        if 0 <= nxt <= scan + 4:  # 잔여 토큰이 근접에 이어질 때만 anchor 전진
+            scan = nxt + len(t)
+    tail_head = title[scan:scan + 6]  # keyword(+잔여토큰) 직후 근접 구간
+    if not any(m in tail_head for m in _COMPARISON_TARGET_MARKERS):
+        return None
+    if not _has_separate_subject(keyword, title):
+        return None
+    return "NONSUBJECT_COMPARISON"
+
 
 def classify_keyword_kind(keyword: str, news_meta: Optional[Dict] = None) -> str:
     """키워드 유형 tri-state: 'event' | 'entity' | 'unknown'.
@@ -734,6 +878,12 @@ def classify_entity_role(keyword: str, article: Dict) -> tuple:
     near = title[max(0, pos - 12):pos + len(kw0) + 12]
     if any(m in near for m in _RHETORIC_LIST_MARKERS):
         return "non_subject", "NONSUBJECT_LIST_RHETORIC"
+
+    # comparison 대상(A): keyword가 "~에 맞불/맞서/겨냥/대항" 대상 위치 + 별도 주체 확인.
+    # "대결/대응/대체/라이벌/경쟁" 단독은 마커에 없어 여기 안 걸린다(공동 주체 보호).
+    comp = _comparison_target_role(keyword, title)
+    if comp:
+        return "non_subject", comp
 
     # incidental/side-mention 기사는 subject 아님(대표 자격 없음) — 기존 신호 재사용.
     if article.get("is_incidental"):
@@ -1609,6 +1759,92 @@ def compute_news_signal(keyword: str, raw_items: List[dict], require_all_tokens:
         # (전부 non_subject) 정제를 되돌린다 — 이 경우는 아래 gate/B2가 자연히 걸러낸다.
         refined = [a for a in scored_articles if a.get("entity_role") != "non_subject"]
         if refined:
+            scored_articles = refined
+    else:
+        # comparison 대상 정제(A, 2026-07-21): entity가 아닌 keyword('애플 카드' 같은 다토큰
+        # unknown 포함)도 "비교/맞불 대상 위치 + 별도 주체 확인"이면 non_subject로 강등한다.
+        # entity 블록과 달리 comparison 신호만 본다(전체 entity-role 판정은 event/unknown에
+        # 적용하지 않는다는 기존 계약 유지 — 산불/폭우 등 사건어·다토큰 정상 이슈 보호).
+        # comparison-dominant 모수: keyword 첫 토큰이 title 어절에 **명시적 표기변형**으로
+        # 등장하는 기사. ranker._word_contains_token(grounding과 동일한 token/alias 경계 계약)을
+        # 재사용해 별도 startswith 규칙을 두지 않는다(사용자 P1 사전검토 2차, 2026-07-21).
+        # 이전엔 `t.startswith(kw_first_tok)`(무제한 접두)이라 '삼성'←'삼성물산', '카드'←
+        # '카드뉴스'처럼 다른 개념 기사가 분모에 오포함될 수 있었다. 이제 조사결합('미국은'←
+        # '미국')·명시 alias·sibling 붙여쓰기 복합('애플카드에'←'애플'+'카드')만 인정하고,
+        # '파인애플'←'애플'/'삼성물산'←'삼성'/'카드뉴스'←'카드'는 배제된다. siblings는 keyword의
+        # 나머지 토큰(다토큰 keyword의 붙여쓰기 복합 근거)을 넘긴다.
+        from news import ranker as _ranker
+        kw_toks_all = _tokens(keyword)
+        kw_first_tok = kw_toks_all[0] if kw_toks_all else None
+        kw_siblings = set(kw_toks_all[1:]) if len(kw_toks_all) > 1 else set()
+        kw_first_alias = _ranker._institution_alias_forms(kw_first_tok) if kw_first_tok else set()
+        # 문맥 alias(약칭↔정식명칭)도 grounding과 **동일한 충돌·최소 증거 계약**으로 재사용한다
+        # (_contextual_alias_forms). 단순 접두 매칭을 다시 도입하지 않으며, 확장형이 충돌하거나
+        # 증거가 부족하면 매핑에 안 들어가 kw_first_alias가 그대로 유지된다(사용자 P1 2차).
+        if kw_first_tok:
+            ctx_alias = _ranker._contextual_alias_forms(set(kw_toks_all), scored_articles)
+            if kw_first_tok in ctx_alias:
+                kw_first_alias = set(kw_first_alias) | ctx_alias[kw_first_tok]
+        if kw_first_tok:
+            # title을 _tokens(정규식 [가-힣A-Za-z0-9]{2,})로 어절 토큰화한다 — .split()은
+            # '출시…애플카드에'처럼 구두점(…·)으로 붙은 어절을 못 나눠 '애플카드에'를 놓친다.
+            title_present = [
+                a for a in scored_articles
+                if any(
+                    _ranker._word_contains_token(tok, kw_first_tok, kw_siblings, kw_first_alias)
+                    for tok in _tokens(a.get("title") or "")
+                )
+            ]
+            # comparison-dominant 최소표본(>=2)은 **독립 기사 수**로 세야 한다(Codex P2,
+            # 2026-07-22). scored_articles는 URL dedup 전이라 동일 URL 기사가 2번 있으면
+            # title_present=2로 잘못 충족돼 comparison_dominant가 오발동한다. 상위 파이프라인의
+            # dedup 계약(news.dedup.dedup_articles = 동일 url 1건, 입력순서 유지)과 동일한
+            # URL identity로 evidence 모수를 dedup한다. dedup_articles는 url 없는 기사를
+            # 제거하지만, comparison 모수에선 url 없는 기사도 각각 독립으로 세야 하므로
+            # (fallback: 객체 identity) 그 부분만 로컬 처리한다.
+            title_present = _dedup_by_url_identity(title_present)
+        else:
+            title_present = []
+        comp_hits, subj_hits = 0, 0
+        for a in title_present:
+            if _comparison_target_role(keyword, a.get("title") or ""):
+                comp_hits += 1
+            elif _keyword_is_title_subject(keyword, a.get("title") or ""):
+                subj_hits += 1
+        # comparison-dominant 조건(사용자 P1 보완, 2026-07-21): 기사 1건짜리 오판으로 전체
+        # 후보가 탈락하는 것을 막기 위해 최소 표본 + 비율 + 혼재 배제를 모두 요구한다.
+        #   1) 최소 표본: title에 keyword가 등장하는 기사가 COMPARISON_DOMINANT_MIN_ARTICLES
+        #      건 이상이어야 한다(기사 1건만의 comparison 언급으로는 판정하지 않음 — 단일
+        #      기사의 서술 습관/오탐 가능성이 너무 크다).
+        #   2) 혼재 배제: subj_hits>=1이면(주체로 쓰인 기사가 하나라도 있으면) 그 자체로
+        #      비강등(subj_hits==0 유지 — 기존 계약과 동일, 혼재 시 "주체 증거 우선").
+        #   3) 비율: comp_hits가 title_present 중 COMPARISON_DOMINANT_MIN_RATIO 이상이어야
+        #      한다(desc-only 기사까지 전부 날리는 강한 조치이므로, 소수 기사의 비교 언급
+        #      만으로는 부족 — 다수 기사에 걸쳐 일관되게 비교 대상으로 쓰일 때만 인정).
+        comparison_dominant = (
+            subj_hits == 0
+            and len(title_present) >= COMPARISON_DOMINANT_MIN_ARTICLES
+            and comp_hits / len(title_present) >= COMPARISON_DOMINANT_MIN_RATIO
+        )
+        for a in scored_articles:
+            comp = _comparison_target_role(keyword, a.get("title") or "")
+            if comp:
+                a["entity_role"] = "non_subject"
+                a["entity_role_reason"] = comp
+                entity_role_reasons[id(a)] = comp
+            elif comparison_dominant:
+                a["entity_role"] = "non_subject"
+                a["entity_role_reason"] = "NONSUBJECT_COMPARISON_DOMINANT"
+                entity_role_reasons[id(a)] = "NONSUBJECT_COMPARISON_DOMINANT"
+        refined = [a for a in scored_articles if a.get("entity_role") != "non_subject"]
+        if refined:
+            scored_articles = refined
+        elif comparison_dominant:
+            # 전부 comparison으로 강등됐다 = keyword가 이 이슈의 주체가 아님이 확정적.
+            # 이때는 entity 블록의 "전부 non_subject면 롤백"(과잉 제외 방지)을 적용하지 않고
+            # 빈 evidence를 유지한다 → high_relevance_count 0 → quality gate에서 자연 탈락하고
+            # 다른 실제 주체 후보가 canonical이 된다("애플 카드"가 삼성 이슈의 대표로 승격되는
+            # 것을 막는 핵심 경로). comparison 신호가 아니라 단순 롤백 케이스는 위 if로 보존.
             scored_articles = refined
     keyword_kind_effective = keyword_kind
 
