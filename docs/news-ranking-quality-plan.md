@@ -494,3 +494,57 @@ P0/P1 잔존 없음(1건 즉시 반영) → 구현 착수 가능 상태.
 - `_SUBTOPIC_GENERIC_TOKENS`는 하드코딩 최소셋이다. 사전을 키우면 fixture 과적합·유지보수 부담이 커지므로, 판정의 주력은 "키워드·날짜를 제외한 뒤에도 2개 이상 토큰이 2개 이상 기사에서 반복되는가"이고 이 집합은 보조다.
 - 키워드 파생형 판정은 형태소 분석이 아니라 단방향 substring이다. 짧은 키워드가 별개 고유명사에 우연히 포함되면 그 토큰이 근거에서 빠질 수 있다(계획서의 "무거운 NLP 의존성 추가 금지" 원칙과의 절충 — §5).
 - **복수 하위 사건이 섞인 키워드는 억제하지 않는다.** DF>=2는 전체 기사 토큰 union 기준이라, (a) 8건 중 2건만 두 토큰을 공유하는 2+6, (b) 기사 1·2가 토큰 X를, 기사 3·4가 토큰 Y를 공유하는 서로 다른 pair, (c) 클러스터별로 각각 공통 토큰을 내는 다중 사건도 게이트를 통과한다. 두 토큰이 같은 기사 pair에서 함께 관측될 필요도 없다. 이 경우 근거 토큰을 더 많이 담은 기사가 대표가 된다. 과반 임계로 닫을 수 있지만 운영 실데이터 5건이 함께 억제되는 대가가 커서 열어 뒀다(Codex review-only P2로 범위 명시). 이번 작업 대상은 "공통 사건이 아예 없는" broad 키워드이고, 이는 공통 사건이 존재하는 별개 문제다.
+
+## 13. Top10 underfill 근본 수정 — 다중 사건(roundup) 기사 merge bridge 차단 (2026-07-30)
+
+### 문제 (운영 진단 데이터로 확정)
+
+- 증상: Top10이 간헐적으로 6~9개만 노출(2026-07-29 18:48 KST 화면 8개 사례). 48h/성공 81회 기준
+  평균 selected 9.27, 10개 충족 66.7%, 8개 이하 19.8%.
+- 퍼널: 미달 27회 전수에서 `RANK_CUTOFF=0` — 순위 컷·late drop·저장 손실이 아니라, gate 통과
+  17~38개가 `dedupe_and_merge`에서 5~12개 독립 이슈로 붕괴하는 것이 병목. pass2(후보 45개)가
+  pass1(30개)보다 독립 이슈가 오히려 줄어드는 역전(8→6, 6→4)도 관측 — 기사가 늘수록 bridge 증가.
+- 기전: "고지용 이혼→문근영 결혼→황정민 사생활 의혹→…"처럼 서로 다른 사건을 나열하는 연예/종합
+  (roundup) 기사가 여러 키워드의 네이버 검색 결과에 공통으로 잡히면, `_article_overlap()`이 URL
+  일치만으로 즉시 1.0을 반환해 서로 다른 실제 사건이 transitive 연쇄로 한 그룹에 붕괴했다
+  (18:47 실행에서 '문근영 결혼' 그룹이 3개 사건/5개 키워드 흡수 — 진단 DB decisions로 확인).
+- 기각한 대안(데이터 근거): 후보 pool 확대는 phrase 생존 0/27회 + 위 역전 현상으로 기각. 검색어
+  변형은 게이트 탈락 키워드가 대부분 정당 탈락(광범위 entity/주가/구작)이라 기각.
+
+### 수정 (news/ranker.py, 공유 URL 분기에만 한정 — 비공유 경로 bit-identical)
+
+`_is_same_issue()`가 공유 URL 근거에 대해 "비공유(잔여) 근거의 교차 확인"을 요구한다.
+
+- 공유 URL 없음: 기존 신호 그대로(`_same_issue_evidence_signals`에 전체 근거 전달, 동작 불변).
+- 동일 coverage(양쪽 근거가 전부 공유): 문자열 유사(`_is_similar_keyword`)이거나 두 keyword의
+  일반 anchor(`_keyword_anchor_tokens`) 합집합(비공집합)이 공유 기사 한 필드 안 span
+  (`_combo_span_grounded`, 6토큰)으로 grounding될 때만 merge("공수처 김영환 압수수색"류 보존,
+  흩어진 roundup 나열 차단). 엄격 merge anchor는 이 분기에 쓰지 않는다(진짜 중복 recall 보존,
+  Codex diff 리뷰 P1).
+- 한쪽만 전부 공유(subset): 문자열 유사이거나 subset 쪽 merge anchor가 상대 잔여 기사 단일 필드에
+  grounding될 때만 merge('정평' ⊂ '문근영 결혼' 보존).
+- 양쪽 잔여 보유: 기존 신호(pairwise Jaccard 0.5 / DF≥2+anchor)를 잔여 근거만으로 재평가 + 실패 시
+  문자열 유사·merge anchor 잔여 grounding(양방향)으로만 보정.
+- subset/잔여 fallback의 엄격 merge anchor = `_keyword_anchor_tokens - _SEARCH_INTENT_SUFFIXES -
+  _all_display_generic()` (비어 있으면 anchor 경로 병합 불가 — 공집합 자명 통과 금지). threshold 값 변경 없음, 신규
+  reason_code 없음, 분리된 그룹도 기존 하위 게이트(no_rep/display/grounding/crime) 전부 통과 필요.
+- 관찰 로그: merge 보류 pair를 fixed-point 종료 후 "최종적으로 다른 그룹에 남은 pair"만 run당 1회
+  집계 경고(`same-issue bridge 보류 N쌍`).
+
+### 검증
+
+- 신규 테스트 10개 + 기존 전체 565개 통과(`python -m unittest discover -s tests`).
+- 운영형 replay: 48h·81회 co-selected 3,168쌍에서 old/new 모두 병합 판정 0(기존 노출 이슈의 순위
+  왜곡·신규 병합 0), 화면 중복 proxy(공유 URL 보유 co-selected 쌍) 0 유지. 18:47 재구성 replay:
+  독립 이슈 1개 → 2개(허양임은 고지용 아내와 정상 병합 유지, 분리된 '교제 의혹 무혐의'는 기사
+  부족으로 하위 게이트에서 정상 차단 — 강제 노출 없음).
+
+### 알려진 한계 (후속 관찰)
+
+- 공유 URL이 없는 pair는 기존 경로 그대로라, 사실상 동일한 roundup 제목이 서로 다른 URL로 양쪽에
+  잡히면 pairwise Jaccard(≥0.5)로 여전히 병합될 수 있다(테스트로 현재 동작 고정).
+- 동일 coverage에서 두 사건 구획이 span 6토큰 이내로 인접한 roundup은 병합될 수 있다(양쪽 모두
+  roundup만으로 cohesion gate를 통과해야 하는 희귀 케이스, 테스트로 고정).
+- 운영 확인 지표(다음 정기 실행 이후): `news_keyword_runs.selected_count` 분포(10개 충족률),
+  decisions의 `MERGED_INTO_OTHER` per-run 수, Actions 로그의 `bridge 보류` 집계, co-selected 쌍의
+  공유 URL proxy(0 유지 여부).
