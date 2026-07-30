@@ -1148,6 +1148,161 @@ class TestSameIssueMerge(unittest.TestCase):
         merged = ranker.dedupe_and_merge(ranked)
         self.assertEqual(len(merged), 2)  # incidental 기사 공유만으로는 merge 안 됨
 
+    # === 공유 URL bridge 보정 (2026-07-30, 운영 underfill 근본 수정) ===
+    # 다중 사건 나열(roundup) 기사가 두 키워드 검색 결과에 모두 잡히면, 기존에는 URL
+    # 일치만으로 즉시 merge(1.0)돼 서로 다른 실제 사건이 한 이슈로 붕괴했다(2026-07-29
+    # 18:47 운영 사례: '문근영 결혼' 그룹이 '고지용 이혼' 등 3개 사건/5개 키워드 흡수).
+    # 공유 URL 근거는 잔여(비공유) 근거의 교차 확인을 요구한다.
+
+    def _roundup_case(self):
+        """운영(진단 DB) 실제 제목 기반 재구성: 서로 다른 두 사건 + 공유 roundup 2건."""
+        roundup1 = _article(
+            "황정민 여성팬과 법정 공방·문근영 결혼·고지용 이혼 고백…오늘 연예뉴스",
+            "https://r.example.com/roundup1")
+        roundup2 = _article(
+            "고지용 이혼→문근영 결혼→황정민 사생활 의혹→최정원 상간남 소송 승소",
+            "https://r.example.com/roundup2")
+        moon = [
+            _article("'국민 여동생' 문근영 데려간 '7세 연상' 정평, 누군가 했더니", "https://m.example.com/m1"),
+            _article("작품서 첫만남·결혼식은 식사로 대체…문근영 정평, 극비 열애 후 결혼", "https://m.example.com/m2"),
+            _article("'광주 출신 배우' 문근영, 7살 연상 배우 정평과 결혼", "https://m.example.com/m3"),
+        ]
+        go = [
+            _article("고지용, 허양임과 이혼 발표…오래 고민 끝 결정", "https://g.example.com/g1"),
+            _article("젝스키스 고지용, 아내 허양임과 이혼…결혼 12년만", "https://g.example.com/g2"),
+            _article("고지용 측 허양임과 이혼 조정 마무리 공식 입장", "https://g.example.com/g3"),
+        ]
+        return roundup1, roundup2, moon, go
+
+    def test_roundup_shared_url_does_not_merge_distinct_events(self):
+        # 서로 다른 사건(문근영 결혼 vs 고지용 이혼)이 공유 roundup URL만으로 병합되면 안 됨.
+        roundup1, roundup2, moon, go = self._roundup_case()
+        ranked = [
+            self._ranked_with_articles("문근영 결혼", 0.9, moon + [roundup1, roundup2]),
+            self._ranked_with_articles("고지용 아내", 0.8, go + [roundup1, roundup2]),
+        ]
+        merged = ranker.dedupe_and_merge(ranked)
+        self.assertEqual(len(merged), 2)  # 독립 이슈 2개 유지 (underfill 원인 수정)
+
+    def test_roundup_decline_emits_aggregated_observation_log(self):
+        roundup1, roundup2, moon, go = self._roundup_case()
+        ranked = [
+            self._ranked_with_articles("문근영 결혼", 0.9, moon + [roundup1, roundup2]),
+            self._ranked_with_articles("고지용 아내", 0.8, go + [roundup1, roundup2]),
+        ]
+        with self.assertLogs("news.ranker", level="WARNING") as cm:
+            ranker.dedupe_and_merge(ranked)
+        bridge_logs = [m for m in cm.output if "bridge 보류" in m]
+        self.assertEqual(len(bridge_logs), 1)  # pair별 남발 없이 run당 1회 집계
+
+    def test_true_pair_shared_url_with_corroborating_residuals_merges(self):
+        # 같은 사건(고지용 이혼)을 가리키는 두 키워드: 공유 기사 + 각자 독립 보도 보유.
+        shared = _article("젝스키스 고지용, 아내 허양임과 이혼…결혼 12년만", "https://s.example.com/s1")
+        ranked = [
+            self._ranked_with_articles("허양임", 0.9, [
+                shared,
+                _article("허양임, 고지용과 이혼 발표에 심경 고백", "https://a.example.com/a1"),
+                _article("방송인 허양임, 고지용과 12년만 이혼", "https://a.example.com/a2"),
+            ]),
+            self._ranked_with_articles("고지용 아내", 0.8, [
+                shared,
+                _article("고지용, 허양임과 이혼 조정 마무리", "https://b.example.com/b1"),
+                _article("고지용 이혼 발표…아내 허양임과 결별", "https://b.example.com/b2"),
+            ]),
+        ]
+        merged = ranker.dedupe_and_merge(ranked)
+        self.assertEqual(len(merged), 1)  # 잔여 근거가 교차 확인되는 진짜 중복은 계속 병합
+
+    def test_subset_coverage_with_anchor_in_residual_merges(self):
+        # subset 키워드('정평')의 근거가 전부 공유 기사여도, 상대 잔여 기사에 anchor가
+        # 실제 등장하면 같은 사건으로 병합(별칭/부분집합 중복 보존).
+        shared1 = _article("문근영, 7살 연상 배우 정평과 결혼", "https://s.example.com/w1")
+        shared2 = _article("작품서 첫만남…문근영 정평 극비 열애 후 결혼", "https://s.example.com/w2")
+        ranked = [
+            self._ranked_with_articles("문근영 결혼", 0.9, [
+                shared1, shared2,
+                _article("국민 여동생 문근영 저 시집갔어요…남편은 배우 정평", "https://m.example.com/w3"),
+            ]),
+            self._ranked_with_articles("정평", 0.7, [shared1, shared2]),
+        ]
+        merged = ranker.dedupe_and_merge(ranked)
+        self.assertEqual(len(merged), 1)
+
+    def test_subset_roundup_only_without_anchor_grounding_not_merged(self):
+        # 근거가 전부 공유 roundup뿐인 키워드('최정원')는 상대의 자체 보도에 anchor가
+        # 없으면 흡수되지 않는다(무관 사건 bridge 차단).
+        roundup1, roundup2, moon, go = self._roundup_case()
+        ranked = [
+            self._ranked_with_articles("고지용 아내", 0.9, go + [roundup1, roundup2]),
+            self._ranked_with_articles("최정원", 0.7, [roundup1, roundup2]),
+        ]
+        merged = ranker.dedupe_and_merge(ranked)
+        self.assertEqual(len(merged), 2)
+
+    def test_identical_coverage_scattered_anchors_not_merged(self):
+        # 동일 coverage(둘 다 같은 roundup 1건뿐)이고 두 anchor가 한 필드 안에서 span
+        # 제한(6토큰)을 넘겨 흩어져 있으면 병합하지 않는다(다중 사건 나열 방어).
+        far = _article(
+            "최정원 상간남 소송 승소 판결 확정 소식과 함께 별개로 전해진 두산에너빌리티 수주 공시",
+            "https://r.example.com/far1")
+        ranked = [
+            self._ranked_with_articles("최정원 소송", 0.9, [far]),
+            self._ranked_with_articles("두산에너빌리티 수주", 0.8, [far]),
+        ]
+        merged = ranker.dedupe_and_merge(ranked)
+        self.assertEqual(len(merged), 2)
+
+    def test_identical_coverage_adjacent_segments_known_limit(self):
+        # 알려진 한계 고정(fixture pin): 동일 coverage에서 두 사건 구획이 span 이내로
+        # 인접한 roundup은 여전히 병합될 수 있다(양쪽 모두 cohesion gate를 roundup만으로
+        # 통과해야 하는 희귀 케이스 — 후속 관찰 대상, 이 테스트는 현재 동작 문서화).
+        adjacent = _article("고지용 이혼 문근영 결혼 동시 발표", "https://r.example.com/adj1")
+        ranked = [
+            self._ranked_with_articles("고지용 이혼", 0.9, [adjacent]),
+            self._ranked_with_articles("문근영 결혼", 0.8, [adjacent]),
+        ]
+        merged = ranker.dedupe_and_merge(ranked)
+        self.assertEqual(len(merged), 1)
+
+    def test_search_intent_only_anchor_cannot_corroborate_subset(self):
+        # subset 쪽 키워드의 anchor가 검색의도 일반어('결혼')뿐이면 — 엄격 merge anchor
+        # 집합이 공집합 — anchor 경로로 병합할 수 없다(공집합 자명 통과 금지 가드).
+        shared = _article("연예계 결혼 소식 총정리…이번 주 화제의 발표", "https://s.example.com/si1")
+        ranked = [
+            self._ranked_with_articles("김태효 구속기소", 0.9, [
+                shared,
+                _article("특검, 김태효 전 안보실 1차장 구속기소", "https://k.example.com/k1"),
+                _article("김태효 구속기소…내란 중요종사 혐의", "https://k.example.com/k2"),
+            ]),
+            self._ranked_with_articles("결혼", 0.6, [shared]),
+        ]
+        merged = ranker.dedupe_and_merge(ranked)
+        self.assertEqual(len(merged), 2)
+
+    def test_different_url_roundup_jaccard_known_limit(self):
+        # 알려진 한계 고정: 공유 URL이 없는 pair는 기존 경로 그대로라, 사실상 동일한
+        # roundup 제목이 서로 다른 URL로 양쪽에 잡히면 pairwise Jaccard(>=0.5)로 여전히
+        # 병합될 수 있다(비공유 URL 경로 bit-identical 유지가 이번 수정의 범위 결정).
+        r1 = _article("고지용 이혼→문근영 결혼→황정민 사생활 의혹→최정원 소송 승소", "https://x.example.com/r1")
+        r2 = _article("고지용 이혼→문근영 결혼→황정민 사생활 의혹→최정원 소송 승소", "https://y.example.com/r2")
+        ranked = [
+            self._ranked_with_articles("문근영 결혼", 0.9, [r1]),
+            self._ranked_with_articles("고지용 아내", 0.8, [r2]),
+        ]
+        merged = ranker.dedupe_and_merge(ranked)
+        self.assertEqual(len(merged), 1)
+
+    def test_merge_still_absorbs_duplicates_no_forced_unmerge(self):
+        # 12개 후보가 8개 사건이면 정확히 8그룹 — 중복을 풀어 10개로 억지 확장하지 않음.
+        ranked = []
+        for i in range(8):
+            ev = _article(f"사건{i} 핵심인물{i} 검거 단독 보도", f"https://e{i}.example.com/1")
+            ranked.append(self._ranked_with_articles(f"사건{i} 인물{i}", 0.9 - i * 0.02, [ev]))
+            if i < 4:  # 4개 사건은 동일 기사 URL을 공유하는 별칭 후보 존재
+                ranked.append(self._ranked_with_articles(f"인물{i}", 0.5 - i * 0.02, [ev]))
+        merged = ranker.dedupe_and_merge(ranked)
+        self.assertEqual(len(merged), 8)
+
     def test_merge_reason_similar_keyword_when_no_article_overlap_merge(self):
         # 유사 키워드 dedupe만 발생하고(article overlap 없음), 각자 기사도 겹치지 않으면
         # merge_reason은 same_article_cluster가 아니라 similar_keyword여야 한다.

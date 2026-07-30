@@ -561,36 +561,7 @@ def _article_overlap(articles_a: List[Dict], articles_b: List[Dict]) -> float:
     """
     relevant_a = [a for a in (articles_a or []) if _is_same_issue_evidence_article(a)]
     relevant_b = [b for b in (articles_b or []) if _is_same_issue_evidence_article(b)]
-
-    urls_a = {a.get("url") for a in relevant_a if a.get("url")}
-    urls_b = {b.get("url") for b in relevant_b if b.get("url")}
-    if urls_a and urls_b and (urls_a & urls_b):
-        return 1.0
-
-    from news.summarizer import _tokens
-
-    def _toks(a: Dict) -> set:
-        return set(_tokens(f"{a.get('title', '')} {a.get('snippet', '')}"))
-
-    toks_list_a = [_toks(a) for a in relevant_a]
-    toks_list_b = [_toks(b) for b in relevant_b]
-    if not toks_list_a or not toks_list_b:
-        return 0.0
-
-    best = 0.0
-    for ta in toks_list_a:
-        if not ta:
-            continue
-        for tb in toks_list_b:
-            if not tb:
-                continue
-            union = ta | tb
-            if not union:
-                continue
-            overlap = len(ta & tb) / len(union)
-            if overlap > best:
-                best = overlap
-    return best
+    return _pairwise_evidence_overlap(relevant_a, relevant_b)
 
 
 def _is_same_issue_evidence_article(article: Dict) -> bool:
@@ -702,7 +673,13 @@ def _keyword_anchor_tokens(item: Dict) -> set:
     }
 
 
-def _has_cross_keyword_anchor(item_a: Dict, item_b: Dict, shared_tokens: set) -> bool:
+def _has_cross_keyword_anchor(
+    item_a: Dict,
+    item_b: Dict,
+    shared_tokens: set,
+    articles_a: Optional[List[Dict]] = None,
+    articles_b: Optional[List[Dict]] = None,
+) -> bool:
     """겹치는 사건 토큰(shared_tokens) 중, 두 keyword 중 하나의 anchor 토큰이 포함되거나
     한쪽 keyword의 anchor 토큰이 상대 article 그룹에 등장하는지 확인.
 
@@ -710,22 +687,27 @@ def _has_cross_keyword_anchor(item_a: Dict, item_b: Dict, shared_tokens: set) ->
     등장하므로 anchor 조건을 만족한다(권오영 감독 그룹의 기사에도 "배재고"가 실제로
     반복 등장). 반대로 "정부 오늘 새 정책 발표" ↔ "기업 오늘 실적 발표"는 keyword
     anchor("정부"/"기업")가 서로의 그룹에 등장하지 않아 걸러진다.
+
+    articles_a/articles_b: 검사 대상 기사 리스트를 명시 지정(이미 evidence 필터 통과).
+    None이면 기존처럼 item 전체 기사에서 evidence 필터를 적용해 읽는다. 공유 URL bridge
+    보정 경로는 잔여(비공유) 기사만 명시 전달해, 공유 roundup 기사가 anchor 등장 근거를
+    스스로 충족시키는 우회를 막는다(Codex 계획리뷰 P1).
     """
     anchors_a = _keyword_anchor_tokens(item_a)
     anchors_b = _keyword_anchor_tokens(item_b)
     if shared_tokens & (anchors_a | anchors_b):
         return True
 
-    articles_a = (item_a.get("news_meta") or {}).get("articles") or []
-    articles_b = (item_b.get("news_meta") or {}).get("articles") or []
+    if articles_a is None:
+        articles_a = _evidence_articles_of(item_a)
+    if articles_b is None:
+        articles_b = _evidence_articles_of(item_b)
     tokens_in_a = set()
     for a in articles_a:
-        if _is_same_issue_evidence_article(a):
-            tokens_in_a |= set(_tokens_of(a))
+        tokens_in_a |= set(_tokens_of(a))
     tokens_in_b = set()
     for b in articles_b:
-        if _is_same_issue_evidence_article(b):
-            tokens_in_b |= set(_tokens_of(b))
+        tokens_in_b |= set(_tokens_of(b))
     if anchors_a & tokens_in_b or anchors_b & tokens_in_a:
         return True
     return False
@@ -744,41 +726,191 @@ def _representative_overlap(item_a: Dict, item_b: Dict) -> set:
     return df_a & df_b
 
 
-def _is_same_issue(item_a: Dict, item_b: Dict) -> bool:
-    """same-issue merge 판정: article overlap(기존) OR 사건 토큰 overlap(신규, 옵션 B+C).
+def _evidence_articles_of(item: Dict) -> List[Dict]:
+    """item의 same-issue merge 판정용 유효 근거 기사 리스트."""
+    articles = (item.get("news_meta") or {}).get("articles") or []
+    return [a for a in articles if _is_same_issue_evidence_article(a)]
 
-    신규 신호는 아래 조건을 모두 만족해야 인정한다(Codex review-only 조언: B를 recall
-    신호로, C를 precision 게이트로 결합):
-    1. 두 keyword 그룹 다 유효 근거 기사가 0건이 아니고, 양쪽 다 singleton(1건)은
-       아니어야 한다 — 양쪽 다 근거가 1건뿐이면 "반복 등장"을 전혀 관측할 수 없어
-       흔한 서술어만 겹쳐도 신호가 발생하는 오탐 위험이 가장 크다(Codex review-only
-       재지적: "정부 오늘 새 정책 발표" vs "기업 오늘 실적 발표" 단일 기사끼리).
-    2. 두 keyword의 article 그룹에서 문서빈도 2 이상(또는 singleton fallback)인 토큰이
-       최소 REPRESENTATIVE_OVERLAP_MIN_SHARED_TOKENS개 이상 겹친다.
-    3. 겹치는 토큰 중 하나가 두 keyword 중 하나의 anchor 토큰이거나, 한쪽 keyword의
-       anchor 토큰이 상대 article 그룹에 실제로 등장한다(정부/기업처럼 서로 무관한
-       주체의 흔한 서술어만 겹치는 오탐을 차단).
-    4. 겹치는 토큰 중 흔한 서술어(_GENERIC_EVENT_PREDICATE_WORDS)가 아닌 것이 최소
-       1개 포함돼야 한다(anchor 게이트를 우회하는 일반 서술어만의 조합 방지).
+
+def _merge_anchor_tokens(item: Dict) -> set:
+    """공유 URL bridge 보정(corroboration) 전용의 더 엄격한 anchor 집합.
+
+    `_keyword_anchor_tokens`에서 검색의도 어휘(_SEARCH_INTENT_SUFFIXES: "결혼" 등)와
+    display 일반어(_all_display_generic)를 추가로 제외한다. 단독 일반 토큰("결혼")이
+    span=0으로 자명하게 grounding돼 roundup bridge를 재허용하는 것을 막고, 고유명사성
+    anchor("정평"/"허양임")만 남긴다. 기존 `_keyword_anchor_tokens` 소비처(공유 URL이
+    없는 기존 merge 경로)는 건드리지 않는다 — 이 헬퍼는 아래 `_is_same_issue`의
+    공유 URL 분기에서만 사용한다(no-shared 경로 bit-identical 유지, Codex 계획리뷰).
     """
-    articles_a = (item_a.get("news_meta") or {}).get("articles") or []
-    articles_b = (item_b.get("news_meta") or {}).get("articles") or []
-    if _article_overlap(articles_a, articles_b) >= MERGE_ARTICLE_OVERLAP_THRESHOLD:
+    return _keyword_anchor_tokens(item) - _SEARCH_INTENT_SUFFIXES - _all_display_generic()
+
+
+def _pairwise_evidence_overlap(relevant_a: List[Dict], relevant_b: List[Dict]) -> float:
+    """이미 evidence 필터를 통과한 두 기사 리스트의 overlap(_article_overlap과 동일 계약).
+
+    URL 일치 우선(1.0), 없으면 기사쌍 최대 token Jaccard. `_article_overlap`의 내부
+    로직을 리스트 입력으로 분리한 것 — 공유 URL 제외 후의 잔여(residual) 기사끼리
+    재판정할 때 필요하다. `_article_overlap`은 이 함수를 그대로 사용한다.
+    """
+    urls_a = {a.get("url") for a in relevant_a if a.get("url")}
+    urls_b = {b.get("url") for b in relevant_b if b.get("url")}
+    if urls_a and urls_b and (urls_a & urls_b):
+        return 1.0
+
+    from news.summarizer import _tokens
+
+    def _toks(a: Dict) -> set:
+        return set(_tokens(f"{a.get('title', '')} {a.get('snippet', '')}"))
+
+    toks_list_a = [_toks(a) for a in relevant_a]
+    toks_list_b = [_toks(b) for b in relevant_b]
+    if not toks_list_a or not toks_list_b:
+        return 0.0
+
+    best = 0.0
+    for ta in toks_list_a:
+        if not ta:
+            continue
+        for tb in toks_list_b:
+            if not tb:
+                continue
+            union = ta | tb
+            if not union:
+                continue
+            overlap = len(ta & tb) / len(union)
+            if overlap > best:
+                best = overlap
+    return best
+
+
+def _same_issue_evidence_signals(
+    item_a: Dict, item_b: Dict, ev_a: List[Dict], ev_b: List[Dict]
+) -> bool:
+    """기존 same-issue 판정 신호(overlap OR DF+anchor)를 명시적 기사 리스트로 평가한다.
+
+    ev_a/ev_b는 이미 `_is_same_issue_evidence_article` 필터를 통과한 리스트다.
+    공유 URL이 없는 pair에는 전체 근거 리스트가 그대로 들어와 기존 동작과 완전히
+    동일하고(bit-identical), 공유 URL이 있는 pair에는 잔여(비공유) 리스트만 들어와
+    "공유 roundup 기사가 DF/anchor 근거를 스스로 충족시키는" 우회를 차단한다
+    (Codex 계획리뷰 P1: `_has_cross_keyword_anchor`가 전체 기사를 다시 읽으면 안 됨).
+
+    신호 조건(기존 그대로):
+    1. 양쪽 근거 0건이면 불가, 양쪽 다 singleton(1건)이면 불가.
+    2. DF>=2(또는 singleton fallback) 토큰이 REPRESENTATIVE_OVERLAP_MIN_SHARED_TOKENS개
+       이상 겹친다.
+    3. 겹침 중 keyword anchor 교차 조건(_has_cross_keyword_anchor 계약).
+    4. 겹침에 일반 서술어가 아닌 토큰 최소 1개.
+    """
+    if _pairwise_evidence_overlap(ev_a, ev_b) >= MERGE_ARTICLE_OVERLAP_THRESHOLD:
         return True
 
-    evidence_count_a = _count_same_issue_evidence_articles(articles_a)
-    evidence_count_b = _count_same_issue_evidence_articles(articles_b)
+    evidence_count_a = len(ev_a)
+    evidence_count_b = len(ev_b)
     if evidence_count_a == 0 or evidence_count_b == 0:
         return False
     if evidence_count_a == 1 and evidence_count_b == 1:
         return False
 
-    shared = _representative_overlap(item_a, item_b)
+    shared = _group_df_tokens(ev_a) & _group_df_tokens(ev_b)
     if len(shared) < REPRESENTATIVE_OVERLAP_MIN_SHARED_TOKENS:
         return False
     if not (shared - _GENERIC_EVENT_PREDICATE_WORDS):
         return False
-    return _has_cross_keyword_anchor(item_a, item_b, shared)
+    return _has_cross_keyword_anchor(item_a, item_b, shared, ev_a, ev_b)
+
+
+def _anchor_grounded_in_articles(anchors: set, articles: List[Dict]) -> bool:
+    """merge anchor 집합이 비어있지 않고, 단일 기사 한 필드 안에서 span 제한 이내로
+    함께 등장하는지(_combo_span_grounded 계약 재사용).
+
+    공집합은 자명하게 참이 되므로 반드시 거짓 처리한다(빈 anchor 키워드는 이 경로로
+    merge할 수 없다 — Codex 계획리뷰 P1). 서로 다른 기사에 흩어진 토큰 합집합으로는
+    보정하지 않는다(단일 기사 필드 grounding만 인정).
+    """
+    if not anchors:
+        return False
+    return _combo_span_grounded(anchors, articles)
+
+
+def _is_same_issue(item_a: Dict, item_b: Dict) -> bool:
+    """same-issue merge 판정: 공유 URL 근거는 비공유(잔여) 근거의 교차 확인을 요구한다.
+
+    배경(2026-07-30, 운영 진단): "고지용 이혼→문근영 결혼→황정민 사생활 의혹→…"처럼
+    서로 다른 사건을 나열하는 연예/종합(roundup) 기사가 두 키워드의 네이버 검색 결과에
+    모두 잡히면, 기존 로직은 URL 일치만으로 즉시 merge(1.0)해 서로 다른 실제 사건이
+    한 이슈로 붕괴했다(transitive 연쇄로 최대 5개 키워드/3개 사건이 1그룹). 이것이
+    Top10 미달(underfill)의 지배적 원인이었다(48h 27회 미달 실행 전수에서 RANK_CUTOFF=0,
+    gate 통과 17~38개가 merge 후 5~12개로 붕괴).
+
+    판정 규칙(공유 URL 유무로 분기 — 공유 없음 경로는 기존과 완전 동일):
+    - 공유 URL 없음: 기존 신호 그대로(_same_issue_evidence_signals에 전체 근거 전달).
+    - 양쪽 근거가 전부 공유(동일 coverage): 문자열 유사 키워드거나, 두 keyword의
+      merge anchor 합집합이 공유 기사 한 필드 안에 span 제한으로 grounding될 때만 merge.
+    - 한쪽 근거만 전부 공유(subset): 문자열 유사 키워드거나, subset 쪽 merge anchor가
+      상대 잔여 기사 단일 필드에 grounding될 때만 merge('정평' ⊂ '문근영 결혼' 보존).
+    - 양쪽 모두 잔여 근거 보유: 기존 신호를 잔여 근거만으로 재평가하고, 실패 시
+      문자열 유사 또는 merge anchor의 상대 잔여 grounding(양방향)으로만 보정.
+      같은 사건이라면 양쪽 검색이 각자 독립 보도를 확보하므로 잔여끼리도 교차 근거가
+      남는다 — 다중 사건 roundup 공유만으로는 merge 근거가 되지 않는다.
+    """
+    ev_a = _evidence_articles_of(item_a)
+    ev_b = _evidence_articles_of(item_b)
+    urls_a = {a.get("url") for a in ev_a if a.get("url")}
+    urls_b = {b.get("url") for b in ev_b if b.get("url")}
+    shared_urls = urls_a & urls_b
+
+    if not shared_urls:
+        return _same_issue_evidence_signals(item_a, item_b, ev_a, ev_b)
+
+    rest_a = [a for a in ev_a if a.get("url") not in shared_urls]
+    rest_b = [b for b in ev_b if b.get("url") not in shared_urls]
+    kw_a = item_a.get("keyword", "")
+    kw_b = item_b.get("keyword", "")
+
+    if not rest_a and not rest_b:
+        # 동일 coverage(A==B==공유). 문자열 유사이거나, 두 keyword의 anchor 합집합이
+        # 공유 기사 "한 필드 안 근접 span"으로 함께 grounding되면 같은 사건으로 본다
+        # ("공수처 김영환 압수수색"류 통과). 서로 다른 list 구획에 흩어진 roundup은
+        # span 조건에서 배제된다. 알려진 한계: span 이내로 인접한 roundup 구획은
+        # 여전히 merge될 수 있다(둘 다 roundup만으로 cohesion gate를 통과해야 하는
+        # 희귀 케이스 — 관찰 로그로 추적).
+        if _is_similar_keyword(kw_a, kw_b):
+            return True
+        # 동일 coverage는 subset/잔여 fallback과 달리 엄격 merge anchor가 아니라 일반
+        # anchor 합집합을 쓴다(Codex diff 리뷰 P1: "조사"+"김영환"처럼 한쪽 anchor가
+        # 검색의도/일반어 필터로 비는 진짜 중복 pair의 recall 보존). 합집합이 한 기사
+        # 한 필드의 근접 span 안에 함께 grounding돼야 하므로, 단독 일반 토큰만으로
+        # 자명 통과하는 subset류 우회와는 위험 구조가 다르다. 합집합 공집합은 거짓.
+        anchor_union = _keyword_anchor_tokens(item_a) | _keyword_anchor_tokens(item_b)
+        shared_articles = [a for a in ev_a if a.get("url") in shared_urls]
+        return _anchor_grounded_in_articles(anchor_union, shared_articles)
+
+    if not rest_a or not rest_b:
+        # 한쪽만 전부 공유(subset). subset 쪽이 상대의 "자체 보도"에 실제로 등장해야
+        # 같은 사건이다. roundup만 공유하는 무관 keyword는 상대 잔여 기사에 anchor가
+        # 없어 차단된다.
+        if _is_similar_keyword(kw_a, kw_b):
+            return True
+        subset_item, other_rest = (item_a, rest_b) if not rest_a else (item_b, rest_a)
+        return _anchor_grounded_in_articles(_merge_anchor_tokens(subset_item), other_rest)
+
+    # 양쪽 모두 잔여 근거 보유 — 기존 신호를 잔여 근거로만 재평가.
+    if _same_issue_evidence_signals(item_a, item_b, rest_a, rest_b):
+        return True
+    if _is_similar_keyword(kw_a, kw_b):
+        return True
+    if _anchor_grounded_in_articles(_merge_anchor_tokens(item_a), rest_b):
+        return True
+    if _anchor_grounded_in_articles(_merge_anchor_tokens(item_b), rest_a):
+        return True
+    return False
+
+
+def _shared_evidence_urls(item_a: Dict, item_b: Dict) -> set:
+    """두 item의 유효 근거 기사 간 공유 URL 집합(관찰 로그 전용)."""
+    urls_a = {a.get("url") for a in _evidence_articles_of(item_a) if a.get("url")}
+    urls_b = {b.get("url") for b in _evidence_articles_of(item_b) if b.get("url")}
+    return urls_a & urls_b
 
 
 def _display_group_articles(members: List[Dict]) -> List[Dict]:
@@ -1212,6 +1344,11 @@ def dedupe_and_merge(ranked: List[Dict]) -> List[Dict]:
     """
     result: List[Dict] = []
     consumed = set()  # 이미 dedupe/merge에 흡수된 keyword
+    # 관찰 전용(랭킹 영향 없음): 공유 URL 근거가 있었지만 잔여 근거 교차확인 실패로
+    # merge하지 않은 pair 후보. fixed-point 특성상 나중에 다른 멤버를 통해 같은 그룹이
+    # 될 수 있으므로 여기서는 수집만 하고, 전체 merge 완료 후 "최종적으로 다른 그룹에
+    # 남은 pair"만 집계 로그로 남긴다(Codex 계획리뷰 P2/P3).
+    declined_bridge_pairs: Dict[frozenset, int] = {}
 
     for i, item in enumerate(ranked):
         kw = item["keyword"]
@@ -1260,6 +1397,17 @@ def dedupe_and_merge(ranked: List[Dict]) -> List[Dict]:
                     consumed.add(okw)
                     article_merge_count += 1
                     changed = True
+                else:
+                    # 관찰 수집: 공유 URL이 있었는데 merge하지 않은 모든 (멤버, other)
+                    # pair를 기록한다(첫 멤버에서 멈추면 pair 단위 관측이 왜곡됨 —
+                    # Codex diff 리뷰 P3). 중복 수집은 frozenset 키가 흡수하고,
+                    # 최종 판정은 함수 끝 reconcile에서.
+                    for m in group:
+                        shared_urls = _shared_evidence_urls(m, other)
+                        if shared_urls:
+                            declined_bridge_pairs[
+                                frozenset((m["keyword"], okw))
+                            ] = len(shared_urls)
 
         if len(group) == 1:
             merged = dict(item)
@@ -1286,6 +1434,27 @@ def dedupe_and_merge(ranked: List[Dict]) -> List[Dict]:
         # 전부 문자열/기관명 유사도만으로 흡수됐으면 similar_keyword로 정확히 구분(Codex P3 반영).
         merged["merge_reason"] = "same_article_cluster" if article_merge_count > 0 else "similar_keyword"
         result.append(merged)
+
+    # 관찰 로그(랭킹 영향 없음): 수집된 declined bridge 후보 중 "최종적으로 서로 다른
+    # 그룹에 남은" pair만 보고한다 — fixed-point에서 나중에 같은 그룹으로 합류한 pair는
+    # bridge 보류가 아니다. run당 1회 집계 경고(pair별 남발 방지).
+    if declined_bridge_pairs:
+        membership: Dict[str, int] = {}
+        for gi, merged_item in enumerate(result):
+            membership[merged_item["keyword"]] = gi
+            for rel in merged_item.get("related_keywords") or []:
+                membership[rel] = gi
+        separated = []
+        for pair, url_count in declined_bridge_pairs.items():
+            kws = sorted(pair)
+            ga, gb = membership.get(kws[0]), membership.get(kws[1])
+            if ga is not None and gb is not None and ga != gb:
+                separated.append((kws[0], kws[1], url_count))
+        if separated:
+            logger.warning(
+                "[news] same-issue bridge 보류 %d쌍(공유 URL 있으나 잔여 근거 미교차) 예시=%s",
+                len(separated), separated[:5],
+            )
 
     return result
 
