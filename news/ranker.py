@@ -25,7 +25,7 @@
   실패를 방어한다(§7-3).
 """
 import logging
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from news.candidates import _INDEPENDENT_SEARCH_FAMILIES
 
@@ -2559,3 +2559,66 @@ def exclude_no_representative(items: List[Dict]) -> tuple:
             continue
         kept.append(item)
     return kept, excluded
+
+
+def run_selection_stages(
+    candidates: List[Dict],
+    signals: Dict[str, Dict],
+    observe: Optional[Callable[[str, List[str]], None]] = None,
+) -> Dict:
+    """뉴스 선정 게이트 시퀀스의 단일 진실원.
+
+    main._rank_and_select(운영)와 news.replay.replay_selection(재생)이 이 함수 하나를
+    호출한다 — 게이트 추가/순서 변경은 반드시 여기서만 일어나야 두 경로가 갈라지지
+    않는다(news/dryrun.py가 자체 복제본으로 2단계 누락 + 순서 역전으로 drift한 전례가
+    이 통합의 근거. dryrun 재동기는 별도 PR).
+
+    observe(stage, excluded_keywords): 각 제외 단계 직후 호출되는 순수 관찰 hook.
+    main이 기존과 동일한 시점(다음 stage의 내부 로그보다 앞)에 자기 logger로 집계
+    경고를 찍기 위해 존재한다 — 파이프라인 결과에 영향을 주면 안 된다.
+    stage ∈ {"pr_excluded", "generic_excluded", "display_excluded", "no_rep_excluded"}.
+
+    반환 dict(단계별 중간 산출물 — 호출자가 로깅/진단/재구성에 소비):
+      gate_passed: compute_scores 통과 직후 keyword 리스트(이후 단계와 무관하게
+                   이 시점 값을 보존하기 위해 즉시 추출)
+      ranked: exclude_pr_clusters 통과 후 리스트
+      pr_excluded / generic_excluded / display_excluded / no_rep_excluded:
+                   각 단계의 제외 keyword 리스트
+      merged: display 변환 3단계(resolve/consistency/grounding)까지 끝난 merge 결과
+      kept: 모든 제외 완료 후 리스트(= main의 selected_pre_display)
+      top: select_top 결과
+    """
+    notify = observe or (lambda stage, excluded: None)
+    ranked = compute_scores(candidates, signals)
+    gate_passed = [r["keyword"] for r in ranked]
+    # PR/광고성 클러스터 hard exclude — merge 이전 per-keyword 기준.
+    ranked, pr_excluded = exclude_pr_clusters(ranked)
+    notify("pr_excluded", pr_excluded)
+    merged = dedupe_and_merge(ranked)
+    # singleton sense-mixing display 보정 — merge 후, invariant 검증 전.
+    merged = resolve_singleton_displays(merged)
+    # display_keyword/articles 정합성 invariant — merge 후, generic guard 전.
+    merged = enforce_display_article_consistency(merged)
+    # display source grounding — 무근거 조각 축약/drop. consistency 직후.
+    merged = enforce_display_source_grounding(merged)
+    kept, generic_excluded = exclude_generic_singletons(merged)
+    notify("generic_excluded", generic_excluded)
+    # display 부족 / no_representative 제외는 select_top *이전* 전체 리스트에 적용한다
+    # (2026-07, Codex 계획리뷰 P1-4). 제외 후 select_top이 슬라이스만 하므로 하위
+    # 정상후보가 자연히 그 자리를 채운다. 순서: generic → display부족 → no_rep → select_top.
+    kept, display_excluded = exclude_insufficient_display_articles(kept)
+    notify("display_excluded", display_excluded)
+    kept, no_rep_excluded = exclude_no_representative(kept)
+    notify("no_rep_excluded", no_rep_excluded)
+    top = select_top(kept)
+    return {
+        "gate_passed": gate_passed,
+        "ranked": ranked,
+        "pr_excluded": pr_excluded,
+        "merged": merged,
+        "generic_excluded": generic_excluded,
+        "display_excluded": display_excluded,
+        "no_rep_excluded": no_rep_excluded,
+        "kept": kept,
+        "top": top,
+    }

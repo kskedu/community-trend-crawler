@@ -4922,5 +4922,162 @@ class TestTruncatedTitleTiebreak(unittest.TestCase):
         self.assertEqual(summary_type, "no_representative")
 
 
+class TestRunSelectionStages(unittest.TestCase):
+    """ranker.run_selection_stages 단일 진실원 계약 회귀 고정(2026-07 통합).
+
+    main._rank_and_select(운영)와 replay_selection(재생)이 같은 시퀀스 정의를 소비하고,
+    observe hook이 결과에 영향 없이 기존 로그 발생 시점(다음 stage 내부 로그보다 앞)을
+    보존하는지 고정한다. 시퀀스 복제본이 조용히 drift한 전례(news/dryrun.py)의 재발 방지.
+    """
+
+    def _cands(self):
+        return [
+            {"keyword": "금리 인상", "sources": {"daum_home": 1}},
+            {"keyword": "반도체 수출", "sources": {"nate_home": 1}},
+            # display 기사 1건 → exclude_insufficient_display_articles 제외 대상.
+            {"keyword": "단일기사", "sources": {"daum_home": 3}},
+            # 기사 2건이나 공통 하위주제 없음 → exclude_no_representative 제외 대상.
+            {"keyword": "민경욱", "sources": {"daum_home": 4}},
+        ]
+
+    def _signals(self):
+        return {
+            "news": {
+                "금리 인상": _news(3, 1, 2, 0.9, articles=[
+                    _article("금리 인상 단행 발표 충격", "https://a.com/a1", "금리 인상 단행 발표"),
+                    _article("금리 인상 단행 발표 반응", "https://b.com/a2", "금리 인상 단행 발표"),
+                ]),
+                "반도체 수출": _news(3, 1, 2, 0.9, articles=[
+                    _article("반도체 수출 증가 발표 호조", "https://a.com/b1", "반도체 수출 증가 발표"),
+                    _article("반도체 수출 증가 발표 지속", "https://b.com/b2", "반도체 수출 증가 발표"),
+                ]),
+                "단일기사": _news(3, 1, 2, 0.9, articles=[
+                    _article("단일기사 후속 상황 발표", "https://a.com/c1", "단일기사 후속"),
+                ]),
+                "민경욱": _news(3, 1, 2, 0.9, articles=[
+                    _article("속보...", "https://a.com/d1",
+                             "민경욱 전 의원이 자택에서 의식 불명 상태로 발견돼 병원으로 이송됐다."),
+                    _article("현장 화보", "https://b.com/d2",
+                             "민경욱 전 의원이 자택에서 의식 불명 상태로 발견돼 병원으로 이송됐다."),
+                ]),
+            },
+            "datalab": {}, "google": {},
+        }
+
+    def test_contract_keys_and_top_equals_select_top(self):
+        stages = ranker.run_selection_stages(self._cands(), self._signals())
+        self.assertEqual(
+            set(stages.keys()),
+            {"gate_passed", "ranked", "pr_excluded", "merged", "generic_excluded",
+             "display_excluded", "no_rep_excluded", "kept", "top"},
+        )
+        # top은 kept의 순수 slice — 재호출해도 동일해야 한다(순위 재계산 없음).
+        self.assertEqual(stages["top"], ranker.select_top(stages["kept"]))
+
+    def test_gate_passed_snapshot_taken_before_exclusions(self):
+        # gate_passed는 compute_scores 통과 직후 시점 값 — 이후 단계에서 제외되는
+        # 후보도 포함해야 한다(main의 gate통과 카운트/재구성 계약).
+        stages = ranker.run_selection_stages(self._cands(), self._signals())
+        self.assertIn("단일기사", stages["gate_passed"])
+        self.assertIn("단일기사", stages["display_excluded"])
+        self.assertIn("민경욱", stages["gate_passed"])
+        self.assertIn("민경욱", stages["no_rep_excluded"])
+        top_keywords = [t["keyword"] for t in stages["top"]]
+        self.assertNotIn("단일기사", top_keywords)
+        self.assertNotIn("민경욱", top_keywords)
+
+    def test_observe_called_in_stage_order_with_returned_lists(self):
+        calls = []
+        stages = ranker.run_selection_stages(
+            self._cands(), self._signals(),
+            observe=lambda stage, excluded: calls.append((stage, excluded)),
+        )
+        self.assertEqual(
+            [s for s, _ in calls],
+            ["pr_excluded", "generic_excluded", "display_excluded", "no_rep_excluded"],
+        )
+        # hook이 받은 리스트는 반환 dict와 동일 객체(사본 아님 — 관찰 전용 계약).
+        for stage, excluded in calls:
+            self.assertIs(excluded, stages[stage])
+
+    def test_observe_has_no_effect_on_results(self):
+        base = ranker.run_selection_stages(self._cands(), self._signals())
+        observed = ranker.run_selection_stages(
+            self._cands(), self._signals(), observe=lambda s, e: None)
+        self.assertEqual([t["keyword"] for t in base["top"]],
+                         [t["keyword"] for t in observed["top"]])
+        for key in ("gate_passed", "pr_excluded", "generic_excluded",
+                    "display_excluded", "no_rep_excluded"):
+            self.assertEqual(base[key], observed[key])
+
+    def test_main_rank_and_select_delegates_to_shared_sequence(self):
+        top_main = main_module._rank_and_select(self._cands(), self._signals(), "test")
+        stages = ranker.run_selection_stages(self._cands(), self._signals())
+        self.assertEqual([t["keyword"] for t in top_main],
+                         [t["keyword"] for t in stages["top"]])
+        self.assertEqual([t.get("display_keyword") for t in top_main],
+                         [t.get("display_keyword") for t in stages["top"]])
+        self.assertEqual([t.get("score") for t in top_main],
+                         [t.get("score") for t in stages["top"]])
+
+    def test_replay_selection_matches_shared_sequence(self):
+        from news.replay import replay_selection, _fetch_from_input
+
+        def _raw(title, url, desc):
+            import datetime as _dt
+            from email.utils import format_datetime
+            dt = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=1)
+            return {"title": title, "originallink": url, "link": url,
+                    "description": desc, "pubDate": format_datetime(dt)}
+
+        abk = {
+            "금리 인상": [
+                _raw("금리 인상 단행 발표 충격", "https://a.com/r1", "금리 인상 단행 발표"),
+                _raw("금리 인상 단행 발표 반응", "https://b.com/r2", "금리 인상 단행 발표"),
+                _raw("금리 인상 단행 발표 후폭풍", "https://c.com/r3", "금리 인상 단행 발표"),
+            ],
+            "반도체 수출": [
+                _raw("반도체 수출 증가 발표 호조", "https://a.com/r4", "반도체 수출 증가 발표"),
+                _raw("반도체 수출 증가 발표 지속", "https://b.com/r5", "반도체 수출 증가 발표"),
+                _raw("반도체 수출 증가 발표 확대", "https://c.com/r6", "반도체 수출 증가 발표"),
+            ],
+        }
+        kws = list(abk)
+        out = replay_selection({"keywords": kws, "articles_by_keyword": abk})
+        candidates = [{"keyword": kw, "sources": {"daum_home": i + 1}}
+                      for i, kw in enumerate(kws)]
+        signals = {"news": cand.build_news_signals(candidates, _fetch_from_input(abk)),
+                   "datalab": {}, "google": {}}
+        stages = ranker.run_selection_stages(candidates, signals)
+        self.assertEqual([s["keyword"] for s in out["selected"]],
+                         [t["keyword"] for t in stages["top"]])
+        self.assertEqual(out["gate_passed"], stages["gate_passed"])
+        self.assertEqual(out["display_excluded"], stages["display_excluded"])
+        self.assertEqual(out["no_rep_excluded"], stages["no_rep_excluded"])
+
+    def test_log_interleaving_preserved_in_rank_and_select(self):
+        # 기존 계약: 각 제외 단계의 집계 경고(main logger)는 그 단계 직후·다음 stage의
+        # 내부 로그보다 앞에 찍힌다. run_selection_stages 통합 후에도 observe hook이
+        # 이 인터리브 순서를 보존해야 한다(Codex 계획리뷰 2R P1 회귀 방지).
+        with self.assertLogs(level="WARNING") as cm:
+            main_module._rank_and_select(self._cands(), self._signals(), "test")
+        out = cm.output
+
+        def _idx(substr):
+            for i, line in enumerate(out):
+                if substr in line:
+                    return i
+            self.fail(f"log line not found: {substr} in {out}")
+
+        drop_insufficient = _idx("drop 단일기사: insufficient_display_articles")
+        agg_display = _idx("display_articles 부족 제외")
+        drop_no_rep = _idx("drop 민경욱: no_representative")
+        agg_no_rep = _idx("no_representative 제외")
+        # ranker 내부 drop 로그 → main 집계 경고 → 다음 stage 내부 로그 → 그 집계 경고.
+        self.assertLess(drop_insufficient, agg_display)
+        self.assertLess(agg_display, drop_no_rep)
+        self.assertLess(drop_no_rep, agg_no_rep)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
