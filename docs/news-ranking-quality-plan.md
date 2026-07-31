@@ -548,3 +548,36 @@ P0/P1 잔존 없음(1건 즉시 반영) → 구현 착수 가능 상태.
 - 운영 확인 지표(다음 정기 실행 이후): `news_keyword_runs.selected_count` 분포(10개 충족률),
   decisions의 `MERGED_INTO_OTHER` per-run 수, Actions 로그의 `bridge 보류` 집계, co-selected 쌍의
   공유 URL proxy(0 유지 여부).
+
+## 14. 선정 게이트 시퀀스 단일 진실원화 — `ranker.run_selection_stages` (2026-07-31)
+
+**문제(구조)**: compute_scores → exclude_pr_clusters → dedupe_and_merge →
+resolve_singleton_displays → enforce_display_article_consistency →
+enforce_display_source_grounding → exclude_generic_singletons →
+exclude_insufficient_display_articles → exclude_no_representative → select_top의
+게이트 시퀀스가 `main._rank_and_select`, `news/replay.replay_selection`,
+`news/dryrun.run_ranking`, replay docstring 산문까지 4곳에 복제돼 있었다.
+main↔replay는 동기 상태였으나 단일 정의가 없어 게이트 추가 시마다 수동 동기화가
+필요했고, dryrun 복제본은 실제로 drift했다(grounding·no_representative 2단계 누락 +
+display-min 게이트가 select_top 이후에 남아 있는 2026-07 이전 순서).
+
+**수정(동작 불변)**: 시퀀스를 `ranker.run_selection_stages(candidates, signals,
+observe=None)` 하나로 추출하고 main(운영)·replay(재생)가 이 함수만 호출한다.
+- 반환 dict가 모든 중간 산출물(gate_passed/ranked/merged/kept/top + 4종 제외 리스트)을
+  실어 main의 로깅·진단(_diag_record_pass)·shadow 탐지를 기존과 동일 값으로 재구성한다.
+- `observe(stage, excluded)` hook: main의 단계별 집계 경고가 기존과 동일 시점
+  (다음 stage 내부 로그보다 앞)·동일 logger에서 발생하도록 보존한다 — 로그 인터리브
+  순서까지 byte-exact(Codex 계획리뷰 2R P1 반영).
+- threshold/게이트 조건/순서/reason_code/로그 문자열 변경 없음. dryrun 재동기는
+  출력이 바뀌는 수정이라 별도 PR로 미룸(후속 후보 §14-1).
+
+**검증**: 전체 unittest 572개(신규 7: 반환 계약, gate_passed 시점, observe 순서·무영향,
+main/replay 위임 동일성, 로그 인터리브 회귀) + 48h 운영 재구성 81 run + roundup 재현
+1건 = 82 시나리오 exact differential replay byte-identical + production 경로 로그
+record 738건(logger명·레벨·메시지·순서) byte-identical + 교차 checkout parity.
+
+**후속 후보(이번 범위 제외)**: dryrun.run_ranking 재동기(§14-1), dead code 4건 제거
+(`_keyword_pos_in_title`/`_DEDUPE_SUFFIXES`/`_count_same_issue_evidence_articles`/
+`_representative_overlap`+white-box 테스트 정리), displayed-article 파생 6곳 통합,
+grounding fail-closed drop의 reason_code 오귀속(DISPLAY_ARTICLE_INCONSISTENT) 정확도,
+tests 공용 fixture factory, contextual alias 병합 로직 2곳 통합.

@@ -495,35 +495,31 @@ def _rank_and_select(candidates, signals, pass_name, diag=None):
 
     diag: PassSnapshot(호출자가 생성해 명시 전달). None이면 진단 미수집 — 랭킹 동작 동일.
     """
-    ranked = ranker.compute_scores(candidates, signals)
-    gate_passed = len(ranked)
-    # PR/광고성 클러스터 hard exclude — merge 이전 per-keyword 기준(문제 B).
-    ranked, pr_excluded = ranker.exclude_pr_clusters(ranked)
-    if pr_excluded:
-        logger.warning("[news] %s: PR/광고성 클러스터 제외 %s", pass_name, pr_excluded)
-    merged = ranker.dedupe_and_merge(ranked)
-    # singleton sense-mixing display 보정("위홀 뜻" 사례) — merge 후, invariant 검증 전.
-    merged = ranker.resolve_singleton_displays(merged)
-    # display_keyword/articles 정합성 invariant — merge 후, generic guard 전(문제 A).
-    merged = ranker.enforce_display_article_consistency(merged)
-    # display source grounding — 무근거 조각(따릉이 '명예'류) 축약/drop. consistency 직후.
-    merged = ranker.enforce_display_source_grounding(merged)
-    kept, generic_excluded = ranker.exclude_generic_singletons(merged)
-    if generic_excluded:
-        logger.warning("[news] %s: generic singleton 제외 %s", pass_name, generic_excluded)
-    # display 부족 / no_representative 제외를 select_top *이전* 전체 리스트에 적용한다
-    # (2026-07 변경, Codex 계획리뷰 P1-4). 이전엔 select_top 이후라 Top10 통과분이 빠지면
-    # 하위 backfill 없이 개수가 줄었다. 이제 제외 후 select_top이 슬라이스만 하므로 하위
-    # 정상후보가 자연히 그 자리를 채운다. 순서: generic → display부족 → no_rep → select_top.
-    kept, display_excluded = ranker.exclude_insufficient_display_articles(kept)
-    if display_excluded:
-        logger.warning("[news] %s: display_articles 부족 제외 %s", pass_name, display_excluded)
-    kept, no_rep_excluded = ranker.exclude_no_representative(kept)
-    if no_rep_excluded:
-        logger.warning("[news] %s: no_representative 제외 %s", pass_name, no_rep_excluded)
+    # 게이트 시퀀스 자체는 ranker.run_selection_stages 단일 진실원에 있다(2026-07 통합).
+    # 집계 경고는 observe hook으로 기존과 동일 시점(다음 stage 내부 로그보다 앞)·동일
+    # logger에서 발생시킨다 — 로그 인터리브 순서 보존.
+    _stage_warnings = {
+        "pr_excluded": "[news] %s: PR/광고성 클러스터 제외 %s",
+        "generic_excluded": "[news] %s: generic singleton 제외 %s",
+        "display_excluded": "[news] %s: display_articles 부족 제외 %s",
+        "no_rep_excluded": "[news] %s: no_representative 제외 %s",
+    }
+
+    def _observe(stage, excluded):
+        if excluded:
+            logger.warning(_stage_warnings[stage], pass_name, excluded)
+
+    stages = ranker.run_selection_stages(candidates, signals, observe=_observe)
+    gate_passed = len(stages["gate_passed"])
+    ranked = stages["ranked"]
+    pr_excluded = stages["pr_excluded"]
+    merged = stages["merged"]
+    generic_excluded = stages["generic_excluded"]
+    display_excluded = stages["display_excluded"]
+    no_rep_excluded = stages["no_rep_excluded"]
     # selected_pre_display = 모든 제외 완료 후 리스트(진단 재구성 호환용 이름 유지).
-    selected_pre_display = kept
-    top = ranker.select_top(kept)
+    selected_pre_display = stages["kept"]
+    top = stages["top"]
     logger.info(
         "[news] %s: candidates=%d gate통과=%d PR제외=%d merge후=%d generic제외=%d "
         "display부족제외=%d no_rep제외=%d final=%d",

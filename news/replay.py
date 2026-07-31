@@ -40,12 +40,9 @@ def _fetch_from_input(articles_by_keyword: Dict[str, List[dict]]) -> Callable[[s
 def replay_selection(replay_input: Dict, fetch_news: Optional[Callable[[str], List[dict]]] = None) -> Dict:
     """입력 스냅샷으로 select 단계를 재생한다(순수 함수, DB 접근 없음).
 
-    흐름은 main._rank_and_select와 동일한 게이트 순서를 재사용한다:
-      compute_scores(quality gate) → exclude_pr_clusters → dedupe_and_merge →
-      resolve_singleton_displays → enforce_display_article_consistency →
-      enforce_display_source_grounding →
-      exclude_generic_singletons → exclude_insufficient_display_articles →
-      exclude_no_representative → select_top.
+    게이트 순서는 ranker.run_selection_stages 단일 진실원을 그대로 호출한다 —
+    운영(main._rank_and_select)과 같은 함수를 쓰므로 여기 문서에 순서를 재나열하지
+    않는다(산문 복제가 세 번째 drift 지점이었음).
 
     반환:
     {
@@ -91,17 +88,13 @@ def replay_selection(replay_input: Dict, fetch_news: Optional[Callable[[str], Li
             "entity_roles": roles,
         }
 
-    ranked = ranker.compute_scores(candidates, signals)
-    gate_passed = [r["keyword"] for r in ranked]
-    ranked, pr_excluded = ranker.exclude_pr_clusters(ranked)
-    merged = ranker.dedupe_and_merge(ranked)
-    merged = ranker.resolve_singleton_displays(merged)
-    merged = ranker.enforce_display_article_consistency(merged)
-    merged = ranker.enforce_display_source_grounding(merged)
-    kept, generic_excluded = ranker.exclude_generic_singletons(merged)
-    kept, display_excluded = ranker.exclude_insufficient_display_articles(kept)
-    kept, no_rep_excluded = ranker.exclude_no_representative(kept)
-    top = ranker.select_top(kept)
+    stages = ranker.run_selection_stages(candidates, signals)
+    gate_passed = stages["gate_passed"]
+    pr_excluded = stages["pr_excluded"]
+    generic_excluded = stages["generic_excluded"]
+    display_excluded = stages["display_excluded"]
+    no_rep_excluded = stages["no_rep_excluded"]
+    top = stages["top"]
 
     candidate_map = {c["keyword"]: c for c in candidates}
     issues = build_ranked_issues(top, candidate_map, data_sources=["replay"])
