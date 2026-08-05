@@ -1279,10 +1279,11 @@ class TestSameIssueMerge(unittest.TestCase):
         merged = ranker.dedupe_and_merge(ranked)
         self.assertEqual(len(merged), 2)
 
-    def test_different_url_roundup_jaccard_known_limit(self):
-        # 알려진 한계 고정: 공유 URL이 없는 pair는 기존 경로 그대로라, 사실상 동일한
-        # roundup 제목이 서로 다른 URL로 양쪽에 잡히면 pairwise Jaccard(>=0.5)로 여전히
-        # 병합될 수 있다(비공유 URL 경로 bit-identical 유지가 이번 수정의 범위 결정).
+    def test_different_url_roundup_no_longer_bridges(self):
+        # PR #17 알려진 한계 1번 해소(2026-08-05): 같은 roundup이 제휴/전재로 서로 다른
+        # URL을 달면 URL 교집합이 비어 공유 URL 가드가 통째로 우회됐고, 기존 경로의 첫
+        # 신호인 pairwise Jaccard가 1.0이 되어 즉시 병합됐다. 이제 near-duplicate 제목을
+        # 공유 근거로 인정해 PR #17의 잔여 근거 계약이 동일하게 적용된다.
         r1 = _article("고지용 이혼→문근영 결혼→황정민 사생활 의혹→최정원 소송 승소", "https://x.example.com/r1")
         r2 = _article("고지용 이혼→문근영 결혼→황정민 사생활 의혹→최정원 소송 승소", "https://y.example.com/r2")
         ranked = [
@@ -1290,7 +1291,169 @@ class TestSameIssueMerge(unittest.TestCase):
             self._ranked_with_articles("고지용 아내", 0.8, [r2]),
         ]
         merged = ranker.dedupe_and_merge(ranked)
+        self.assertEqual(len(merged), 2)
+
+    # === 신디케이트 roundup bridge 차단 (2026-08-05, 운영 underfill 잔여 원인) ===
+    # 09:48 KST 실행(run 8a0a91ec): 품질 게이트 통과 15개 중 5개가 '김우빈 기프트 출연'
+    # 한 그룹으로 흡수돼 독립 이슈 10개 → display 게이트 후 7개로 발행됐다. 승자의 기사
+    # 8건은 전부 김우빈/기프트 기사였고 흡수된 키워드(하춘화/송영규/김서연/이수연) 기사는
+    # 1건도 없었다. 기전은 같은 연예 종합 기사가 서로 다른 URL로 양쪽에 잡힌 것.
+
+    def _syndicated_roundup(self, url):
+        """서로 다른 사건을 나열한 연예 종합 기사(제휴 전재로 URL만 다름)."""
+        return _article(
+            "김우빈 기프트 출연 확정·하춘화 근황·송영규 사망·이수연 신곡 발표 종합",
+            url)
+
+    def test_syndicated_roundup_does_not_merge_distinct_events(self):
+        # 핵심 회귀(09:48 재현): 동일 roundup이 다른 URL로 잡혀도 서로 다른 사건은 분리.
+        kim = [
+            _article("[공식] 김우빈, 前프로야구 투수코치 된다..'기프트' 하반기 컴백", "https://k.example.com/k1"),
+            _article("김우빈, 고교 야구부 감독 된다…'기프트' 출연 확정", "https://k.example.com/k2"),
+            _article("김우빈, 웹툰 원작 '기프트' 주인공…전국 꼴찌 야구부 감독 된다", "https://k.example.com/k3"),
+        ]
+        ha = [
+            _article("하춘화, 데뷔 60주년 기념 콘서트 개최 소식 전해", "https://h.example.com/h1"),
+            _article("가수 하춘화 근황 공개…변함없는 무대 매너 화제", "https://h.example.com/h2"),
+        ]
+        ranked = [
+            self._ranked_with_articles(
+                "김우빈 기프트 출연", 0.9, kim + [self._syndicated_roundup("https://a.example.com/r")]),
+            self._ranked_with_articles(
+                "하춘화", 0.5, ha + [self._syndicated_roundup("https://b.example.com/r")]),
+        ]
+        merged = ranker.dedupe_and_merge(ranked)
+        self.assertEqual(len(merged), 2)
+
+    def test_syndicated_roundup_transitive_chain_does_not_collapse(self):
+        # transitive 증폭 차단: roundup 하나가 3개 사건을 한 그룹으로 붕괴시키지 않는다.
+        def ev(prefix, titles):
+            return [_article(t, f"https://{prefix}.example.com/{i}") for i, t in enumerate(titles)]
+        ranked = [
+            self._ranked_with_articles("김우빈 기프트 출연", 0.9, ev("k", [
+                "[공식] 김우빈, 前프로야구 투수코치 된다..'기프트' 하반기 컴백",
+                "김우빈, 고교 야구부 감독 된다…'기프트' 출연 확정",
+            ]) + [self._syndicated_roundup("https://a.example.com/r")]),
+            self._ranked_with_articles("하춘화", 0.6, ev("h", [
+                "하춘화, 데뷔 60주년 기념 콘서트 개최 소식 전해",
+                "가수 하춘화 근황 공개…변함없는 무대 매너 화제",
+            ]) + [self._syndicated_roundup("https://b.example.com/r")]),
+            self._ranked_with_articles("이수연 가수", 0.4, ev("l", [
+                "가수 이수연, 신곡 발매하며 컴백 활동 시작한다",
+                "이수연 신곡 음원 차트 진입…팬들 응원 이어져",
+            ]) + [self._syndicated_roundup("https://c.example.com/r")]),
+        ]
+        merged = ranker.dedupe_and_merge(ranked)
+        self.assertEqual(len(merged), 3)
+
+    def test_genuine_syndicated_duplicate_still_merges(self):
+        # 진짜 동일 사건이 다른 URL로 전재된 경우: 잔여 근거가 교차하면 병합 유지
+        # (중복 노출 방지 — 이번 변경이 정상 병합까지 막지 않는다).
+        syn_a = _article("젝스키스 고지용, 아내 허양임과 이혼…결혼 12년만에 결별 결정", "https://p.example.com/1")
+        syn_b = _article("젝스키스 고지용, 아내 허양임과 이혼…결혼 12년만에 결별 결정", "https://q.example.com/1")
+        ranked = [
+            self._ranked_with_articles("고지용 이혼", 0.9, [
+                syn_a,
+                _article("고지용, 허양임과 이혼 발표…오래 고민 끝 내린 결정", "https://p.example.com/2"),
+            ]),
+            self._ranked_with_articles("허양임", 0.8, [
+                syn_b,
+                _article("허양임, 고지용과 이혼 조정 마무리…공식 입장 발표", "https://q.example.com/2"),
+            ]),
+        ]
+        merged = ranker.dedupe_and_merge(ranked)
         self.assertEqual(len(merged), 1)
+
+    def test_short_titles_are_not_treated_as_near_duplicates(self):
+        # 최소 토큰 guard: 짧은 제목이 우연히 일치해도 공유 근거로 승격되지 않는다
+        # (승격되면 기존 경로가 아니라 공유 근거 분기로 빠져 판정이 달라짐).
+        a_toks = ranker._title_tokens_of(_article("속보 오늘 날씨", "https://s.example.com/1"))
+        b_toks = ranker._title_tokens_of(_article("속보 오늘 날씨", "https://s.example.com/2"))
+        self.assertFalse(ranker._is_near_duplicate_title(a_toks, b_toks))
+
+    def test_long_identical_titles_are_near_duplicates(self):
+        long_title = "이흥구 대법관 후임 후보에 김문관 김성수 김예영 김정중 4인 압축"
+        a_toks = ranker._title_tokens_of(_article(long_title, "https://s.example.com/1"))
+        b_toks = ranker._title_tokens_of(_article(long_title, "https://s.example.com/2"))
+        self.assertTrue(ranker._is_near_duplicate_title(a_toks, b_toks))
+
+    def test_split_shared_evidence_matches_url_split_when_no_near_dup(self):
+        # near-dup이 0건이면 기존 URL 기준 분할과 집합 동등해야 한다(공유 URL 경로 보존).
+        shared = _article("젝스키스 고지용, 아내 허양임과 이혼…결혼 12년만", "https://s.example.com/shared")
+        ev_a = [
+            shared,
+            _article("문근영 정평, 극비 열애 후 결혼 발표 화제", "https://a.example.com/1"),
+            {"title": "제목만 있고 URL 없는 기사", "url": None},
+        ]
+        ev_b = [
+            shared,
+            _article("태풍 돌핀 북상…제주 산간 호우 특보 발효 중", "https://b.example.com/1"),
+        ]
+        shared_a, shared_b, rest_a, rest_b = ranker._split_shared_evidence(ev_a, ev_b)
+        self.assertEqual(shared_a, [shared])
+        self.assertEqual(shared_b, [shared])
+        self.assertEqual(rest_a, [ev_a[1], ev_a[2]])
+        self.assertEqual(rest_b, [ev_b[1]])
+
+    def test_split_shared_evidence_is_symmetric_with_duplicate_urls(self):
+        # 같은 URL 기사가 한쪽에 중복으로 있어도 set-membership 판정이라 순서 의존 없음.
+        dup = _article("젝스키스 고지용, 아내 허양임과 이혼…결혼 12년만", "https://s.example.com/dup")
+        ev_a = [dup, dup]
+        ev_b = [dup, _article("태풍 돌핀 북상…제주 산간 호우 특보 발효", "https://b.example.com/1")]
+        shared_a, shared_b, rest_a, rest_b = ranker._split_shared_evidence(ev_a, ev_b)
+        self.assertEqual(shared_a, [dup, dup])
+        self.assertEqual(rest_a, [])
+        self.assertEqual(shared_b, [dup])
+        self.assertEqual(rest_b, [ev_b[1]])
+        # 반대 방향도 대칭
+        rev_a, rev_b, rev_ra, rev_rb = ranker._split_shared_evidence(ev_b, ev_a)
+        self.assertEqual(rev_a, shared_b)
+        self.assertEqual(rev_b, shared_a)
+
+    def _asymmetric_near_dup_pair(self):
+        """near-dup(J>=0.9)이지만 한쪽 제목에만 상대 anchor가 있는 pair.
+
+        공유 URL 시절엔 양쪽 공유 기사가 동일해 이런 비대칭이 불가능했다. near-dup은
+        제목이 완전히 같다는 보장이 없어 판정 방향에 따라 결과가 갈릴 수 있다.
+        """
+        common = ["대법관", "후임", "인사", "검증", "절차", "마무리",
+                  "국회", "동의", "표결", "예정", "정부", "발표",
+                  "일정", "조율", "단계", "완료", "확정", "공식"]
+        title_a = " ".join(["김문관", "김정중"] + common)   # 양쪽 anchor가 인접
+        title_b = " ".join(["김문관", "제청"] + common)     # '김정중' 없음
+        return (
+            self._ranked_with_articles("김문관", 0.9, [_article(title_a, "https://a.example.com/1")]),
+            self._ranked_with_articles("김정중", 0.6, [_article(title_b, "https://b.example.com/1")]),
+        )
+
+    def test_is_same_issue_symmetric_for_asymmetric_near_dup_titles(self):
+        # 판정이 호출 방향에 의존하면 dedupe_and_merge가 score 순서로 호출하므로
+        # 순위 변동만으로 병합 여부가 달라진다(중복 노출 회귀).
+        item_a, item_b = self._asymmetric_near_dup_pair()
+        self.assertEqual(
+            ranker._is_same_issue(item_a, item_b),
+            ranker._is_same_issue(item_b, item_a),
+        )
+
+    def test_merge_result_independent_of_input_order_for_near_dup(self):
+        item_a, item_b = self._asymmetric_near_dup_pair()
+        forward = ranker.dedupe_and_merge([dict(item_a), dict(item_b)])
+        # score를 뒤집어 호출 순서가 반대가 되어도 그룹 수는 같아야 한다.
+        flipped_a = dict(item_b, score=0.9)
+        flipped_b = dict(item_a, score=0.6)
+        backward = ranker.dedupe_and_merge([flipped_a, flipped_b])
+        self.assertEqual(len(forward), len(backward))
+
+    def test_near_duplicate_applies_to_articles_without_url(self):
+        # URL 결측이 merge 우회 통로가 되지 않는다(fail-closed).
+        title = "이흥구 대법관 후임 후보에 김문관 김성수 김예영 김정중 4인 압축"
+        ev_a = [{"title": title, "url": None}]
+        ev_b = [{"title": title, "url": ""}]
+        shared_a, shared_b, rest_a, rest_b = ranker._split_shared_evidence(ev_a, ev_b)
+        self.assertEqual(shared_a, ev_a)
+        self.assertEqual(shared_b, ev_b)
+        self.assertEqual(rest_a, [])
+        self.assertEqual(rest_b, [])
 
     def test_merge_still_absorbs_duplicates_no_forced_unmerge(self):
         # 12개 후보가 8개 사건이면 정확히 8그룹 — 중복을 풀어 10개로 억지 확장하지 않음.
