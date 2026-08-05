@@ -581,3 +581,85 @@ record 738건(logger명·레벨·메시지·순서) byte-identical + 교차 chec
 `_representative_overlap`+white-box 테스트 정리), displayed-article 파생 6곳 통합,
 grounding fail-closed drop의 reason_code 오귀속(DISPLAY_ARTICLE_INCONSISTENT) 정확도,
 tests 공용 fixture factory, contextual alias 병합 로직 2곳 통합.
+
+## 15. 신디케이트 roundup bridge 차단 — §13 알려진 한계 1번 해소 (2026-08-05)
+
+### 문제 (운영 진단 데이터로 확정)
+
+- 증상: 2026-08-05 09:48 KST 화면 7개 노출(run `8a0a91ec`, news_top_only, status=success,
+  candidate 30, selected 7, error/skip 없음, 진단 `classification_invariant_ok=true`).
+- 퍼널: 품질 게이트 통과 15 → `MERGED_INTO_OTHER` 5(전부 '김우빈 기프트 출연' 1그룹) →
+  독립 이슈 10 → `DISPLAY_ARTICLE_INCONSISTENT` 3 → **selected 7**. `RANK_CUTOFF=0`,
+  `NO_REPRESENTATIVE=0` — 순위 컷·late drop·backfill 부재·저장 손실 전부 아님.
+- 오병합 확증: 승자의 기사 8건은 전부 김우빈/기프트 기사이고 흡수된 4개 키워드
+  (하춘화/송영규 사망/이수연 가수/김서연 배우) 관련 기사는 0건. 흡수된 키워드는 다른
+  실행에서 독립 선정된다(48h 기준 태풍 돌핀 경로 61회·김서연 배우 27회·최애의 사원 30회).
+- 48h 전수(98 success run / 3,150 decisions, 전부 `628b7b0`): selected 10개 89회 / 미달 9회.
+  **미달 run의 최대 merge group 평균 16.7 vs 정상 3.5**(단조 상관). 최악은 '유하진'
+  (강균성 결혼 기사 8건뿐)이 25개 후보 흡수 — 형소법·필라델피아 필리스·태풍 돌핀·
+  세제개편안·화암동굴 등 완전 무관 사건 포함.
+- 기전: PR #17이 막은 것은 **공유 URL** roundup bridge였다. 같은 roundup이 제휴/전재로
+  **다른 URL**을 달고 양쪽 검색결과에 잡히면 URL 교집합이 비어 `_is_same_issue`의
+  `if not shared_urls` 조기 반환으로 **PR #17 가드가 통째로 우회**되고, 기존 경로의 첫
+  신호인 pairwise Jaccard가 1.0이 되어 즉시 병합됐다. `dedupe_and_merge`의 transitive
+  fixed-point가 이를 증폭한다(재현: 독립 4개 이슈 → 2그룹).
+
+### 수정 (news/ranker.py — 공유 근거의 "정의"만 확장, 분기 로직 불변)
+
+`_is_same_issue`가 쓰는 공유 근거를 URL 교집합이 아니라 `_split_shared_evidence`로 구한다.
+
+- 공유 근거 = 같은 URL **또는** 서로 다른 URL로 신디케이트된 사실상 동일 기사.
+- near-dup 판정(`_is_near_duplicate_title`)은 **title only**, Jaccard ≥
+  `_NEAR_DUPLICATE_TITLE_JACCARD = 0.9`, 양쪽 제목 토큰 ≥
+  `_NEAR_DUPLICATE_MIN_TITLE_TOKENS = 5`. 운영 진단 스냅샷에 snippet이 없어 임계값 근거를
+  title로만 측정할 수 있어 측정 필드와 판정 필드를 일치시켰다(기존 merge 신호인
+  `_pairwise_evidence_overlap`의 title+snippet Jaccard는 미변경).
+- **set-membership** 판정("상대편에 하나라도 공유 대응이 있으면 shared") — 기사쌍을
+  소비하는 matching이 아니라 대칭이고 fixed-point 순서 의존이 없다.
+- subset / 양쪽 잔여 분기의 판정 로직은 바꾸지 않았다. 동일 coverage 분기만 grounding
+  근거를 `shared_a` **또는** `shared_b`로 확장했다 — 공유 URL 시절엔 양쪽 공유 기사가
+  같은 기사라 어느 쪽을 봐도 동일했지만, near-dup은 제목이 완전히 같다는 보장이 없어
+  한쪽에만 상대 anchor가 있으면 `_is_same_issue(a,b) != _is_same_issue(b,a)`가 된다.
+  `dedupe_and_merge`가 score 순서로 호출하므로 순위 변동만으로 병합 여부가 흔들린다
+  (Codex diff 리뷰 P2, 재현 확인). 대칭성 복구를 위한 최소 확장이다.
+- near-dup이 0건이면 분할 결과가 기존 URL 기준과 집합 동등 → 공유 URL 경로 보존.
+- threshold/score 가중치/ranking/게이트/reason_code/로그 문자열 변경 없음. 신규 상수 2개뿐.
+
+### 임계값 근거
+
+- 48h co-selected 4,252쌍의 기사쌍 최대 title Jaccard: p50 0.000 / p90 0.053 / p95 0.062 /
+  **p99 0.083** → 서로 다른 이슈는 0.9 근처에 오지 않는다.
+- 0.85/0.9/0.95/1.0 어디로 잡아도 co-selected 판정 변화 동일 → 0.9는 안정 구간.
+- 제목 토큰 수 분포(5,649건): mean 8.2 / p5 6 / 5토큰 미만 1.3%. 실제 cross-URL near-dup
+  히트 8건은 전부 8~9토큰이라 최소 토큰 guard가 정상 신디케이트 탐지를 깎지 않는다.
+
+### 검증
+
+- 전체 테스트 582개 통과(baseline 572 + 신규 10).
+- 운영형 differential replay(base `628b7b0` vs after, 동일 입력):
+  co-selected **4,252쌍 판정 변화 0건**, 98 run merge group 재구성 **변화 0건**
+  (group 수 합계 960 = 960) — 기존 정상 후보의 근거 없는 탈락·신규 위험 후보 0.
+- 09:48 재구성 replay: 독립 이슈 **1개 → 5개**(오병합 4건 해소). 분리된 후보도 기존
+  하위 게이트(no_rep/display/grounding/crime/comparison)를 그대로 통과해야 노출된다.
+- 성능: 최대 후보 규모 `dedupe_and_merge` 4.5ms/call.
+
+### 알려진 한계·trade-off (후속 관찰)
+
+- 동일 coverage 분기가 `shared_a or shared_b`를 쓰므로, near-dup pair 중 **한쪽 제목에만**
+  양쪽 anchor가 span 이내로 들어있는 경우 병합이 허용된다(대칭성 확보의 대가). 이는 아래
+  §13 한계 2번(인접 구획 roundup) 범위 안에 있다.
+- **의도된 trade-off**: 이번 변경은 PR #17의 shared-evidence 정책을 different-URL near-dup
+  경로에도 **일관 적용**한다. 그 결과 "진짜 동일 사건이 다른 URL로 전재됐고 두 keyword의
+  anchor 합집합이 span 6토큰을 초과하는" pair는 병합되지 않고 분리된다(화면 중복 가능).
+  이는 공유 URL 경로에서 PR #17이 이미 채택한 것과 **동일한** trade-off이며 새로운 종류의
+  손실이 아니다. 운영 데이터상 위험은 낮게 관측된다(co-selected 판정 변화 0건).
+- §13 알려진 한계 2번(동일 coverage에서 두 사건 구획이 span 6토큰 이내로 인접한 roundup은
+  병합될 수 있음)은 그대로 유지되며, 이제 near-dup URL 경로에도 동일하게 적용된다.
+- 5토큰 이상이어도 `속보 대통령 회의 결과 발표`류 generic 제목이 우연히 일치할 잔여
+  위험은 남는다(현재 운영 데이터에서는 미관측).
+- 관찰 로그 `same-issue bridge 보류 N쌍`은 **공유 URL bridge 보류만** 센다
+  (`_shared_evidence_urls`는 URL 기준 유지 — 로그 의미 보존). near-dup 보류는 이 카운터에
+  잡히지 않는다. 별도 카운터 추가는 후속 후보.
+- 운영 확인 지표(다음 정기 실행 이후): `selected_count` 10개 충족률, per-run
+  `MERGED_INTO_OTHER` 수와 **최대 merge group 크기**(미달 상관 지표), co-selected 쌍의
+  화면 중복 proxy.

@@ -50,6 +50,18 @@ MERGE_ARTICLE_OVERLAP_THRESHOLD = 0.5
 # 보완한다. "겹치는 사건 토큰 최소 개수" + "keyword anchor 교차 등장" 조건을 모두 만족해야
 # merge 근거로 인정한다(일반 서술어 1~2개 겹침으로 오탐 병합되는 것을 막기 위함).
 REPRESENTATIVE_OVERLAP_MIN_SHARED_TOKENS = 2
+# 서로 다른 URL로 신디케이트된 "사실상 동일한 기사"를 공유 근거로 인정하는 기준
+# (2026-08-05 운영 진단). PR #17이 차단한 roundup bridge는 공유 URL 경로만 막았는데,
+# 같은 roundup이 제휴/전재로 다른 URL을 달고 양쪽 검색결과에 잡히면 URL 교집합이 비어
+# PR #17 가드가 통째로 우회됐다(_is_same_issue의 `if not shared_urls` 조기 반환).
+# 판정은 **title only** — 운영 진단 스냅샷에 snippet이 없어 임계값 근거를 title로만
+# 측정할 수 있고, 측정 필드와 판정 필드를 일치시켜야 기준이 흔들리지 않는다.
+# (기존 merge 신호인 _pairwise_evidence_overlap의 title+snippet Jaccard는 건드리지 않음.)
+_NEAR_DUPLICATE_TITLE_JACCARD = 0.9
+# 짧은 제목("속보"/"오늘 날씨"류)이 우연히 일치해 공유 근거로 승격되는 것을 막는 하한.
+# 운영 48h 기사 제목 5,649건 토큰수 mean 8.2 / p5 6 / 5토큰 미만 1.3%, 실제 cross-URL
+# near-dup 히트 8건은 전부 8~9토큰이라 정상 신디케이트 탐지를 깎지 않는다.
+_NEAR_DUPLICATE_MIN_TITLE_TOKENS = 5
 DISPLAY_KEYWORD_MAX_LEN = 18
 
 # 최상위 4축 가중치 (사용자 확정 2026-07-04)
@@ -745,6 +757,78 @@ def _merge_anchor_tokens(item: Dict) -> set:
     return _keyword_anchor_tokens(item) - _SEARCH_INTENT_SUFFIXES - _all_display_generic()
 
 
+def _title_tokens_of(article: Dict) -> set:
+    """near-duplicate 판정 전용 title 토큰 집합(snippet 미포함 — 상수 주석 참고)."""
+    from news.summarizer import _tokens
+
+    return set(_tokens(article.get("title", "") or ""))
+
+
+def _is_near_duplicate_title(tokens_a: set, tokens_b: set) -> bool:
+    """두 기사 제목이 "사실상 같은 기사"(제휴/전재 신디케이션)인지 판정.
+
+    양쪽 다 최소 토큰 수를 넘고 Jaccard가 임계값 이상일 때만 참. 짧은 제목은
+    우연 일치 위험이 커서 하한(_NEAR_DUPLICATE_MIN_TITLE_TOKENS)으로 차단한다.
+    """
+    if (
+        len(tokens_a) < _NEAR_DUPLICATE_MIN_TITLE_TOKENS
+        or len(tokens_b) < _NEAR_DUPLICATE_MIN_TITLE_TOKENS
+    ):
+        return False
+    union = tokens_a | tokens_b
+    if not union:
+        return False
+    return len(tokens_a & tokens_b) / len(union) >= _NEAR_DUPLICATE_TITLE_JACCARD
+
+
+def _split_shared_evidence(ev_a: List[Dict], ev_b: List[Dict]) -> tuple:
+    """두 근거 리스트를 (공유 근거, 잔여 근거)로 가른다.
+
+    "공유 근거" = 같은 URL이거나, 서로 다른 URL로 신디케이트된 사실상 동일 기사
+    (`_is_near_duplicate_title`). PR #17은 공유 URL만 공유 근거로 봤는데, 같은 roundup이
+    다른 URL을 달면 URL 교집합이 비어 가드가 통째로 우회됐다(2026-08-05 진단).
+
+    **set-membership 판정**이다 — "상대편에 하나라도 공유 대응이 있으면 shared". 기사쌍을
+    소비하는 bipartite matching이 아니므로 대칭이고, dedupe_and_merge의 fixed-point에서
+    순서 의존이 생기지 않는다.
+
+    near-dup 판정은 URL 유무를 요구하지 않는다 — URL이 없거나 빈 기사도 제목이 사실상
+    동일하면 같은 근거로 본다(URL 결측을 merge 우회 통로로 두지 않는 fail-closed 방향).
+
+    near-dup이 0건이면 결과는 기존 URL 기준 분할과 **집합 동등**하다(공유 URL 경로 보존).
+    반환: (shared_a, shared_b, rest_a, rest_b) — 각 리스트의 원소 순서는 입력 순서 유지.
+    """
+    urls_a = {a.get("url") for a in ev_a if a.get("url")}
+    urls_b = {b.get("url") for b in ev_b if b.get("url")}
+    shared_urls = urls_a & urls_b
+
+    # title 토큰은 리스트당 1회만 계산해 재사용(fixed-point 반복 호출 대비).
+    toks_a = [_title_tokens_of(a) for a in ev_a]
+    toks_b = [_title_tokens_of(b) for b in ev_b]
+
+    shared_a, rest_a = [], []
+    for i, a in enumerate(ev_a):
+        url = a.get("url")
+        if (url and url in shared_urls) or any(
+            _is_near_duplicate_title(toks_a[i], tb) for tb in toks_b
+        ):
+            shared_a.append(a)
+        else:
+            rest_a.append(a)
+
+    shared_b, rest_b = [], []
+    for j, b in enumerate(ev_b):
+        url = b.get("url")
+        if (url and url in shared_urls) or any(
+            _is_near_duplicate_title(toks_b[j], ta) for ta in toks_a
+        ):
+            shared_b.append(b)
+        else:
+            rest_b.append(b)
+
+    return shared_a, shared_b, rest_a, rest_b
+
+
 def _pairwise_evidence_overlap(relevant_a: List[Dict], relevant_b: List[Dict]) -> float:
     """이미 evidence 필터를 통과한 두 기사 리스트의 overlap(_article_overlap과 동일 계약).
 
@@ -842,8 +926,15 @@ def _is_same_issue(item_a: Dict, item_b: Dict) -> bool:
     Top10 미달(underfill)의 지배적 원인이었다(48h 27회 미달 실행 전수에서 RANK_CUTOFF=0,
     gate 통과 17~38개가 merge 후 5~12개로 붕괴).
 
-    판정 규칙(공유 URL 유무로 분기 — 공유 없음 경로는 기존과 완전 동일):
-    - 공유 URL 없음: 기존 신호 그대로(_same_issue_evidence_signals에 전체 근거 전달).
+    2026-08-05 확장: "공유 근거"를 공유 URL만이 아니라 **서로 다른 URL로 신디케이트된
+    사실상 동일 기사**(_split_shared_evidence)까지로 넓혔다. 같은 roundup이 제휴/전재로
+    다른 URL을 달면 URL 교집합이 비어 위 가드가 통째로 우회되고, 기존 경로의 첫 신호인
+    pairwise Jaccard가 1.0이 되어 서로 다른 사건이 즉시 병합됐다(48h 미달 9회 전수에서
+    RANK_CUTOFF=0 · 최대 merge group 16.7 vs 정상 3.5). 분기 판정 로직 자체는 그대로이고
+    바뀐 것은 무엇을 공유 근거로 볼지의 정의뿐이다.
+
+    판정 규칙(공유 근거 유무로 분기 — 공유 없음 경로는 기존과 완전 동일):
+    - 공유 근거 없음: 기존 신호 그대로(_same_issue_evidence_signals에 전체 근거 전달).
     - 양쪽 근거가 전부 공유(동일 coverage): 문자열 유사 키워드거나, 두 keyword의
       merge anchor 합집합이 공유 기사 한 필드 안에 span 제한으로 grounding될 때만 merge.
     - 한쪽 근거만 전부 공유(subset): 문자열 유사 키워드거나, subset 쪽 merge anchor가
@@ -855,15 +946,11 @@ def _is_same_issue(item_a: Dict, item_b: Dict) -> bool:
     """
     ev_a = _evidence_articles_of(item_a)
     ev_b = _evidence_articles_of(item_b)
-    urls_a = {a.get("url") for a in ev_a if a.get("url")}
-    urls_b = {b.get("url") for b in ev_b if b.get("url")}
-    shared_urls = urls_a & urls_b
+    shared_a, shared_b, rest_a, rest_b = _split_shared_evidence(ev_a, ev_b)
 
-    if not shared_urls:
+    if not shared_a and not shared_b:
         return _same_issue_evidence_signals(item_a, item_b, ev_a, ev_b)
 
-    rest_a = [a for a in ev_a if a.get("url") not in shared_urls]
-    rest_b = [b for b in ev_b if b.get("url") not in shared_urls]
     kw_a = item_a.get("keyword", "")
     kw_b = item_b.get("keyword", "")
 
@@ -882,8 +969,14 @@ def _is_same_issue(item_a: Dict, item_b: Dict) -> bool:
         # 한 필드의 근접 span 안에 함께 grounding돼야 하므로, 단독 일반 토큰만으로
         # 자명 통과하는 subset류 우회와는 위험 구조가 다르다. 합집합 공집합은 거짓.
         anchor_union = _keyword_anchor_tokens(item_a) | _keyword_anchor_tokens(item_b)
-        shared_articles = [a for a in ev_a if a.get("url") in shared_urls]
-        return _anchor_grounded_in_articles(anchor_union, shared_articles)
+        # 공유 URL이던 시절엔 shared_a와 shared_b가 같은 기사라 어느 쪽을 봐도 동일했지만,
+        # near-dup은 제목이 완전히 같다는 보장이 없어 한쪽에만 상대 anchor가 있을 수 있다.
+        # 그때 shared_a만 보면 _is_same_issue(a,b) != _is_same_issue(b,a)가 되고,
+        # dedupe_and_merge가 score 순서로 호출하므로 순위에 따라 병합 여부가 흔들린다.
+        # 양쪽 공유 근거를 모두 근거로 인정해 판정을 대칭으로 유지한다(Codex diff 리뷰 P2).
+        return _anchor_grounded_in_articles(
+            anchor_union, shared_a
+        ) or _anchor_grounded_in_articles(anchor_union, shared_b)
 
     if not rest_a or not rest_b:
         # 한쪽만 전부 공유(subset). subset 쪽이 상대의 "자체 보도"에 실제로 등장해야
