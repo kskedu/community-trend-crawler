@@ -20,6 +20,38 @@ logger = logging.getLogger(__name__)
 SNIPPET_MAX = 150
 _TAG_RE = re.compile(r"<[^>]+>")
 
+# 검색/랭킹의 주제 근거가 될 수 없는 기사 섹션·편집 라벨. 원문 title은 그대로
+# 보존하고, relevance/phrase/grounding 판정용 view에서 선두 대괄호 prefix만 제거한다.
+# 작은 의미 범주 집합으로 한정해 고유 주체(`[삼성전자]`)를 지우지 않는다.
+GENERIC_NEWS_SECTION_LABELS = frozenset({
+    "날씨", "뉴스", "경제", "정치", "사회", "스포츠", "연예",
+})
+_TITLE_FORMAT_PREFIX_WORDS = frozenset({
+    "속보", "단독", "종합", "포토", "영상", "굿모닝", "오늘의",
+})
+_LEADING_BRACKET_PREFIX_RE = re.compile(r"^\s*\[([^\[\]]{1,30})\]\s*")
+_PREFIX_TOKEN_RE = re.compile(r"[가-힣A-Za-z0-9]+")
+
+
+def title_evidence_text(title: Optional[str]) -> str:
+    """Return a title view with leading section/format bracket labels removed.
+
+    Only recognized category/format-only prefixes are stripped, repeatedly. The
+    stored/displayed original title is never mutated. Unknown bracketed subjects
+    remain evidence.
+    """
+    evidence = title or ""
+    while True:
+        match = _LEADING_BRACKET_PREFIX_RE.match(evidence)
+        if not match:
+            break
+        tokens = [t.lower() for t in _PREFIX_TOKEN_RE.findall(match.group(1))]
+        allowed = GENERIC_NEWS_SECTION_LABELS | _TITLE_FORMAT_PREFIX_WORDS
+        if not tokens or not all(t in allowed for t in tokens):
+            break
+        evidence = evidence[match.end():]
+    return evidence.strip()
+
 # === description hygiene (이미지 캡션/사진 설명/출처 문구 정제, 2026-07-04) ===============
 # 문제: Naver News description에 "com AI로 생성된 이미지 [사진=챗GPT] 1년 넘게..."처럼
 # 이미지 캡션/사진 설명 문구가 섞여 키워드 소개글(representative_summary)에 그대로

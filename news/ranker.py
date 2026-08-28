@@ -28,6 +28,7 @@ import logging
 from typing import Callable, Dict, List, Optional
 
 from news.candidates import _INDEPENDENT_SEARCH_FAMILIES
+from news.normalizer import GENERIC_NEWS_SECTION_LABELS, title_evidence_text
 
 logger = logging.getLogger(__name__)
 
@@ -1069,7 +1070,7 @@ _DISPLAY_GENERIC_WORDS = {
     # fallback된다("조사"와 동일 메커니즘). "발표"는 _GENERIC_EVENT_PREDICATE_WORDS에
     # 이미 있어 중복 추가하지 않는다.
     "투자", "사업", "계획", "추진", "확대", "지원", "협력", "체결", "공급", "운영",
-}
+} | set(GENERIC_NEWS_SECTION_LABELS)
 
 
 def _all_display_generic() -> set:
@@ -1230,6 +1231,10 @@ def _is_generic_only_display(keyword: str) -> bool:
     """
     from news.summarizer import _tokens
 
+    # summarizer._tokens는 요약용 stopword인 "뉴스"를 제거한다. display 품질 판정은
+    # 그보다 앞선 의미 계약이므로 exact generic label을 먼저 확인해 빈 토큰 우회를 막는다.
+    if (keyword or "").strip() in _all_display_generic():
+        return True
     toks = set(_tokens(keyword or ""))
     if not toks:
         return False
@@ -2238,7 +2243,7 @@ def _displayed_article_units(articles: List[Dict]) -> List[tuple]:
     displayed = _displayed_articles(articles)
     units = []
     for a in displayed:
-        text = f"{a.get('title', '')} {a.get('snippet', '')}"
+        text = f"{title_evidence_text(a.get('title', ''))} {a.get('snippet', '')}"
         units.append((set(_tokens(text)), text))
     return units
 
