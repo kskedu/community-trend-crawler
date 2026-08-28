@@ -18,7 +18,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional
 
-from news.normalizer import normalize_article, PRESS_UNKNOWN
+from news.normalizer import normalize_article, PRESS_UNKNOWN, title_evidence_text
 from news.summarizer import _tokens, summarize  # 기존 토크나이저/요약 로직 재사용(신규 의존성 없음)
 
 logger = logging.getLogger(__name__)
@@ -333,7 +333,9 @@ def compute_article_relevance(keyword: str, article: Dict, require_all_tokens: b
     quality gate를 통과할 수 있다. True면 keyword의 모든 토큰이 존재해야 등장으로
     인정한다(기존 seed/aux 후보는 기본값 False — 동작 불변).
     """
-    title = article.get("title") or ""
+    # 대괄호 section/format prefix는 검색 결과의 편집 메타데이터이지 기사 주제가
+    # 아니다. 원본 title은 보존하고 relevance 판정에만 정제 view를 쓴다.
+    title = title_evidence_text(article.get("title"))
     snippet = article.get("snippet") or ""
 
     _matcher = _has_all_keyword_tokens if require_all_tokens else _has_keyword_token
@@ -1676,7 +1678,7 @@ def derive_aux_keywords(
             art = normalize_article(raw)
             if not art:
                 continue
-            for tok in set(_tokens(art.get("title", ""))):
+            for tok in set(_tokens(title_evidence_text(art.get("title", "")))):
                 if len(tok) >= 2 and _norm_key(tok) not in seed_kws:
                     freq[tok] = freq.get(tok, 0) + 1
     # 2회 이상 등장한 토큰만 후보로(노이즈 억제)
@@ -2052,7 +2054,7 @@ def derive_phrase_candidates(
 
     df: Dict[str, set] = {}
     for key, a in source_articles.items():
-        title = a.get("title") or ""
+        title = title_evidence_text(a.get("title"))
         if any(m in title for m in _INCIDENTAL_MARKERS_STRONG):
             continue
         toks = _tokens(title)
