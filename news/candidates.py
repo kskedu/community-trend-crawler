@@ -1720,24 +1720,6 @@ def compute_news_signal(keyword: str, raw_items: List[dict], require_all_tokens:
     if not normalized:
         return None
 
-    domains = set()
-    recent_count = 0
-    ages = []
-    for a in normalized:
-        url = a.get("url") or ""
-        try:
-            from urllib.parse import urlparse
-            host = urlparse(url).netloc.lower()
-            if host:
-                domains.add(host)
-        except Exception:
-            pass
-        age = _age_hours(a.get("published_at"))
-        if age is not None:
-            ages.append(age)
-            if age <= RECENT_HOURS:
-                recent_count += 1
-
     # relevance 산출(개선4/5) → articles는 relevance 내림차순으로 재배열됨
     scored_articles = score_articles_relevance(keyword, normalized, require_all_tokens=require_all_tokens)
 
@@ -1849,6 +1831,34 @@ def compute_news_signal(keyword: str, raw_items: List[dict], require_all_tokens:
             # 것을 막는 핵심 경로). comparison 신호가 아니라 단순 롤백 케이스는 위 if로 보존.
             scored_articles = refined
     keyword_kind_effective = keyword_kind
+
+    # ── evidence volume 신호(recent_count/domain_diversity/latest_age_hours)는 entity-role
+    #    정제가 끝난 **canonical evidence set**(scored_articles) 기준으로 센다(2026-09).
+    #    이 세 값을 정제 이전 raw `normalized` 로 세던 것이 랭킹 계약 drift 였다:
+    #    정제로 evidence 에서 빠진 오염 기사(keyword 가 사건 주체가 아닌 side-mention 등)가
+    #    ranker 의 news 축(recent_count 0.60 + domain_diversity 0.20 = 축의 80%)에는 계속
+    #    가산돼, 실제 근거 3건짜리 키워드가 근거 8건짜리와 같은 news 점수를 받았다.
+    #    (2026-09-01 11:19 운영 run: "이현균" refined 3건인데 rc/dd 는 raw 기준으로 집계 →
+    #     news 축 0.78, 최종 0.8252, rank 4.)
+    #    정제를 건너뛰는 event/unknown 키워드는 scored_articles == normalized 라 값이 그대로다
+    #    (회귀 없음). 정제가 전부 non_subject 라 롤백된 경우도 동일하다.
+    domains = set()
+    recent_count = 0
+    ages = []
+    for a in scored_articles:
+        url = a.get("url") or ""
+        try:
+            from urllib.parse import urlparse
+            host = urlparse(url).netloc.lower()
+            if host:
+                domains.add(host)
+        except Exception:
+            pass
+        age = _age_hours(a.get("published_at"))
+        if age is not None:
+            ages.append(age)
+            if age <= RECENT_HOURS:
+                recent_count += 1
 
     # clustering(개선2) → primary cluster 기준 representative 선택
     clusters = cluster_articles(scored_articles)
