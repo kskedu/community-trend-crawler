@@ -917,6 +917,72 @@ def _anchor_grounded_in_articles(anchors: set, articles: List[Dict]) -> bool:
     return _combo_span_grounded(anchors, articles)
 
 
+# 비공유 근거 경로에서 merge bridge 로 인정할 최소 "교차 근거 기사 수".
+# 1이면 다중 사건 나열(roundup) 기사 **한 건**만으로 서로 다른 이슈가 붙는다
+# (2026-09-03 06:48 운영 사례: 정몽규 그룹이 지예은/카사마츠/뉴욕증시 등 10개
+# 무관 이슈를 흡수해 selected 7). 같은 사건이라면 양쪽 검색이 각자 복수의 독립
+# 보도를 확보하므로 2건 이상 교차한다 — 운영 06:48 선정 7건의 상호 최대 Jaccard 는
+# 0.000~0.077 로 이 조건과 무관하고, 실제 동일 이슈 pair 는 2/2·2/3 로 통과한다.
+_MERGE_MIN_CROSS_EVIDENCE_ARTICLES = 2
+
+
+def _cross_evidence_support(item_self: Dict, item_other: Dict, articles: List[Dict]):
+    """상대 keyword 의 merge anchor 가 등장하는 내 근거 기사 수. anchor 가 없으면 None.
+
+    "이 merge 를 뒷받침하는 내 기사가 몇 건인가"를 센다. roundup 한 건만 상대 사건을
+    언급하고 나머지 기사는 전부 다른 사건이면 1이 되고, 진짜 같은 사건이면 내 보도
+    다수에 상대 anchor 가 반복 등장한다.
+
+    None 은 "지지 0건"과 다르다 — 상대 keyword 가 전부 일반어라 anchor 집합이 비면
+    (예: "신임") 이 신호 자체를 관측할 수 없다는 뜻이다. 관측 불가를 0으로 접으면
+    근거 없이 merge 를 막게 되므로 호출부에서 구분해 판정을 보류한다.
+    """
+    anchors = _merge_anchor_tokens(item_other)
+    if not anchors:
+        return None
+    return sum(1 for a in articles if anchors & set(_tokens_of(a)))
+
+
+def _has_multi_article_cross_evidence(
+    item_a: Dict, item_b: Dict, ev_a: List[Dict], ev_b: List[Dict]
+) -> bool:
+    """양쪽 모두 단 1건의 기사로만 교차 연결되는(=roundup bridge 의심) pair 인지 판정.
+
+    참이면 교차 근거가 충분하다는 뜻이라 기존 판정을 그대로 살린다. 거짓이면 양쪽 다
+    지지 기사가 1건 이하 — 서로 다른 사건을 나열한 기사 한 건이 유일한 접점이므로
+    merge 하지 않는다. 근거가 원래 1건뿐인 keyword(singleton)는 이 조건을 만족시킬
+    수 없으므로 판정 대상에서 제외한다(기존 동작 보존 — 여기서 막으면 정상 소규모
+    이슈까지 못 붙는다).
+
+    **의도적 fail-closed trade-off(known risk).** 진짜 같은 사건이라도 양쪽 근거가
+    2건뿐이고 접점이 1:1 이면 분리될 수 있다. 두 방향의 비용이 대칭이 아니라서 이쪽을
+    택했다 — false merge 는 나열 기사 한 건이 transitive 연쇄로 10개 이슈를 한 그룹에
+    접어 Top10 을 7개로 붕괴시키지만(2026-09-03 06:48, run 4912ac60), 과분리는 같은
+    사건이 두 줄로 보이는 데 그치고 근거가 조금만 두터워지면(support >= 2) 사라진다.
+
+    이 분리가 운영에서 실제 문제로 관측되더라도 **_MERGE_MIN_CROSS_EVIDENCE_ARTICLES
+    를 낮추지 말 것** — 그건 06:48 붕괴를 그대로 되돌린다. 대신 near-dup 탐지(공유 근거
+    승격) 쪽을 개선해 가드를 우회하지 않고 정상 경로로 merge 시켜야 한다.
+    회귀 고정: tests/test_news_ranking.py::test_sparse_same_event_split_is_the_accepted_tradeoff
+    """
+    if len(ev_a) < _MERGE_MIN_CROSS_EVIDENCE_ARTICLES or len(ev_b) < _MERGE_MIN_CROSS_EVIDENCE_ARTICLES:
+        return True
+    support_a = _cross_evidence_support(item_a, item_b, ev_a)
+    support_b = _cross_evidence_support(item_b, item_a, ev_b)
+    observed = [s for s in (support_a, support_b) if s is not None]
+    if not observed:
+        # 양쪽 다 anchor 가 비어 신호를 관측할 수 없다 — 기존 판정에 맡긴다(fail-open).
+        return True
+    return max(observed) >= _MERGE_MIN_CROSS_EVIDENCE_ARTICLES
+
+
+# roundup bridge 로 의심할 기사쌍 유사도의 상한(미만). 이 값 이상이면 "부분적으로 겹치는
+# 나열 기사"가 아니라 사실상 같은 보도라 교차 근거 가드를 적용하지 않는다. near-dup
+# 임계(_NEAR_DUPLICATE_TITLE_JACCARD)는 title only 로 재는 반면 여기 overlap 은
+# title+snippet 이라 같은 값을 공유하지 않고 별도 상수로 둔다.
+_MERGE_BRIDGE_SUSPECT_MAX_OVERLAP = 1.0
+
+
 def _is_same_issue(item_a: Dict, item_b: Dict) -> bool:
     """same-issue merge 판정: 공유 URL 근거는 비공유(잔여) 근거의 교차 확인을 요구한다.
 
@@ -950,6 +1016,19 @@ def _is_same_issue(item_a: Dict, item_b: Dict) -> bool:
     shared_a, shared_b, rest_a, rest_b = _split_shared_evidence(ev_a, ev_b)
 
     if not shared_a and not shared_b:
+        # 공유 근거가 전혀 없는데도 붙는 경로. 여기서 merge 를 만드는 건
+        # _pairwise_evidence_overlap 의 "기사쌍 최대 Jaccard >= 0.5" 인데, 서로 다른
+        # URL 로 각자 작성된 다중 사건 나열(roundup) 기사끼리는 near-dup 임계(0.9)에
+        # 못 미쳐 공유 근거로 승격되지 않으면서 이 임계는 넘겨(운영 실측 0.667~0.750)
+        # 공유 근거 가드를 통째로 우회했다. 교차 근거가 양쪽 다 기사 1건뿐이면
+        # 같은 사건의 근거가 아니라 나열 기사 한 건이 유일한 접점이라는 뜻이다.
+        # 기사쌍이 사실상 동일(overlap 1.0)하면 나열 기사 bridge 가 아니라 같은 보도다 —
+        # 가드 대상에서 빼고 기존 판정을 그대로 쓴다.
+        if (
+            _pairwise_evidence_overlap(ev_a, ev_b) < _MERGE_BRIDGE_SUSPECT_MAX_OVERLAP
+            and not _has_multi_article_cross_evidence(item_a, item_b, ev_a, ev_b)
+        ):
+            return False
         return _same_issue_evidence_signals(item_a, item_b, ev_a, ev_b)
 
     kw_a = item_a.get("keyword", "")

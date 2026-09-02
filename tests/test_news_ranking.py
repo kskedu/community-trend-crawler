@@ -1228,6 +1228,228 @@ class TestSameIssueMerge(unittest.TestCase):
         merged = ranker.dedupe_and_merge(ranked)
         self.assertEqual(len(merged), 1)
 
+    # === cross-URL roundup bridge (2026-09-03 06:48 운영 underfill 근본 수정) ===
+    # PR #17/#19 는 "공유 근거"(같은 URL 또는 near-dup 제목)를 통한 bridge 만 막았다.
+    # 서로 다른 매체가 각자 작성한 다중 사건 나열 기사끼리는 제목 Jaccard 가 near-dup
+    # 임계(0.9)에 못 미쳐 공유 근거로 승격되지 않는 반면, merge 임계(0.5)는 넘겨
+    # (운영 실측 0.667~0.750) 공유 근거 가드를 통째로 우회했다.
+    # 06:48 run(4912ac60): gate 통과 36개가 merge 후 9개로 붕괴, 정몽규 그룹이
+    # 지예은 바타 결혼 / 카사마츠 쇼 한국어 / 뉴욕증시 반등 등 10개 무관 이슈를 흡수해
+    # selected 7. 흡수된 셋은 모두 인접 run 에서 계약 변경 없이 독립 선정된 이슈다
+    # (지예은 05:48·06:19 rank4, 카사마츠 05:48·06:19 rank6, 뉴욕증시 07:19 rank2).
+
+    def _cross_url_roundup_case(self):
+        """운영 06:48 재구성: 서로 다른 URL 의 나열 기사 + 각자의 독립 보도."""
+        jung = [
+            _article("정몽규 전 회장, 12시간 동안 경찰 조사받았다", "https://j.example.com/j1"),
+            _article("조사 마친 정몽규…12시간 만에 귀가", "https://j.example.com/j2"),
+        ]
+        roundup_j = _article(
+            "오늘의 연예 소식…정몽규 경찰 조사, 지예은 바타 결혼, 과즙세연 논란 정리",
+            "https://a.example.com/roundup")
+        ji = [
+            _article("지예은, 바타와 12월 결혼 발표", "https://z.example.com/z1"),
+            _article("지예은 결혼 소감 공개", "https://z.example.com/z2"),
+        ]
+        roundup_z = _article(
+            "연예 종합…지예은 바타 결혼, 정몽규 경찰 조사, 과즙세연 논란",
+            "https://b.example.com/roundup")
+        return jung, roundup_j, ji, roundup_z
+
+    def test_cross_url_roundup_does_not_merge_distinct_events(self):
+        # 06:48 핵심 회귀: 서로 다른 URL 의 나열 기사만 접점인 두 사건은 병합 금지.
+        jung, roundup_j, ji, roundup_z = self._cross_url_roundup_case()
+        ranked = [
+            self._ranked_with_articles("정몽규 경찰 조사", 0.9, jung + [roundup_j]),
+            self._ranked_with_articles("지예은 바타 결혼", 0.8, ji + [roundup_z]),
+        ]
+        merged = ranker.dedupe_and_merge(ranked)
+        self.assertEqual(len(merged), 2)
+
+    def test_cross_url_roundup_pair_is_below_near_duplicate_threshold(self):
+        # 이 회귀의 전제: 두 나열 기사는 near-dup(공유 근거)로 승격되지 **않는다**.
+        # 승격된다면 PR #17/#19 가드가 이미 잡았을 것이고 이 테스트는 무의미해진다.
+        _, roundup_j, _, roundup_z = self._cross_url_roundup_case()
+        toks_j = ranker._title_tokens_of(roundup_j)
+        toks_z = ranker._title_tokens_of(roundup_z)
+        self.assertFalse(ranker._is_near_duplicate_title(toks_j, toks_z))
+        jaccard = len(toks_j & toks_z) / len(toks_j | toks_z)
+        self.assertGreaterEqual(jaccard, ranker.MERGE_ARTICLE_OVERLAP_THRESHOLD)
+        self.assertLess(jaccard, ranker._NEAR_DUPLICATE_TITLE_JACCARD)
+
+    def test_cross_url_roundup_collapse_keeps_three_distinct_issues(self):
+        # 06:48 축소 재현: 나열 기사 한 건이 transitive 연쇄로 3개 이슈를 하나로
+        # 접는 것을 막는다(정몽규가 지예은·뉴욕증시를 흡수한 실제 패턴).
+        jung, roundup_j, ji, roundup_z = self._cross_url_roundup_case()
+        market = [
+            _article("뉴욕증시, 국채금리 하락에 반등 마감", "https://n.example.com/n1"),
+            _article("다우 0.8% 상승…뉴욕증시 반등", "https://n.example.com/n2"),
+            _article("아침 종합…뉴욕증시 반등, 정몽규 조사, 브로드컴 실적",
+                     "https://c.example.com/roundup"),
+        ]
+        ranked = [
+            self._ranked_with_articles("정몽규 경찰 조사", 0.9, jung + [roundup_j]),
+            self._ranked_with_articles("지예은 바타 결혼", 0.8, ji + [roundup_z]),
+            self._ranked_with_articles("뉴욕증시 반등", 0.7, market),
+        ]
+        merged = ranker.dedupe_and_merge(ranked)
+        self.assertEqual(len(merged), 3)
+
+    def test_true_pair_without_shared_url_still_merges(self):
+        # 반대 방향 보호: 공유 URL 이 없어도 **같은 사건**이면 양쪽 보도 다수에 상대
+        # anchor 가 반복 등장하므로 계속 병합된다(가드가 정상 merge 를 깎지 않는다).
+        ranked = [
+            self._ranked_with_articles("용혜인 남편 사무총장 임명", 0.9, [
+                _article("용혜인, 창당 3일 만 남편 사무총장 임명", "https://p.example.com/p1"),
+                _article("창당 사흘만에 남편 사무총장에…부부회의 모독 유감", "https://p.example.com/p2"),
+                _article("용혜인, 부부 둘이 참석한 회의서 남편 당 사무총장 임명",
+                         "https://p.example.com/p3"),
+            ]),
+            self._ranked_with_articles("용혜인", 0.8, [
+                _article("창당 때부터 용혜인 부부당… 둘만의 회의 뒤 남편 사무총장 됐다",
+                         "https://q.example.com/q1"),
+                _article("기본소득당, 용혜인 남편 논란에 당내 논의 거쳐 사무총장 임명",
+                         "https://q.example.com/q2"),
+            ]),
+        ]
+        merged = ranker.dedupe_and_merge(ranked)
+        self.assertEqual(len(merged), 1)
+
+    def test_single_evidence_keyword_merge_is_unchanged_by_guard(self):
+        # 근거가 1건뿐인 keyword 는 "복수 기사 교차" 조건을 원리상 만족할 수 없다.
+        # 가드가 여기까지 적용되면 정상 소규모 이슈의 중복 제거가 막히므로 제외한다.
+        shared = _article("공수처, 김영환 지사 사무실 압수수색", "https://s.example.com/only")
+        ranked = [
+            self._ranked_with_articles("김영환", 0.9, [shared]),
+            self._ranked_with_articles("공수처 압수수색", 0.8, [shared]),
+        ]
+        merged = ranker.dedupe_and_merge(ranked)
+        self.assertEqual(len(merged), 1)
+
+    def test_cross_evidence_guard_needs_only_one_side_corroborated(self):
+        # 교차 근거는 **한쪽만** 복수여도 통과한다(max 규칙). 같은 사건이라도 주력
+        # 키워드의 보도에는 부속 각도 이름이 한 번만 나오는 비대칭이 흔해서, 양쪽 모두
+        # (min 규칙) 요구하면 정상 pair 를 끊는다. roundup bridge 는 양쪽 다 1건이라
+        # 이 완화로도 여전히 차단된다.
+        big = self._ranked_with_articles("정몽규 경찰 조사", 0.9, [
+            _article("정몽규 전 회장, 12시간 동안 경찰 조사받았다", "https://j.example.com/j1"),
+            _article("조사 마친 정몽규…12시간 만에 귀가", "https://j.example.com/j2"),
+            _article("정몽규 조사에 홍명보 선임 의혹 광수대 수사", "https://j.example.com/j3"),
+        ])
+        small = self._ranked_with_articles("홍명보 선임 의혹", 0.8, [
+            _article("홍명보 선임 의혹, 정몽규 경찰 조사 12시간", "https://h.example.com/h1"),
+            _article("홍명보 감독 선임 개입 의혹 수사 확대…정몽규 조사", "https://h.example.com/h2"),
+        ])
+        ev_big = ranker._evidence_articles_of(big)
+        ev_small = ranker._evidence_articles_of(small)
+        # 비대칭 전제: 한쪽 1건, 다른 쪽 2건.
+        self.assertEqual(ranker._cross_evidence_support(big, small, ev_big), 1)
+        self.assertEqual(ranker._cross_evidence_support(small, big, ev_small), 2)
+        # max 규칙이므로 가드는 통과시킨다(min 규칙이면 여기서 끊긴다).
+        self.assertTrue(
+            ranker._has_multi_article_cross_evidence(big, small, ev_big, ev_small)
+        )
+
+    def test_sparse_same_event_split_is_the_accepted_tradeoff(self):
+        """이 계약의 known risk 를 **의도된 동작으로 고정**한다(fail-closed trade-off).
+
+        진짜 같은 사건이라도 양쪽 근거가 2건뿐이고 접점이 1:1 이면 분리된다.
+        이것은 버그가 아니라 선택이다 — 반대편(false merge)의 비용이 압도적으로 크기
+        때문이다: 나열 기사 한 건이 transitive 연쇄로 10개 이슈를 한 그룹으로 접어
+        Top10 이 7개로 붕괴한다(2026-09-03 06:48, run 4912ac60). 분리 쪽 비용은
+        같은 사건이 두 줄로 보이는 것뿐이고, 그마저 아래 test 처럼 근거가 조금만
+        두터워지면 사라진다.
+
+        **이 테스트가 실패하도록 임계를 다시 완화하지 말 것.** 완화는 06:48 붕괴를
+        그대로 되돌린다. 이 분리가 운영에서 실제 문제로 관측되면 임계를 낮추는 대신
+        near-dup 탐지(공유 근거 승격) 쪽을 개선해야 한다 — 그쪽은 가드를 우회하지
+        않고 정상 경로로 merge 시키는 방향이다.
+        """
+        a = self._ranked_with_articles("김포 공장 화재", 0.9, [
+            _article("김포 물류창고서 큰불…소방 대응 2단계 발령", "https://a.example.com/1"),
+            _article("김포 화재 진화 작업 계속", "https://a.example.com/2"),
+        ])
+        b = self._ranked_with_articles("소방 대응 2단계", 0.8, [
+            _article("김포 물류창고 불…소방 대응 2단계 상향", "https://b.example.com/1"),
+            _article("소방 대응 2단계란 무엇인가", "https://b.example.com/2"),
+        ])
+        ev_a = ranker._evidence_articles_of(a)
+        ev_b = ranker._evidence_articles_of(b)
+        # 전제: 공유 근거가 없고(near-dup 미만) 접점이 양쪽 1건씩이다.
+        shared_a, shared_b, _, _ = ranker._split_shared_evidence(ev_a, ev_b)
+        self.assertEqual((len(shared_a), len(shared_b)), (0, 0))
+        self.assertEqual(ranker._cross_evidence_support(a, b, ev_a), 1)
+        self.assertEqual(ranker._cross_evidence_support(b, a, ev_b), 1)
+        self.assertEqual(len(ranker.dedupe_and_merge([a, b])), 2)
+
+    def test_sparse_same_event_merges_once_evidence_is_slightly_denser(self):
+        # 위 trade-off 의 반대편 경계: 근거가 조금만 두터워져 상대 anchor 가 복수
+        # 기사에 등장하면(support >= 2) 같은 사건은 정상적으로 병합된다.
+        # 분리 위험이 좁은 구간에만 있다는 것을 고정한다.
+        a = self._ranked_with_articles("김포 공장 화재", 0.9, [
+            _article("김포 물류창고서 큰불…소방 대응 2단계 발령", "https://c.example.com/1"),
+            _article("김포 물류창고 화재 소방 대응 2단계 확대", "https://c.example.com/2"),
+        ])
+        b = self._ranked_with_articles("소방 대응 2단계", 0.8, [
+            _article("김포 물류창고 불…소방 대응 2단계 상향", "https://d.example.com/1"),
+            _article("김포 화재로 소방 대응 2단계 발령", "https://d.example.com/2"),
+        ])
+        ev_a = ranker._evidence_articles_of(a)
+        ev_b = ranker._evidence_articles_of(b)
+        self.assertGreaterEqual(ranker._cross_evidence_support(a, b, ev_a), 2)
+        self.assertEqual(len(ranker.dedupe_and_merge([a, b])), 1)
+
+    def test_guard_is_fail_open_when_both_anchors_are_empty(self):
+        # 양쪽 keyword 가 모두 일반어라 merge anchor 가 비면 이 신호 자체를 관측할 수
+        # 없다. "관측 불가"를 "지지 0건"으로 접으면 근거 없이 merge 를 막게 되므로
+        # 기존 판정에 맡긴다(fail-open). 관측 불가와 0 을 구분하지 않으면 generic
+        # keyword 의 정상 병합이 조용히 사라진다.
+        a = self._ranked_with_articles("신임", 0.9, [
+            _article("신임 사무총장 임명 절차 마무리 단계", "https://d1.example.com/1"),
+            _article("신임 사무총장 임명 절차 마무리 발표", "https://d1.example.com/2"),
+        ])
+        b = self._ranked_with_articles("임명", 0.8, [
+            _article("신임 사무총장 임명 절차 마무리 단계 돌입", "https://d2.example.com/1"),
+            _article("신임 사무총장 임명 절차 마무리 공지", "https://d2.example.com/2"),
+        ])
+        ev_a = ranker._evidence_articles_of(a)
+        ev_b = ranker._evidence_articles_of(b)
+        # 전제: 양쪽 anchor 가 비어 support 가 관측 불가(None)이고, overlap 은 1.0 미만
+        # 이라 동일 보도 예외가 아니라 실제로 가드 경로를 탄다.
+        self.assertIsNone(ranker._cross_evidence_support(a, b, ev_a))
+        self.assertIsNone(ranker._cross_evidence_support(b, a, ev_b))
+        self.assertLess(
+            ranker._pairwise_evidence_overlap(ev_a, ev_b),
+            ranker._MERGE_BRIDGE_SUSPECT_MAX_OVERLAP,
+        )
+        self.assertTrue(
+            ranker._has_multi_article_cross_evidence(a, b, ev_a, ev_b)
+        )
+        self.assertEqual(len(ranker.dedupe_and_merge([a, b])), 1)
+
+    def test_identical_evidence_is_not_treated_as_roundup_bridge(self):
+        # 기사쌍이 사실상 동일(overlap 1.0)하면 나열 기사 bridge 가 아니라 같은 보도다.
+        # 제목이 짧아 near-dup 최소 토큰 수에 못 미치면 공유 근거로 승격되지 않은 채
+        # 이 경로로 오는데, 그때까지 가드를 적용하면 anchor 가 비는 일반어 keyword 의
+        # 정상 병합이 깨진다(운영: '신임' x '민경욱' display 정합성 분기 회귀).
+        short = "무관한 다른 사건 보도"
+        self.assertLess(
+            len(ranker._title_tokens_of(_article(short, "https://x.example.com/1"))),
+            ranker._NEAR_DUPLICATE_MIN_TITLE_TOKENS,
+        )
+        ranked = [
+            self._ranked_with_articles("신임", 0.9, [
+                _article(short, "https://d1.example.com/1"),
+                _article(short, "https://d1.example.com/2"),
+            ]),
+            self._ranked_with_articles("민경욱", 0.8, [
+                _article(short, "https://d2.example.com/1"),
+                _article(short, "https://d2.example.com/2"),
+            ]),
+        ]
+        merged = ranker.dedupe_and_merge(ranked)
+        self.assertEqual(len(merged), 1)
+
     def test_subset_roundup_only_without_anchor_grounding_not_merged(self):
         # 근거가 전부 공유 roundup뿐인 키워드('최정원')는 상대의 자체 보도에 anchor가
         # 없으면 흡수되지 않는다(무관 사건 bridge 차단).
