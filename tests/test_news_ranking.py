@@ -1350,6 +1350,55 @@ class TestSameIssueMerge(unittest.TestCase):
             ranker._has_multi_article_cross_evidence(big, small, ev_big, ev_small)
         )
 
+    def test_sparse_same_event_split_is_the_accepted_tradeoff(self):
+        """이 계약의 known risk 를 **의도된 동작으로 고정**한다(fail-closed trade-off).
+
+        진짜 같은 사건이라도 양쪽 근거가 2건뿐이고 접점이 1:1 이면 분리된다.
+        이것은 버그가 아니라 선택이다 — 반대편(false merge)의 비용이 압도적으로 크기
+        때문이다: 나열 기사 한 건이 transitive 연쇄로 10개 이슈를 한 그룹으로 접어
+        Top10 이 7개로 붕괴한다(2026-09-03 06:48, run 4912ac60). 분리 쪽 비용은
+        같은 사건이 두 줄로 보이는 것뿐이고, 그마저 아래 test 처럼 근거가 조금만
+        두터워지면 사라진다.
+
+        **이 테스트가 실패하도록 임계를 다시 완화하지 말 것.** 완화는 06:48 붕괴를
+        그대로 되돌린다. 이 분리가 운영에서 실제 문제로 관측되면 임계를 낮추는 대신
+        near-dup 탐지(공유 근거 승격) 쪽을 개선해야 한다 — 그쪽은 가드를 우회하지
+        않고 정상 경로로 merge 시키는 방향이다.
+        """
+        a = self._ranked_with_articles("김포 공장 화재", 0.9, [
+            _article("김포 물류창고서 큰불…소방 대응 2단계 발령", "https://a.example.com/1"),
+            _article("김포 화재 진화 작업 계속", "https://a.example.com/2"),
+        ])
+        b = self._ranked_with_articles("소방 대응 2단계", 0.8, [
+            _article("김포 물류창고 불…소방 대응 2단계 상향", "https://b.example.com/1"),
+            _article("소방 대응 2단계란 무엇인가", "https://b.example.com/2"),
+        ])
+        ev_a = ranker._evidence_articles_of(a)
+        ev_b = ranker._evidence_articles_of(b)
+        # 전제: 공유 근거가 없고(near-dup 미만) 접점이 양쪽 1건씩이다.
+        shared_a, shared_b, _, _ = ranker._split_shared_evidence(ev_a, ev_b)
+        self.assertEqual((len(shared_a), len(shared_b)), (0, 0))
+        self.assertEqual(ranker._cross_evidence_support(a, b, ev_a), 1)
+        self.assertEqual(ranker._cross_evidence_support(b, a, ev_b), 1)
+        self.assertEqual(len(ranker.dedupe_and_merge([a, b])), 2)
+
+    def test_sparse_same_event_merges_once_evidence_is_slightly_denser(self):
+        # 위 trade-off 의 반대편 경계: 근거가 조금만 두터워져 상대 anchor 가 복수
+        # 기사에 등장하면(support >= 2) 같은 사건은 정상적으로 병합된다.
+        # 분리 위험이 좁은 구간에만 있다는 것을 고정한다.
+        a = self._ranked_with_articles("김포 공장 화재", 0.9, [
+            _article("김포 물류창고서 큰불…소방 대응 2단계 발령", "https://c.example.com/1"),
+            _article("김포 물류창고 화재 소방 대응 2단계 확대", "https://c.example.com/2"),
+        ])
+        b = self._ranked_with_articles("소방 대응 2단계", 0.8, [
+            _article("김포 물류창고 불…소방 대응 2단계 상향", "https://d.example.com/1"),
+            _article("김포 화재로 소방 대응 2단계 발령", "https://d.example.com/2"),
+        ])
+        ev_a = ranker._evidence_articles_of(a)
+        ev_b = ranker._evidence_articles_of(b)
+        self.assertGreaterEqual(ranker._cross_evidence_support(a, b, ev_a), 2)
+        self.assertEqual(len(ranker.dedupe_and_merge([a, b])), 1)
+
     def test_guard_is_fail_open_when_both_anchors_are_empty(self):
         # 양쪽 keyword 가 모두 일반어라 merge anchor 가 비면 이 신호 자체를 관측할 수
         # 없다. "관측 불가"를 "지지 0건"으로 접으면 근거 없이 merge 를 막게 되므로

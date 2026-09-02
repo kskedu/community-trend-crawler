@@ -953,6 +953,17 @@ def _has_multi_article_cross_evidence(
     merge 하지 않는다. 근거가 원래 1건뿐인 keyword(singleton)는 이 조건을 만족시킬
     수 없으므로 판정 대상에서 제외한다(기존 동작 보존 — 여기서 막으면 정상 소규모
     이슈까지 못 붙는다).
+
+    **의도적 fail-closed trade-off(known risk).** 진짜 같은 사건이라도 양쪽 근거가
+    2건뿐이고 접점이 1:1 이면 분리될 수 있다. 두 방향의 비용이 대칭이 아니라서 이쪽을
+    택했다 — false merge 는 나열 기사 한 건이 transitive 연쇄로 10개 이슈를 한 그룹에
+    접어 Top10 을 7개로 붕괴시키지만(2026-09-03 06:48, run 4912ac60), 과분리는 같은
+    사건이 두 줄로 보이는 데 그치고 근거가 조금만 두터워지면(support >= 2) 사라진다.
+
+    이 분리가 운영에서 실제 문제로 관측되더라도 **_MERGE_MIN_CROSS_EVIDENCE_ARTICLES
+    를 낮추지 말 것** — 그건 06:48 붕괴를 그대로 되돌린다. 대신 near-dup 탐지(공유 근거
+    승격) 쪽을 개선해 가드를 우회하지 않고 정상 경로로 merge 시켜야 한다.
+    회귀 고정: tests/test_news_ranking.py::test_sparse_same_event_split_is_the_accepted_tradeoff
     """
     if len(ev_a) < _MERGE_MIN_CROSS_EVIDENCE_ARTICLES or len(ev_b) < _MERGE_MIN_CROSS_EVIDENCE_ARTICLES:
         return True
