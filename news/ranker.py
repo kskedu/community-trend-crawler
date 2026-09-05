@@ -1169,6 +1169,47 @@ def _is_same_issue(item_a: Dict, item_b: Dict) -> bool:
     return False
 
 
+# merge 위상(topology) enum — 관찰 전용. _is_same_issue 의 분기 이름과 1:1 이며,
+# 판정 결과(bool)가 아니라 "어떤 근거 구조에서 판정했는지"를 남긴다. 최근 결함이 대부분
+# merge 단계에서 났는데 과거 run 에는 winner 만 남고 이 구조가 남지 않아, 같은 사건인지
+# 나열 기사 bridge 인지를 되짚을 수 없었다(2026-09 관측성 PR).
+MERGE_MODE_NO_SHARED = "NO_SHARED"           # 공유 근거 전무
+MERGE_MODE_IDENTICAL = "IDENTICAL_COVERAGE"  # 양쪽 근거가 전부 공유(A==B==shared)
+MERGE_MODE_SUBSET = "SUBSET_COVERAGE"        # 한쪽만 전부 공유
+MERGE_MODE_BOTH_RESIDUAL = "BOTH_RESIDUAL"   # 양쪽 모두 잔여 근거 보유
+
+
+def merge_evidence_topology(item_a: Dict, item_b: Dict) -> Dict:
+    """두 item 의 공유/잔여 근거 구조를 compact 하게 요약한다(순수 관찰).
+
+    ⚠️ 판정을 다시 하지 않는다 — `_is_same_issue` 와 **동일한** `_split_shared_evidence`
+    출력만 읽어 분기 이름과 카운트로 접는다. merge 규칙을 복제하면 향후 규칙 변경 때
+    조용히 어긋나므로(진단이 거짓말을 하게 된다) 규칙 자체는 절대 재구현하지 않는다.
+
+    반환: {mode, shared_evidence_count, residual_support_a, residual_support_b}
+    기사 본문/제목/URL 은 담지 않는다(정수 + 짧은 enum 만).
+    """
+    ev_a = _evidence_articles_of(item_a)
+    ev_b = _evidence_articles_of(item_b)
+    shared_a, shared_b, rest_a, rest_b = _split_shared_evidence(ev_a, ev_b)
+    if not shared_a and not shared_b:
+        mode = MERGE_MODE_NO_SHARED
+    elif not rest_a and not rest_b:
+        mode = MERGE_MODE_IDENTICAL
+    elif not rest_a or not rest_b:
+        mode = MERGE_MODE_SUBSET
+    else:
+        mode = MERGE_MODE_BOTH_RESIDUAL
+    return {
+        "mode": mode,
+        # shared_a/shared_b 는 서로 다른 URL 의 near-dup 일 수 있어 길이가 다를 수 있다.
+        # 공유 "근거 쌍"의 규모를 보는 게 목적이므로 큰 쪽을 쓴다.
+        "shared_evidence_count": max(len(shared_a), len(shared_b)),
+        "residual_support_a": len(rest_a),
+        "residual_support_b": len(rest_b),
+    }
+
+
 def _shared_evidence_urls(item_a: Dict, item_b: Dict) -> set:
     """두 item의 유효 근거 기사 간 공유 URL 집합(관찰 로그 전용)."""
     urls_a = {a.get("url") for a in _evidence_articles_of(item_a) if a.get("url")}

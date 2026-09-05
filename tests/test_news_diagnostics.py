@@ -19,6 +19,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from news import diagnostics
+from news import ranker
 import main as main_module
 
 
@@ -1110,3 +1111,287 @@ class FreshnessGuardBriefingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CompactObservabilityTest(unittest.TestCase):
+    """2026-09 관측성 PR — 비선정 후보 compact 근거 / merge 위상 / funnel.
+
+    계약: 저장이 늘어날 뿐 **판정은 전혀 바뀌지 않는다**. 기사 본문/제목/URL 전문은
+    후보마다 복제하지 않고 정수 카운트와 짧은 enum 만 남긴다.
+    """
+
+    def _run(self, backfill=None):
+        """compact 필드를 켠 상태로 구동한다 — 배포 후 상태의 계약을 검증한다.
+        (OFF 기본값 자체는 test_compact_fields_withheld_until_sql_applied 가 지킨다.)"""
+        published = []
+        with patch.dict(os.environ, {"NEWS_DIAG_COMPACT_FIELDS": "1"}, clear=False), \
+             _BriefingHarness(self), \
+             patch.object(main_module, "upsert_news_issues",
+                          side_effect=lambda i, source="news_top": published.append(i) or True), \
+             patch.object(main_module, "record_news_diagnostics", return_value=True) as rpc:
+            main_module.run_news_briefing()
+            payload, decisions = rpc.call_args[0]
+        return payload, decisions, (published[0] if published else None)
+
+    # -- (5) RANK_CUTOFF 의 pre-cut score/rank 보존 -------------------------
+
+    def test_rank_cutoff_keeps_precut_rank_and_score(self):
+        """컷 탈락 후보도 score 와 컷 이전 순위를 남긴다(과거엔 전부 NULL 이었다)."""
+        # TOP_N 보다 후보를 많이 넣어 RANK_CUTOFF 를 강제한다.
+        with patch.object(ranker, "select_top", side_effect=lambda r, top_n=2: r[:top_n]):
+            payload, decisions, _ = self._run()
+        cut = [d for d in decisions if d.get("reason_code") == "RANK_CUTOFF"]
+        self.assertTrue(cut, "RANK_CUTOFF 후보가 생성되지 않아 계약을 검증할 수 없다")
+        for d in cut:
+            self.assertIsNotNone(d.get("score"), f"{d['keyword']}: score 가 비었다")
+            self.assertIsNotNone(d.get("pre_cut_rank"), f"{d['keyword']}: pre_cut_rank 가 비었다")
+            self.assertGreater(d["pre_cut_rank"], 2, "컷 탈락인데 pre_cut_rank 가 TOP_N 이내다")
+            self.assertIsNotNone(d.get("article_count"))
+            self.assertIsNotNone(d.get("unique_domain_count"))
+
+    def test_precut_rank_is_dense_and_matches_ordering(self):
+        """pre_cut_rank 는 kept 순서와 일치한다 — score 내림차순이어야 한다."""
+        with patch.object(ranker, "select_top", side_effect=lambda r, top_n=2: r[:top_n]):
+            _, decisions, _ = self._run()
+        ranked_rows = [d for d in decisions if d.get("pre_cut_rank") is not None]
+        ranked_rows.sort(key=lambda d: d["pre_cut_rank"])
+        scores = [d["score"] for d in ranked_rows]
+        self.assertEqual(scores, sorted(scores, reverse=True),
+                         "pre_cut_rank 순서가 score 내림차순과 어긋난다")
+        # selected 행은 finalize_selected 가 발행 rank 로 덮어써 pre_cut_rank 를 갖지 않는다.
+        # 따라서 비선정 구간은 TOP_N 다음 순위부터 **구멍 없이** 이어져야 한다.
+        got = [d["pre_cut_rank"] for d in ranked_rows]
+        self.assertEqual(got, list(range(got[0], got[0] + len(got))),
+                         "pre_cut_rank 에 구멍이 있다")
+        selected_n = sum(1 for d in decisions if d["result_status"].startswith("selected"))
+        self.assertEqual(got[0], selected_n + 1,
+                         "컷 직후 순위가 selected 수 다음에서 시작하지 않는다")
+
+    # -- (4) MERGED_INTO_OTHER winner 관계 + 위상 --------------------------
+
+    def test_merged_row_keeps_winner_and_merge_mode(self):
+        """흡수된 후보는 winner 와 merge 위상·근거 카운트를 함께 남긴다."""
+        a = {"keyword": "코스피", "news_meta": _news_meta("코스피"), "sources": {"daum_home": 1}}
+        b = {"keyword": "환율", "news_meta": _news_meta("환율"), "sources": {"nate_home": 2}}
+        topo = ranker.merge_evidence_topology(a, b)
+        self.assertIn(topo["mode"], {
+            ranker.MERGE_MODE_NO_SHARED, ranker.MERGE_MODE_IDENTICAL,
+            ranker.MERGE_MODE_SUBSET, ranker.MERGE_MODE_BOTH_RESIDUAL,
+        })
+        self.assertIsInstance(topo["shared_evidence_count"], int)
+        self.assertIsInstance(topo["residual_support_a"], int)
+        self.assertIsInstance(topo["residual_support_b"], int)
+
+    def test_merge_topology_is_pure_observation(self):
+        """위상 관찰이 입력 item 을 변형하지 않는다(판정 되먹임 금지)."""
+        a = {"keyword": "코스피", "news_meta": _news_meta("코스피"), "sources": {"daum_home": 1}}
+        b = {"keyword": "환율", "news_meta": _news_meta("환율"), "sources": {"nate_home": 2}}
+        before = json.dumps([a, b], sort_keys=True, default=str)
+        ranker.merge_evidence_topology(a, b)
+        self.assertEqual(json.dumps([a, b], sort_keys=True, default=str), before)
+
+    def test_merge_topology_matches_shared_evidence_split(self):
+        """위상 enum 이 _split_shared_evidence 결과와 1:1 이다(규칙 복제가 아니다)."""
+        a = {"keyword": "코스피", "news_meta": _news_meta("코스피")}
+        b = {"keyword": "코스피", "news_meta": _news_meta("코스피")}   # 완전 동일 근거
+        self.assertEqual(ranker.merge_evidence_topology(a, b)["mode"],
+                         ranker.MERGE_MODE_IDENTICAL)
+        c = {"keyword": "환율", "news_meta": _news_meta("환율")}       # 겹치는 URL 없음
+        self.assertEqual(ranker.merge_evidence_topology(a, c)["mode"],
+                         ranker.MERGE_MODE_NO_SHARED)
+
+    # -- (3) pass1/pass2 funnel 저장 정확성 --------------------------------
+
+    def test_funnel_counts_saved_and_monotonic(self):
+        """funnel 은 단계별 후보 수를 담고, 단계가 진행될수록 늘지 않는다."""
+        payload, decisions, _ = self._run()
+        counts = payload["thresholds"]["selection_diagnostics_v1"]["counts"]
+        for key in ("candidates", "ranked", "merged", "kept", "top"):
+            self.assertIn(key, counts, f"funnel 에 {key} 가 없다")
+        self.assertGreaterEqual(counts["candidates"], counts["ranked"])
+        self.assertGreaterEqual(counts["ranked"], counts["merged"])
+        self.assertGreaterEqual(counts["merged"], counts["kept"])
+        self.assertGreaterEqual(counts["kept"], counts["top"])
+        self.assertEqual(counts["top"], payload["selected_count"])
+
+    def test_funnel_belongs_to_adopted_pass_only(self):
+        """폐기된 pass 의 funnel 이 run 레벨로 승격되지 않는다."""
+        run = diagnostics.RunDiagnostics()
+        discarded = diagnostics.PassSnapshot("pass2")
+        discarded.funnel = {"candidates": 999}
+        adopted = diagnostics.PassSnapshot("pass1(strict)")
+        adopted.funnel = {"candidates": 7}
+        run.commit(adopted)
+        self.assertEqual(run.funnel, {"candidates": 7})
+
+    # -- (6)(7) selected 결과 동일 + classification invariant ---------------
+
+    def test_selected_rows_unchanged_and_invariant_holds(self):
+        """selected 판정/카운트 invariant 가 그대로다 — 관측 필드는 부가일 뿐이다."""
+        payload, decisions, published = self._run()
+        entries = published["keywords"]
+        sel = [d for d in decisions if d["result_status"].startswith("selected")]
+        self.assertEqual(len(sel), len(entries))
+        self.assertEqual({d["keyword"] for d in sel}, {e["keyword"] for e in entries})
+        self.assertEqual(
+            payload["candidate_count"],
+            payload["selected_count"] + payload["not_selected_count"]
+            + payload["rule_excluded_count"],
+        )
+
+    # -- (2) diagnostic on/off 가 selection 결과에 영향 0 --------------------
+
+    def test_selection_identical_with_and_without_diagnostics(self):
+        """diag=None(진단 미수집)과 diag 수집본의 top 이 완전히 같다."""
+        kws = list(_BriefingHarness.PASS1)
+        cands, signals = _candidates(*kws), _signals(*kws)
+
+        def snap(top):
+            return [(t["keyword"], t.get("score"), t.get("display_keyword"),
+                     sorted(t.get("related_keywords") or [])) for t in top]
+
+        without = snap(main_module._rank_and_select(cands, signals, "p", diag=None))
+        collected = diagnostics.PassSnapshot("p")
+        with_diag = snap(main_module._rank_and_select(cands, signals, "p", diag=collected))
+        self.assertEqual(without, with_diag)
+        self.assertTrue(collected.decisions, "진단이 실제로 수집되지 않아 대조가 무의미하다")
+
+    # -- (8)(9) backward compatibility --------------------------------------
+
+    def test_missing_new_fields_do_not_break_payload(self):
+        """새 필드가 없는 과거 형태 snapshot 도 payload 조립에 실패하지 않는다."""
+        run = diagnostics.RunDiagnostics()
+        snap = diagnostics.PassSnapshot("pass1(strict)")
+        snap.record("옛후보", diagnostics.STATUS_NOT_SELECTED, "RANK_CUTOFF")
+        run.commit(snap)
+        payload, decisions = run.build_payload("ts:legacy")
+        self.assertEqual(len(decisions), 1)
+        # 새 필드는 값이 없으면 애초에 실리지 않는다(record 가 None 을 버린다).
+        self.assertNotIn("pre_cut_rank", decisions[0])
+        self.assertNotIn("merge_mode", decisions[0])
+        self.assertEqual(payload["candidate_count"], 1)
+
+    def test_evidence_summary_never_stores_article_text(self):
+        """compact 요약에 title/description/url 전문이 실리지 않는다."""
+        item = {"keyword": "코스피", "news_meta": _news_meta("코스피"),
+                "sources": {"daum_home": 1, "naver_news_aux": True}}
+        ev = diagnostics.evidence_summary(item)
+        blob = json.dumps(ev, ensure_ascii=False)
+        self.assertNotIn("http", blob, "URL 이 compact 요약에 실렸다")
+        self.assertNotIn("본문 요약", blob, "기사 본문이 compact 요약에 실렸다")
+        self.assertNotIn("속보", blob, "기사 제목이 compact 요약에 실렸다")
+        self.assertTrue(all(isinstance(v, int) for v in ev.values()))
+
+    def test_independent_family_count_excludes_naver_aux(self):
+        """independent_family_count 는 source_count 와 다르다 — aux 를 세지 않는다."""
+        item = {"keyword": "코스피", "news_meta": _news_meta("코스피"),
+                "sources": {"daum_home": 1, "nate_home": 2, "naver_news_aux": True}}
+        ev = diagnostics.evidence_summary(item)
+        self.assertEqual(ev["independent_family_count"], 2)   # aux 는 제외
+        self.assertEqual(len(item["sources"]), 3)             # source_count 는 3
+
+    # -- (10) payload size ---------------------------------------------------
+
+    def test_compact_payload_stays_small(self):
+        """비선정 행의 compact 보강이 행당 수백 바이트 수준을 넘지 않는다."""
+        # 컷을 낮춰 비선정 행을 반드시 만든다 — skip 으로 넘어가면 크기 계약이
+        # 한 번도 측정되지 않은 채 통과한다(위양성).
+        with patch.object(ranker, "select_top", side_effect=lambda r, top_n=2: r[:top_n]):
+            _, decisions, _ = self._run()
+        nonsel = [d for d in decisions if d["result_status"] == "not_selected"]
+        self.assertTrue(nonsel, "비선정 후보가 없어 크기 계약을 측정할 수 없다")
+        self.assertTrue(any("pre_cut_rank" in d for d in nonsel),
+                        "compact 보강이 실제로 실리지 않아 측정이 무의미하다")
+        new_fields = ("score", "pre_cut_rank", "article_count", "unique_url_count",
+                      "unique_domain_count", "independent_family_count", "merge_mode",
+                      "shared_evidence_count", "residual_support_winner",
+                      "residual_support_self", "merge_reason")
+        for d in nonsel:
+            extra = {k: d[k] for k in new_fields if k in d}
+            self.assertLessEqual(
+                len(json.dumps(extra, ensure_ascii=False).encode()), 512,
+                f"{d['keyword']}: compact 보강이 512B 를 넘었다",
+            )
+
+    def test_evidence_summary_survives_malformed_articles(self):
+        """비정상 article 이 있어도 예외를 던지지 않는다.
+
+        여기서 예외가 나면 _diag_record_pass 전체가 중단돼 그 run 의 decisions 가
+        통째로 사라진다 — 부가 카운트 때문에 진단 본체를 잃으면 안 된다.
+        """
+        hostile = {
+            "keyword": "x",
+            "news_meta": {"articles": [
+                {"url": None}, {}, {"url": 123}, "문자열이 섞임", {"url": ""},
+                {"url": "https://ok.example.com/a?utm=1"},
+            ]},
+            "sources": {"daum_home": 1},
+        }
+        ev = diagnostics.evidence_summary(hostile)
+        self.assertEqual(ev["unique_url_count"], 1)
+        self.assertEqual(ev["unique_domain_count"], 1)
+        self.assertEqual(ev["independent_family_count"], 1)
+        # articles 자체가 리스트가 아니어도 살아남는다.
+        self.assertEqual(
+            diagnostics.evidence_summary({"news_meta": {"articles": "garbage"}})["article_count"], 0
+        )
+
+    def test_diag_record_survives_hostile_article_payload(self):
+        """비정상 기사 payload 에서도 후보별 decision 이 전부 기록된다(유실 0)."""
+        kws = list(_BriefingHarness.PASS1)
+        cands, signals = _candidates(*kws), _signals(*kws)
+        # 한 후보의 기사 URL 을 정수로 오염시킨다.
+        signals["news"][kws[0]]["articles"][0]["url"] = 12345
+        snap = diagnostics.PassSnapshot("p")
+        main_module._rank_and_select(cands, signals, "p", diag=snap)
+        self.assertEqual(len(snap.decisions), len(cands),
+                         "오염된 기사 하나 때문에 decisions 가 유실됐다")
+        self.assertFalse(snap.degraded, "관측 보강이 snapshot 을 degraded 로 만들었다")
+
+    # -- 배포 순서 안전장치 -------------------------------------------------
+
+    def test_compact_fields_withheld_until_sql_applied(self):
+        """기본(OFF)에서는 새 키를 RPC 로 보내지 않는다.
+
+        배포 SQL 이 컬럼/RPC 를 갱신하기 전에 새 키를 보내면 진단 적재가 통째로
+        실패할 수 있다(단위 테스트로는 잡히지 않는 부류) — 코드 PR 은 OFF 로 배포한다.
+        """
+        run = diagnostics.RunDiagnostics()
+        snap = diagnostics.PassSnapshot("pass1(strict)")
+        snap.record("후보", diagnostics.STATUS_NOT_SELECTED, "RANK_CUTOFF",
+                    score=0.5, pre_cut_rank=11, merge_mode="BOTH_RESIDUAL",
+                    unique_domain_count=3, article_count=4)
+        run.commit(snap)
+        with patch.dict(os.environ, {"NEWS_DIAG_COMPACT_FIELDS": ""}, clear=False):
+            _, decisions = run.build_payload("ts:off")
+        d = decisions[0]
+        for f in diagnostics.COMPACT_FIELDS:
+            self.assertNotIn(f, d, f"OFF 인데 {f} 가 전송된다")
+        # 기존 컬럼은 그대로 나간다 — 비선정 행에 값이 채워지는 것뿐이다.
+        self.assertEqual(d.get("score"), 0.5)
+        self.assertEqual(d.get("article_count"), 4)
+
+    def test_compact_fields_sent_when_enabled(self):
+        """SQL 적용 후 환경변수를 켜면 즉시 전송된다(수집은 항상 되고 있었다)."""
+        run = diagnostics.RunDiagnostics()
+        snap = diagnostics.PassSnapshot("pass1(strict)")
+        snap.record("후보", diagnostics.STATUS_NOT_SELECTED, "RANK_CUTOFF",
+                    score=0.5, pre_cut_rank=11, merge_mode="BOTH_RESIDUAL")
+        run.commit(snap)
+        with patch.dict(os.environ, {"NEWS_DIAG_COMPACT_FIELDS": "1"}, clear=False):
+            _, decisions = run.build_payload("ts:on")
+        self.assertEqual(decisions[0].get("pre_cut_rank"), 11)
+        self.assertEqual(decisions[0].get("merge_mode"), "BOTH_RESIDUAL")
+
+    def test_gate_does_not_mutate_snapshot(self):
+        """OFF 필터링이 snapshot 원본을 훼손하지 않는다(켜면 그대로 나가야 한다)."""
+        run = diagnostics.RunDiagnostics()
+        snap = diagnostics.PassSnapshot("pass1(strict)")
+        snap.record("후보", diagnostics.STATUS_NOT_SELECTED, "RANK_CUTOFF", pre_cut_rank=11)
+        run.commit(snap)
+        with patch.dict(os.environ, {"NEWS_DIAG_COMPACT_FIELDS": ""}, clear=False):
+            run.build_payload("ts:off")
+        with patch.dict(os.environ, {"NEWS_DIAG_COMPACT_FIELDS": "1"}, clear=False):
+            _, decisions = run.build_payload("ts:on")
+        self.assertEqual(decisions[0].get("pre_cut_rank"), 11,
+                         "OFF 경로가 snapshot 을 파괴해 ON 에서도 값이 사라졌다")
