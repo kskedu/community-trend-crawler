@@ -1450,6 +1450,194 @@ class TestSameIssueMerge(unittest.TestCase):
         merged = ranker.dedupe_and_merge(ranked)
         self.assertEqual(len(merged), 1)
 
+    # --- 동일 coverage false-split (2026-09-05 21:47 운영 사례) ---
+
+    def _hormuz_case(self):
+        """운영 21:47 재구성(run 783b45f9): '이란 한국 경고'와 '이란 당국자 간주'는
+        기사 8건이 URL 까지 **완전히 동일**한데도 서로 다른 Top10 항목으로 남았다.
+        매체마다 표현이 갈려(KBS 는 '고위당국자'를 한 단어로 표기) 어느 한 제목도
+        anchor 합집합 {이란,한국,경고,당국자,간주} 5개를 모두 담지 못했기 때문이다.
+        """
+        return [
+            _article("이란 당국자 “한국, 미국 위해 희생 말라”", "https://segye.example.com/1"),
+            _article("'한국 호르무즈 파병 검토'에 이란 \"직접 공격 간주\"…미국 \"기다리고 있다\"",
+                     "https://jtbc.example.com/1"),
+            _article("이란 고위 당국자 \"韓 호르무즈 개입 시 전쟁 참여로 간주\"",
+                     "https://inews24.example.com/1"),
+            _article("이란 \"한국 호르무즈 파병시 전쟁 참여 간주…좌시 안해\"",
+                     "https://tvchosun.example.com/1"),
+            _article("“이란 고위당국자, 한국 호르무즈 개입시 ‘전쟁 참여’로 간주 경고”",
+                     "https://kbs.example.com/1"),
+            _article("\"韓, 호르무즈 파병시 전쟁 참여로 간주\"…이란, 공개 경고",
+                     "https://hankyung.example.com/1"),
+        ]
+
+    def test_identical_coverage_same_event_merges_despite_wording_gap(self):
+        # 필수 1/8: 동일 사건 + 거의 동일 article set + 표현이 다른 candidate → 하나로 merge.
+        arts = self._hormuz_case()
+        ranked = [
+            self._ranked_with_articles("이란 한국 경고", 0.551, list(arts)),
+            self._ranked_with_articles("이란 당국자 간주", 0.540, list(arts)),
+        ]
+        self.assertEqual(len(ranker.dedupe_and_merge(ranked)), 1)
+
+    def test_hormuz_case_fails_the_span_condition(self):
+        # 이 회귀의 전제 고정: span(anchor 합집합 근접 공존) 조건은 **실패**한다.
+        # 통과했다면 기존 코드가 이미 병합했을 것이고 이 fix 는 무의미해진다.
+        arts = self._hormuz_case()
+        a = self._ranked_with_articles("이란 한국 경고", 0.551, list(arts))
+        b = self._ranked_with_articles("이란 당국자 간주", 0.540, list(arts))
+        union = ranker._keyword_anchor_tokens(a) | ranker._keyword_anchor_tokens(b)
+        self.assertFalse(ranker._anchor_grounded_in_articles(union, arts))
+        # 그럼에도 독립 보도 근거로 병합된다.
+        self.assertTrue(ranker._is_same_issue(a, b))
+
+    def test_identical_coverage_merge_is_symmetric(self):
+        arts = self._hormuz_case()
+        a = self._ranked_with_articles("이란 한국 경고", 0.551, list(arts))
+        b = self._ranked_with_articles("이란 당국자 간주", 0.540, list(arts))
+        self.assertEqual(ranker._is_same_issue(a, b), ranker._is_same_issue(b, a))
+
+    def test_syndicated_roundup_across_many_outlets_still_not_merged(self):
+        # 필수 4/5: 나열 기사가 **여러 매체에 전재**돼 매체 수만 늘어도 병합 금지.
+        # 독립 보도 수는 near-dup 을 접으면 1이라 임계를 넘지 못한다 — 단순
+        # "기사 수/매체 수가 많으면 merge" 로 완화되지 않았음을 고정한다.
+        title = "최정원 상간남 소송 승소 판결 확정 소식과 함께 별개로 전해진 두산에너빌리티 수주 공시"
+        synd = [_article(title, f"https://outlet{i}.example.com/r") for i in range(8)]
+        self.assertEqual(ranker._independent_report_count(synd), 1)
+        ranked = [
+            self._ranked_with_articles("최정원 소송", 0.9, list(synd)),
+            self._ranked_with_articles("두산에너빌리티 수주", 0.8, list(synd)),
+        ]
+        self.assertEqual(len(ranker.dedupe_and_merge(ranked)), 2)
+
+    def test_independent_reports_require_every_shared_article_to_cover_both(self):
+        # 전건(全件) 조건 고정: 독립 보도가 충분해도 그중 한 건이라도 한쪽 keyword 를
+        # 다루지 않으면 이 경로로 병합하지 않는다(나열 기사 섞임 방어).
+        both = [
+            _article("이란 고위 당국자 한국 호르무즈 개입 전쟁 참여 간주 경고 발언",
+                     "https://a.example.com/1"),
+            _article("이란 당국자 한국 호르무즈 파병 두고 전쟁 참여 간주한다 경고",
+                     "https://b.example.com/1"),
+            _article("이란 측 한국 호르무즈 개입시 전쟁 참여 간주 경고 재확인 보도",
+                     "https://c.example.com/1"),
+        ]
+        a = self._ranked_with_articles("이란 경고", 0.9, list(both))
+        b = self._ranked_with_articles("한국 호르무즈", 0.8, list(both))
+        self.assertTrue(ranker._is_same_issue(a, b))
+        # 한쪽 keyword 와 무관한 기사 1건을 섞으면 전건 조건이 깨져 병합되지 않는다.
+        unrelated = _article("전혀 다른 사건 프로야구 경기 결과 정리 기사 본문",
+                             "https://d.example.com/1")
+        mixed = list(both) + [unrelated]
+        a2 = self._ranked_with_articles("이란 경고", 0.9, list(mixed))
+        b2 = self._ranked_with_articles("한국 호르무즈", 0.8, list(mixed))
+        self.assertFalse(ranker._is_same_issue(a2, b2))
+
+    def test_two_independent_reports_are_below_the_threshold(self):
+        # 임계 경계 고정: 독립 보도 2건은 부족하다(3건 이상 요구).
+        two = [
+            _article("이란 고위 당국자 한국 호르무즈 개입 전쟁 참여 간주 경고 발언",
+                     "https://a.example.com/1"),
+            _article("이란 당국자 한국 호르무즈 파병 두고 전쟁 참여 간주한다 경고",
+                     "https://b.example.com/1"),
+        ]
+        self.assertEqual(ranker._independent_report_count(two), 2)
+        a = self._ranked_with_articles("이란 경고", 0.9, list(two))
+        b = self._ranked_with_articles("한국 호르무즈", 0.8, list(two))
+        self.assertFalse(ranker._is_same_issue(a, b))
+
+    def test_same_entity_different_event_not_merged_by_independent_reports(self):
+        # 필수 5: 같은 인물이 등장해도 사건이 다르면 이 경로로 병합되지 않는다.
+        # anchor 가 멀리 흩어져 기존 span 조건이 실패하는 나열 기사를 쓴다(span 이
+        # 통과하면 이 fix 와 무관한 기존 known limit 경로라 검증이 되지 않는다).
+        roundup = _article(
+            "손흥민 결승골 소식을 전하며 팬들의 반응과 구단 공식 발표 내용을 함께 정리한 가운데 "
+            "별개로 이강인 도움 기록도 조명됐다",
+            "https://r.example.com/1")
+        a = self._ranked_with_articles("손흥민 결승골", 0.9, [roundup])
+        b = self._ranked_with_articles("이강인 도움", 0.8, [roundup])
+        union = ranker._keyword_anchor_tokens(a) | ranker._keyword_anchor_tokens(b)
+        # 전제: 기존 span 조건은 실패한다(= 이 fix 가 유일한 병합 가능 경로).
+        self.assertFalse(ranker._anchor_grounded_in_articles(union, [roundup]))
+        # 나열 기사는 한 건이므로 독립 보도 수가 임계에 미치지 못해 병합되지 않는다.
+        self.assertEqual(ranker._independent_report_count([roundup]), 1)
+        self.assertEqual(len(ranker.dedupe_and_merge([a, b])), 2)
+
+    def test_hormuz_cause_and_reaction_stay_independent(self):
+        # 필수 6/8: 21:47 rank8('한국 파병 검토')은 잔여 근거(미국의 파병 압박 보도)를
+        # 따로 가져 rank4/7 과 article set 이 다르다(J=0.36). 원인/반응이 각자 독립
+        # 근거를 갖는 경우는 분리 유지 — 이 fix 가 세 개를 하나로 접지 않는다.
+        shared = self._hormuz_case()[:4]
+        warn = list(shared) + [
+            _article("이란 고위 당국자 전쟁 참여 간주 경고 추가 보도 확인",
+                     "https://kbs.example.com/warn"),
+        ]
+        deploy = list(shared) + [
+            _article("트럼프 \"이란 전쟁은 사소한 일\"...미 \"한국 파병 기다리는 중\"",
+                     "https://ytn.example.com/1"),
+            _article("美 당국자 \"한국의 자원 배치 기다리는 중\"…靑 \"결정된 것 없다\"",
+                     "https://mt.example.com/1"),
+        ]
+        a = self._ranked_with_articles("이란 한국 경고", 0.551, warn)
+        c = self._ranked_with_articles("한국 파병 검토", 0.532, deploy)
+        ev_a = ranker._evidence_articles_of(a)
+        ev_c = ranker._evidence_articles_of(c)
+        _, _, rest_a, rest_c = ranker._split_shared_evidence(ev_a, ev_c)
+        # 양쪽 모두 잔여 근거를 가지므로 동일 coverage 경로가 아니다.
+        self.assertTrue(rest_a and rest_c)
+
+    def test_empty_anchor_keyword_cannot_merge_via_independent_reports(self):
+        # 빈 anchor(일반어만인 keyword, 예 '사건')는 이 경로로 병합할 수 없다.
+        # 빈 집합을 "모든 기사에 등장"으로 접으면 일반어 keyword 가 독립 보도 수만으로
+        # 아무 사건에나 흡수된다(_anchor_grounded_in_articles 의 공집합 거짓 계약과 동일).
+        arts = [
+            _article("김영환 지사 관련 여러 절차가 이어지는 가운데 별도로 진행된 압수수색 소식",
+                     "https://a.example.com/1"),
+            _article("김영환 지사 측 입장 발표가 나온 뒤 한참 지나 알려진 압수수색 진행 경과",
+                     "https://b.example.com/1"),
+            _article("김영환 지사 일정 공개 이후 별개로 전해진 압수수색 관련 후속 보도",
+                     "https://c.example.com/1"),
+        ]
+        a = self._ranked_with_articles("사건", 0.9, list(arts))
+        b = self._ranked_with_articles("김영환 압수수색", 0.8, list(arts))
+        # 전제: anchor 가 비고, 기존 span 조건도 실패한다(= 이 경로만이 병합 후보).
+        self.assertEqual(ranker._keyword_anchor_tokens(a), set())
+        union = ranker._keyword_anchor_tokens(a) | ranker._keyword_anchor_tokens(b)
+        self.assertFalse(ranker._anchor_grounded_in_articles(union, arts))
+        # 독립 보도는 충분(3건)하지만 빈 anchor 라 병합하지 않는다.
+        self.assertEqual(ranker._independent_report_count(arts), 3)
+        self.assertFalse(ranker._corroborated_by_independent_reports(a, b, arts))
+        self.assertFalse(ranker._is_same_issue(a, b))
+
+    def test_one_sided_mentions_do_not_count_as_joint_coverage(self):
+        # 각 기사가 한쪽 keyword 만 다루면(교집합 0) 병합하지 않는다. "둘 중 하나라도
+        # 언급"으로 완화하면 서로 다른 사건의 기사 묶음이 통째로 통과한다.
+        mixed = [
+            _article("이란 고위 당국자 전쟁 참여 간주 경고 발언 상세 내용 보도",
+                     "https://x.example.com/1"),
+            _article("이란 당국자 추가 경고 발언 국제사회 반응 정리 기사",
+                     "https://y.example.com/1"),
+            _article("한국 정부 호르무즈 파병 검토 착수 관련 별개 사안 보도",
+                     "https://z.example.com/1"),
+            _article("한국 파병 검토 관련 부처 협의 진행 상황 별도 정리",
+                     "https://w.example.com/1"),
+        ]
+        a = self._ranked_with_articles("이란 경고", 0.9, list(mixed))
+        b = self._ranked_with_articles("한국 파병", 0.8, list(mixed))
+        ka = ranker._keyword_anchor_tokens(a)
+        kb = ranker._keyword_anchor_tokens(b)
+        both = [x for x in mixed
+                if ranker._article_mentions_anchor(x, ka)
+                and ranker._article_mentions_anchor(x, kb)]
+        either = [x for x in mixed
+                  if ranker._article_mentions_anchor(x, ka)
+                  or ranker._article_mentions_anchor(x, kb)]
+        # 전제 고정: 양쪽 동시 언급은 0건이지만 "한쪽이라도"는 전건이다.
+        self.assertEqual(len(both), 0)
+        self.assertEqual(len(either), len(mixed))
+        self.assertFalse(ranker._anchor_grounded_in_articles(ka | kb, mixed))
+        self.assertFalse(ranker._is_same_issue(a, b))
+
     def test_subset_roundup_only_without_anchor_grounding_not_merged(self):
         # 근거가 전부 공유 roundup뿐인 키워드('최정원')는 상대의 자체 보도에 anchor가
         # 없으면 흡수되지 않는다(무관 사건 bridge 차단).
