@@ -10,7 +10,8 @@
 | 2b | `02b_BACKUP_thresholds_helper.sql` | 읽기 전용 — 진단 노출은 이 헬퍼가 담당 |
 | 3 | `03_APPLY_columns.sql` | 쓰기(컬럼 추가) — 파일 전체 복사 실행, 멱등 |
 | 4a | `04a_APPLY_thresholds_helper.sql` | 쓰기 — 파일 전체 복사 실행 |
-| 4b | `04_APPLY_rpc.md` | 쓰기 — [2][3] 만 남음, 02 백업에 반영 |
+| 4b | `04b_APPLY_rpc_autopatch.sql` | 쓰기 — 파일 전체 복사 실행(자동 패치, 멱등) |
+| — | `04_APPLY_rpc.md` | 참고용 — 자동 패치가 앵커를 못 찾을 때 수동 절차 |
 | 5 | `05_POSTCHECK.sql` | 읽기 전용 — 파일 전체 복사 실행 |
 | 6 | `NEWS_DIAG_COMPACT_FIELDS=1` | GitHub Actions env/variable → 이때부터 저장 시작 |
 
