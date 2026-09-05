@@ -120,14 +120,9 @@ ALTER TABLE public.news_keyword_decisions
 -- ---------------------------------------------------------------------
 -- POSTCHECK (읽기 전용) — 노출이 실제로 됐는지 확인한다.
 -- ---------------------------------------------------------------------
--- 1) selection_diagnostics_v1 이 RPC 결과에 실리는가
--- SELECT jsonb_object_keys(
---          (news_diag_list_runs(now() - interval '2 days', now(), NULL, 1, 0)
---           -> 'rows' -> 0 -> 'thresholds_display'));
---
--- 2) 새 decision 컬럼이 반환되는가(값은 이 PR 배포 이후 run 부터 채워진다)
--- SELECT jsonb_object_keys(
---          (news_diag_list_decisions('<run_id>'::uuid, 200, 0) -> 'rows' -> 0));
+-- ⚠️ 실행은 05_POSTCHECK.sql 을 쓰세요. 아래 예시는 위치 인자라 실제 시그니처와
+--    맞지 않습니다(list_decisions 는 인자가 8개 — p_run_id 뒤에 p_since/p_until/
+--    p_category/p_reason_code/p_keyword 가 있다). 이름 지정 인자(=>)로 부를 것.
 
 
 -- ---------------------------------------------------------------------
