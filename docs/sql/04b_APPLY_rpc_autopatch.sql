@@ -78,14 +78,14 @@ BEGIN
   END IF;
 
   IF position('''pre_cut_rank''' in v_src) > 0 THEN
-    v_skip := v_skip || 'news_diag_list_decisions(이미 패치됨)';
+    v_skip := v_skip || 'news_diag_list_decisions(이미 패치됨)'::text;
   ELSE
     IF position(c_dec_anchor in v_src) = 0 THEN
       RAISE EXCEPTION 'list_decisions 앵커를 찾지 못했습니다 — 수동 편집 필요(04_APPLY_rpc.md)';
     END IF;
     v_new := replace(v_src, c_dec_anchor, c_dec_repl);
     EXECUTE v_new;
-    v_done := v_done || 'news_diag_list_decisions';
+    v_done := v_done || 'news_diag_list_decisions'::text;
   END IF;
 
   -- ─────────────── [3] news_diag_record_run ───────────────
@@ -97,7 +97,7 @@ BEGIN
   END IF;
 
   IF position('pre_cut_rank' in v_src) > 0 THEN
-    v_skip := v_skip || 'news_diag_record_run(이미 패치됨)';
+    v_skip := v_skip || 'news_diag_record_run(이미 패치됨)'::text;
   ELSE
     -- 세 앵커가 **각각 정확히 1회**여야 한다. 아니면 손대지 않는다.
     IF position(c_ins_anchor in v_src) = 0
@@ -115,7 +115,7 @@ BEGIN
       RAISE EXCEPTION 'record_run 치환 검증 실패 — 적용하지 않았습니다';
     END IF;
     EXECUTE v_new;
-    v_done := v_done || 'news_diag_record_run';
+    v_done := v_done || 'news_diag_record_run'::text;
   END IF;
 
   RAISE NOTICE 'patched=% skipped=%', v_done, v_skip;
