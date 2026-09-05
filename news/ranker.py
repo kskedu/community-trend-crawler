@@ -917,6 +917,85 @@ def _anchor_grounded_in_articles(anchors: set, articles: List[Dict]) -> bool:
     return _combo_span_grounded(anchors, articles)
 
 
+# 동일 coverage 경로에서 "같은 사건을 각자 취재한 독립 보도의 수"로 인정할 최소값.
+# 이 경로의 오탐(false merge)은 **한 건의 나열(roundup) 기사**가 두 키워드 검색에
+# 모두 잡혀 서로 다른 사건을 붙이는 구조다("최정원 소송"+"두산에너빌리티 수주" 한
+# 문서). 제휴 전재로 URL 이 여러 개가 돼도 near-dup 으로 접으면 결국 1건이다.
+# 반대로 진짜 같은 사건은 서로 다른 매체가 **각자 다른 제목으로** 같은 사건을
+# 보도하므로 near-dup 으로 접어도 여러 건이 남는다(2026-09-05 21:47 운영 사례:
+# 이란 호르무즈 경고 8건, 전부 다른 제목/매체).
+_SAME_EVENT_MIN_INDEPENDENT_REPORTS = 3
+
+
+def _independent_report_count(articles: List[Dict]) -> int:
+    """near-dup 제목을 접은 뒤 남는 "독립 보도" 수.
+
+    같은 기사가 제휴/전재로 여러 URL 을 달아도 1건으로 센다(_is_near_duplicate_title
+    계약 재사용). 나열 기사 한 건이 여러 매체에 전재된 경우와 서로 다른 매체가 같은
+    사건을 각자 보도한 경우를 가르는 것이 이 함수의 목적이다.
+    """
+    reps: List[set] = []
+    count = 0
+    for a in articles or []:
+        toks = _title_tokens_of(a)
+        if any(_is_near_duplicate_title(toks, r) for r in reps):
+            continue
+        reps.append(toks)
+        count += 1
+    return count
+
+
+def _article_mentions_anchor(article: Dict, anchors: set) -> bool:
+    """기사 한 건(제목+snippet)에 anchor 집합의 토큰이 하나라도 등장하는지.
+
+    span/근접 조건 없이 "이 기사가 그 키워드를 다루는가"만 본다 — 근접 조건은
+    _anchor_grounded_in_articles 가 이미 담당하고, 여기서는 여러 독립 보도가
+    **양쪽 키워드를 함께** 다루는지를 보는 것이 목적이다. 빈 anchor 는 거짓
+    (자명 통과 금지 — _anchor_grounded_in_articles 와 동일 계약).
+    """
+    if not anchors:
+        return False
+    toks = _tokens_of(article)
+    return any(_word_contains_token(t, c, anchors) for t in toks for c in anchors)
+
+
+def _corroborated_by_independent_reports(
+    item_a: Dict, item_b: Dict, shared: List[Dict]
+) -> bool:
+    """양쪽 keyword 를 함께 다루는 **독립 보도**가 충분히 많은지(동일 coverage 전용).
+
+    동일 coverage 분기의 기존 통과 조건은 "anchor 합집합이 한 기사 한 필드의 근접
+    span 안에 함께 등장"이다. 이 조건은 매체마다 표현이 갈리는 사건에서 실패한다 —
+    2026-09-05 21:47 운영 사례에서 '이란 한국 경고'와 '이란 당국자 간주'는 8건의
+    기사가 **완전히 동일**(URL 8/8 일치, 대표 기사도 동일)한데도, 어느 한 제목도
+    {이란,한국,경고,당국자,간주} 5개를 모두 담지 못해 분리됐다(KBS 제목은 '고위당국자'
+    를 한 단어로 써서 '당국자' 토큰이 없어 1개 차이로 탈락). 결과적으로 같은 사건이
+    Top10 에 rank4/rank7 두 줄로 노출됐다.
+
+    그래서 span 조건과 **택일(OR)** 로 쓸 수 있는 두 번째 근거를 둔다: 서로 다른
+    매체가 각자 작성한 독립 보도 여러 건이 **모두** 양쪽 keyword 를 함께 다루면
+    같은 사건으로 본다. 나열(roundup) 기사는 이 조건을 만족시킬 수 없다 — 나열은
+    본질적으로 한 문서이고, 전재로 URL 이 늘어도 near-dup 으로 접히면 1건이라
+    _SAME_EVENT_MIN_INDEPENDENT_REPORTS 에 미치지 못한다.
+
+    "모두"(전건)를 요구하는 것이 핵심이다. 과반만 요구하면 서로 다른 사건을 다루는
+    기사 묶음에 나열 기사 몇 건이 섞였을 때 통과할 수 있다.
+    """
+    # 빈 anchor(일반어만인 keyword)는 _article_mentions_anchor 가 항상 거짓을 반환해
+    # together 가 비고 전건 조건에서 걸러진다(공집합 자명 통과 금지 —
+    # _anchor_grounded_in_articles 와 동일 계약). 여기서 따로 막지 않는다.
+    anchors_a = _keyword_anchor_tokens(item_a)
+    anchors_b = _keyword_anchor_tokens(item_b)
+    together = [
+        a
+        for a in shared
+        if _article_mentions_anchor(a, anchors_a) and _article_mentions_anchor(a, anchors_b)
+    ]
+    if len(together) != len(shared):
+        return False
+    return _independent_report_count(together) >= _SAME_EVENT_MIN_INDEPENDENT_REPORTS
+
+
 # 비공유 근거 경로에서 merge bridge 로 인정할 최소 "교차 근거 기사 수".
 # 1이면 다중 사건 나열(roundup) 기사 **한 건**만으로 서로 다른 이슈가 붙는다
 # (2026-09-03 06:48 운영 사례: 정몽규 그룹이 지예은/카사마츠/뉴욕증시 등 10개
@@ -1003,7 +1082,9 @@ def _is_same_issue(item_a: Dict, item_b: Dict) -> bool:
     판정 규칙(공유 근거 유무로 분기 — 공유 없음 경로는 기존과 완전 동일):
     - 공유 근거 없음: 기존 신호 그대로(_same_issue_evidence_signals에 전체 근거 전달).
     - 양쪽 근거가 전부 공유(동일 coverage): 문자열 유사 키워드거나, 두 keyword의
-      merge anchor 합집합이 공유 기사 한 필드 안에 span 제한으로 grounding될 때만 merge.
+      merge anchor 합집합이 공유 기사 한 필드 안에 span 제한으로 grounding되거나,
+      양쪽 keyword를 함께 다루는 **독립 보도**가 충분할 때만 merge
+      (_corroborated_by_independent_reports — 2026-09-05 21:47 false split 대응).
     - 한쪽 근거만 전부 공유(subset): 문자열 유사 키워드거나, subset 쪽 merge anchor가
       상대 잔여 기사 단일 필드에 grounding될 때만 merge('정평' ⊂ '문근영 결혼' 보존).
     - 양쪽 모두 잔여 근거 보유: 기존 신호를 잔여 근거만으로 재평가하고, 실패 시
@@ -1041,6 +1122,7 @@ def _is_same_issue(item_a: Dict, item_b: Dict) -> bool:
         # span 조건에서 배제된다. 알려진 한계: span 이내로 인접한 roundup 구획은
         # 여전히 merge될 수 있다(둘 다 roundup만으로 cohesion gate를 통과해야 하는
         # 희귀 케이스 — 관찰 로그로 추적).
+        # span 조건이 실패해도 독립 보도 근거(아래 fallback)로 merge될 수 있다.
         if _is_similar_keyword(kw_a, kw_b):
             return True
         # 동일 coverage는 subset/잔여 fallback과 달리 엄격 merge anchor가 아니라 일반
@@ -1054,9 +1136,17 @@ def _is_same_issue(item_a: Dict, item_b: Dict) -> bool:
         # 그때 shared_a만 보면 _is_same_issue(a,b) != _is_same_issue(b,a)가 되고,
         # dedupe_and_merge가 score 순서로 호출하므로 순위에 따라 병합 여부가 흔들린다.
         # 양쪽 공유 근거를 모두 근거로 인정해 판정을 대칭으로 유지한다(Codex diff 리뷰 P2).
-        return _anchor_grounded_in_articles(
+        if _anchor_grounded_in_articles(
             anchor_union, shared_a
-        ) or _anchor_grounded_in_articles(anchor_union, shared_b)
+        ) or _anchor_grounded_in_articles(anchor_union, shared_b):
+            return True
+        # span 조건 실패 fallback: 매체별 표현 차이로 어느 한 제목도 anchor 합집합을
+        # 모두 담지 못하는 진짜 중복(운영 21:47 '이란 한국 경고'/'이란 당국자 간주',
+        # 동일 기사 8/8)을 독립 보도 수로 구제한다. 나열 기사 bridge 는 near-dup 을
+        # 접으면 1건이라 통과하지 못한다.
+        return _corroborated_by_independent_reports(
+            item_a, item_b, shared_a
+        ) or _corroborated_by_independent_reports(item_a, item_b, shared_b)
 
     if not rest_a or not rest_b:
         # 한쪽만 전부 공유(subset). subset 쪽이 상대의 "자체 보도"에 실제로 등장해야
