@@ -9,7 +9,8 @@
 | 2 | `02_BACKUP_RPC_DEFS.sql` | 읽기 전용 — 결과를 rollback 원본으로 보관 |
 | 2b | `02b_BACKUP_thresholds_helper.sql` | 읽기 전용 — 진단 노출은 이 헬퍼가 담당 |
 | 3 | `03_APPLY_columns.sql` | 쓰기(컬럼 추가) — 파일 전체 복사 실행, 멱등 |
-| 4 | `04_APPLY_rpc.md` | 쓰기(RPC 교체) — 02 결과에 두 지점만 반영 |
+| 4a | `04a_APPLY_thresholds_helper.sql` | 쓰기 — 파일 전체 복사 실행 |
+| 4b | `04_APPLY_rpc.md` | 쓰기 — [2][3] 만 남음, 02 백업에 반영 |
 | 5 | `05_POSTCHECK.sql` | 읽기 전용 — 파일 전체 복사 실행 |
 | 6 | `NEWS_DIAG_COMPACT_FIELDS=1` | GitHub Actions env/variable → 이때부터 저장 시작 |
 

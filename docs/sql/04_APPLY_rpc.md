@@ -13,27 +13,15 @@ PostgREST 가 모호성 오류를 냅니다. 백업 정의를 붙여넣고 본�
 
 ## [1] `_news_diag_thresholds_display` — 진단 노출 (헬퍼)
 
-⚠️ **`news_diag_list_runs` 는 수정 대상이 아닙니다.** 그 함수는
-`_news_diag_thresholds_display(n.thresholds)` 를 부를 뿐이라, 고칠 곳은 이 헬퍼입니다.
+✅ **전체 파일로 준비됨 → `04a_APPLY_thresholds_helper.sql` 을 그대로 복사해 실행하세요.**
+이 문서에서 손으로 고칠 것은 없습니다.
 
-02b 로 현재 정의를 확인한 뒤, 반환값이 `collected_candidate_count` **하나만**
-남기고 있을 것입니다. `selection_diagnostics_v1` 을 함께 보존하도록 바꿉니다.
+⚠️ `news_diag_list_runs` 는 **수정 대상이 아닙니다.** 그 함수는
+`_news_diag_thresholds_display(n.thresholds)` 를 부를 뿐이라 헬퍼만 고치면 됩니다.
 
-반환 jsonb 를 만드는 마지막 표현식에 아래를 이어 붙이는 형태입니다:
-
-```sql
-||
-CASE WHEN p_thresholds ? 'selection_diagnostics_v1'
-       AND jsonb_typeof(p_thresholds -> 'selection_diagnostics_v1') = 'object'
-     THEN jsonb_build_object('selection_diagnostics_v1',
-                             p_thresholds -> 'selection_diagnostics_v1')
-     ELSE '{}'::jsonb
-END
-```
-
-* 인자 이름은 02b 결과의 실제 이름을 쓰세요(`p_thresholds` 가 아닐 수 있습니다).
-* 기존 `collected_candidate_count` 키는 그대로 남습니다 → 하위호환 유지.
-* `jsonb_typeof` 검사는 이 헬퍼의 기존 "유효한 값만 노출" 방침과 맞춘 것입니다.
+바뀐 동작 한 가지: 진단만 있고 `collected_candidate_count` 가 없던 run 은 지금까지
+`thresholds_display` 가 통째로 NULL 이었는데, 이제 진단이 실린 객체를 반환합니다.
+기존 Admin 은 이 키를 읽지 않으므로 영향 없습니다.
 
 ---
 
