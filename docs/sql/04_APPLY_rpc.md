@@ -60,3 +60,41 @@ END
 
 `02_BACKUP_RPC_DEFS.sql` 로 보관한 `definition` 을 그대로 `CREATE OR REPLACE` 하면 원복됩니다.
 컬럼은 되돌릴 필요 없습니다(NULL 허용, 안 읽으면 무해).
+
+---
+
+## ⚠️ PRECHECK 실측 반영 (2026-09-06)
+
+**시그니처를 한 글자도 바꾸지 마세요.** `CREATE OR REPLACE FUNCTION` 은 인자 목록이
+다르면 교체가 아니라 **새 오버로드**를 만듭니다. 그러면 PostgREST 가 어느 쪽을 부를지
+몰라 모호성 오류를 내고, 진단 조회가 통째로 깨집니다.
+
+실측된 현재 시그니처:
+
+```
+news_diag_list_runs(p_since timestamptz, p_until timestamptz, p_status text,
+                    p_limit integer, p_offset integer)
+
+news_diag_list_decisions(p_run_id uuid, p_since timestamptz, p_until timestamptz,
+                         p_category text, p_reason_code text, p_keyword text,
+                         p_limit integer, p_offset integer)
+
+news_diag_record_run(p_run jsonb, p_decisions jsonb)
+```
+
+`list_decisions` 는 인자가 **8개**입니다(위 [2] 예시보다 많음). 02 백업 정의를
+그대로 붙여넣고 본문만 고치면 자연히 지켜집니다.
+
+**셋 다 `SECURITY DEFINER` 입니다.** 이 키워드를 빠뜨리면 INVOKER 로 바뀌어
+테이블 접근 권한을 잃습니다(`news_keyword_*` 직접 SELECT 는 막혀 있음).
+`GRANT` 는 `postgres` / `service_role` EXECUTE — **건드리지 마세요**.
+
+교체 후 오버로드가 안 생겼는지 확인(1/1/1 이어야 정상):
+
+```sql
+SELECT p.proname, count(*) AS overloads
+  FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+ WHERE n.nspname = 'public'
+   AND p.proname IN ('news_diag_list_runs','news_diag_list_decisions','news_diag_record_run')
+ GROUP BY p.proname ORDER BY p.proname;
+```
