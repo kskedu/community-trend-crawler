@@ -1,100 +1,117 @@
-# 04_APPLY_rpc — RPC 2개 교체 (상용 Supabase)
+# 04_APPLY_rpc — 상용 Supabase, 쓰기
 
-RPC 본문은 저장소에 없고 **DB 안에만** 있습니다. 그래서 이 단계만 전체 파일을 미리 못 만듭니다.
-`02_BACKUP_RPC_DEFS.sql` 결과의 `definition` 을 붙여넣고 **아래 두 지점만** 바꾼 뒤 실행하세요.
+02 / 02b 백업을 먼저 확보하세요. 아래는 **실제 배포 정의를 읽고 확정한** 내용입니다.
 
-`CREATE OR REPLACE FUNCTION` 그대로 씁니다. DROP 금지, 기존 반환 키 삭제·개명 금지, GRANT 변경 금지.
+셋 다 `SECURITY DEFINER` + `SET search_path TO 'pg_catalog', 'public'` 입니다.
+`CREATE OR REPLACE` 할 때 이 두 줄을 그대로 유지하세요. 빠뜨리면 권한/해석이 바뀝니다.
+`GRANT`(postgres / service_role EXECUTE)는 건드리지 마세요.
 
-## [1] news_diag_list_runs — thresholds_display 계산부
+시그니처도 한 글자도 바꾸지 마세요 — 다르면 교체가 아니라 **새 오버로드**가 생겨
+PostgREST 가 모호성 오류를 냅니다. 백업 정의를 붙여넣고 본문만 고치면 자연히 지켜집니다.
 
-지금은 `collected_candidate_count` 만 남기고 나머지를 버립니다. 진단을 함께 보존하도록:
+---
+
+## [1] `_news_diag_thresholds_display` — 진단 노출 (헬퍼)
+
+⚠️ **`news_diag_list_runs` 는 수정 대상이 아닙니다.** 그 함수는
+`_news_diag_thresholds_display(n.thresholds)` 를 부를 뿐이라, 고칠 곳은 이 헬퍼입니다.
+
+02b 로 현재 정의를 확인한 뒤, 반환값이 `collected_candidate_count` **하나만**
+남기고 있을 것입니다. `selection_diagnostics_v1` 을 함께 보존하도록 바꿉니다.
+
+반환 jsonb 를 만드는 마지막 표현식에 아래를 이어 붙이는 형태입니다:
 
 ```sql
-jsonb_build_object(
-  'collected_candidate_count', r.thresholds -> 'collected_candidate_count'
-)
 ||
-CASE WHEN r.thresholds ? 'selection_diagnostics_v1'
+CASE WHEN p_thresholds ? 'selection_diagnostics_v1'
+       AND jsonb_typeof(p_thresholds -> 'selection_diagnostics_v1') = 'object'
      THEN jsonb_build_object('selection_diagnostics_v1',
-                             r.thresholds -> 'selection_diagnostics_v1')
+                             p_thresholds -> 'selection_diagnostics_v1')
      ELSE '{}'::jsonb
 END
 ```
 
-기존 키는 그대로 남으므로 하위호환이 유지됩니다.
-
-## [2] news_diag_list_decisions — 반환 row 구성부
-
-기존 21개 키는 그대로 두고 **추가만** 합니다:
-
-```sql
-'pre_cut_rank',             d.pre_cut_rank,
-'independent_family_count', d.independent_family_count,
-'unique_url_count',         d.unique_url_count,
-'unique_domain_count',      d.unique_domain_count,
-'merge_mode',               d.merge_mode,
-'shared_evidence_count',    d.shared_evidence_count,
-'residual_support_winner',  d.residual_support_winner,
-'residual_support_self',    d.residual_support_self,
-'merge_reason',             d.merge_reason,
-```
-
-## [3] news_diag_record_run — INSERT 컬럼 목록
-
-`p_decisions` jsonb 를 풀어 INSERT 하는 부분에 위 9개를 추가합니다.
-키가 없으면 NULL 이 되어 **구버전 클라이언트와도 호환**됩니다:
-
-```sql
-(x ->> 'pre_cut_rank')::int,
-(x ->> 'independent_family_count')::int,
-(x ->> 'unique_url_count')::int,
-(x ->> 'unique_domain_count')::int,
-(x ->> 'merge_mode'),
-(x ->> 'shared_evidence_count')::int,
-(x ->> 'residual_support_winner')::int,
-(x ->> 'residual_support_self')::int,
-(x ->> 'merge_reason')
-```
-
-## rollback
-
-`02_BACKUP_RPC_DEFS.sql` 로 보관한 `definition` 을 그대로 `CREATE OR REPLACE` 하면 원복됩니다.
-컬럼은 되돌릴 필요 없습니다(NULL 허용, 안 읽으면 무해).
+* 인자 이름은 02b 결과의 실제 이름을 쓰세요(`p_thresholds` 가 아닐 수 있습니다).
+* 기존 `collected_candidate_count` 키는 그대로 남습니다 → 하위호환 유지.
+* `jsonb_typeof` 검사는 이 헬퍼의 기존 "유효한 값만 노출" 방침과 맞춘 것입니다.
 
 ---
 
-## ⚠️ PRECHECK 실측 반영 (2026-09-06)
+## [2] `news_diag_list_decisions` — 새 컬럼 반환
 
-**시그니처를 한 글자도 바꾸지 마세요.** `CREATE OR REPLACE FUNCTION` 은 인자 목록이
-다르면 교체가 아니라 **새 오버로드**를 만듭니다. 그러면 PostgREST 가 어느 쪽을 부를지
-몰라 모호성 오류를 내고, 진단 조회가 통째로 깨집니다.
+`jsonb_build_object(...)` 안의 기존 21개 키는 그대로 두고 **뒤에 추가만** 합니다.
+`'created_at', n.created_at` 앞이나 뒤 어디든 됩니다:
 
-실측된 현재 시그니처:
-
-```
-news_diag_list_runs(p_since timestamptz, p_until timestamptz, p_status text,
-                    p_limit integer, p_offset integer)
-
-news_diag_list_decisions(p_run_id uuid, p_since timestamptz, p_until timestamptz,
-                         p_category text, p_reason_code text, p_keyword text,
-                         p_limit integer, p_offset integer)
-
-news_diag_record_run(p_run jsonb, p_decisions jsonb)
+```sql
+'pre_cut_rank',             n.pre_cut_rank,
+'independent_family_count', n.independent_family_count,
+'unique_url_count',         n.unique_url_count,
+'unique_domain_count',      n.unique_domain_count,
+'merge_mode',               n.merge_mode,
+'shared_evidence_count',    n.shared_evidence_count,
+'residual_support_winner',  n.residual_support_winner,
+'residual_support_self',    n.residual_support_self,
+'merge_reason',             n.merge_reason,
 ```
 
-`list_decisions` 는 인자가 **8개**입니다(위 [2] 예시보다 많음). 02 백업 정의를
-그대로 붙여넣고 본문만 고치면 자연히 지켜집니다.
+⚠️ 별칭은 `d.` 가 아니라 **`n.`** 입니다(`numbered` CTE 기준). `d.*` 로 흘러오므로
+03 을 먼저 실행해 컬럼이 있어야 합니다.
 
-**셋 다 `SECURITY DEFINER` 입니다.** 이 키워드를 빠뜨리면 INVOKER 로 바뀌어
-테이블 접근 권한을 잃습니다(`news_keyword_*` 직접 SELECT 는 막혀 있음).
-`GRANT` 는 `postgres` / `service_role` EXECUTE — **건드리지 마세요**.
+`p_reason_code` 화이트리스트는 그대로 두세요 — 13개 canonical 은 이번에 안 바뀝니다.
 
-교체 후 오버로드가 안 생겼는지 확인(1/1/1 이어야 정상):
+---
+
+## [3] `news_diag_record_run` — 새 컬럼 저장
+
+두 군데를 같이 고쳐야 합니다. **하나만 고치면 컬럼 수가 안 맞아 실패합니다.**
+
+INSERT 컬럼 목록 끝에:
+
+```sql
+, pre_cut_rank, independent_family_count, unique_url_count, unique_domain_count
+, merge_mode, shared_evidence_count, residual_support_winner, residual_support_self
+, merge_reason
+```
+
+SELECT 목록 끝에(`d.articles` 뒤):
+
+```sql
+, d.pre_cut_rank, d.independent_family_count, d.unique_url_count, d.unique_domain_count
+, d.merge_mode, d.shared_evidence_count, d.residual_support_winner, d.residual_support_self
+, d.merge_reason
+```
+
+`jsonb_to_recordset(p_decisions) AS d(...)` 컬럼 정의 목록 끝에:
+
+```sql
+, pre_cut_rank integer, independent_family_count integer
+, unique_url_count integer, unique_domain_count integer
+, merge_mode text, shared_evidence_count integer
+, residual_support_winner integer, residual_support_self integer
+, merge_reason text
+```
+
+`jsonb_to_recordset` 은 **정의 목록에 없는 키를 조용히 무시**합니다.
+그래서 이 단계 전에 새 키가 도착해도 에러 없이 버려질 뿐입니다(유실이지 장애 아님).
+
+---
+
+## 교체 후 확인
+
+오버로드가 안 생겼는지(전부 1 이어야 정상):
 
 ```sql
 SELECT p.proname, count(*) AS overloads
   FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
  WHERE n.nspname = 'public'
-   AND p.proname IN ('news_diag_list_runs','news_diag_list_decisions','news_diag_record_run')
+   AND p.proname IN ('news_diag_list_runs','news_diag_list_decisions',
+                     'news_diag_record_run','_news_diag_thresholds_display')
  GROUP BY p.proname ORDER BY p.proname;
 ```
+
+그 다음 `05_POSTCHECK.sql` 을 실행하세요.
+
+## rollback
+
+02 / 02b 로 보관한 `definition` 을 그대로 `CREATE OR REPLACE` 하면 원복됩니다.
+컬럼은 되돌릴 필요 없습니다(NULL 허용, 안 읽으면 무해).

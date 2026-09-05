@@ -7,6 +7,7 @@
 |---|---|---|
 | 1 | `01_PRECHECK.sql` | 읽기 전용 — 파일 전체 복사 실행 |
 | 2 | `02_BACKUP_RPC_DEFS.sql` | 읽기 전용 — 결과를 rollback 원본으로 보관 |
+| 2b | `02b_BACKUP_thresholds_helper.sql` | 읽기 전용 — 진단 노출은 이 헬퍼가 담당 |
 | 3 | `03_APPLY_columns.sql` | 쓰기(컬럼 추가) — 파일 전체 복사 실행, 멱등 |
 | 4 | `04_APPLY_rpc.md` | 쓰기(RPC 교체) — 02 결과에 두 지점만 반영 |
 | 5 | `05_POSTCHECK.sql` | 읽기 전용 — 파일 전체 복사 실행 |
