@@ -58,6 +58,28 @@ RANK_CUTOFF = "RANK_CUTOFF"
 # RPC가 강제하는 decisions 상한(초과 시 EXCEPTION) — 클라이언트에서 먼저 방어한다.
 MAX_DECISIONS = 200
 
+# compact 관측 필드(2026-09) — 배포 순서 안전장치.
+#
+# 이 필드들은 배포 SQL 이 news_keyword_decisions 에 컬럼을 추가하고
+# news_diag_record_run 이 그것을 읽도록 갱신된 **뒤에야** 저장될 수 있다. 그 전에
+# 보내면 RPC 가 알 수 없는 키를 어떻게 처리하는지에 따라 진단 적재 전체가 조용히
+# 실패할 수 있다(RUN_TYPES CHECK 전례 — 단위 테스트로는 잡히지 않는다).
+#
+# 그래서 코드 PR 은 기본 OFF 로 배포한다. SQL APPLY 후 환경변수로 켠다:
+#     NEWS_DIAG_COMPACT_FIELDS=1
+# 값이 켜져 있지 않으면 payload 조립 단계에서 이 키들을 **제거**한다 — 수집·계산은
+# 그대로 되므로(테스트가 검증하는 대상) 켜는 즉시 저장이 시작된다.
+COMPACT_FIELDS = (
+    "pre_cut_rank", "independent_family_count", "unique_url_count",
+    "unique_domain_count", "merge_mode", "shared_evidence_count",
+    "residual_support_winner", "residual_support_self",
+)
+
+
+def compact_fields_enabled():
+    """배포 SQL 적용 후에만 True. 기본 OFF(안전측)."""
+    return os.getenv("NEWS_DIAG_COMPACT_FIELDS", "").strip().lower() in ("1", "true", "yes", "on")
+
 # 배포 SQL의 news_keyword_runs.run_type CHECK와 1:1. 여기 없는 값을 보내면 RPC 내부
 # INSERT가 CHECK 위반으로 실패해 **모든 진단 적재가 조용히 실패**한다(RPC를 mock한
 # 단위 테스트로는 잡히지 않음 — Codex diff review P1).
@@ -89,6 +111,59 @@ def _norm_key(keyword):
     display_keyword(merge 후 변형)나 객체 identity(dict 복사로 깨짐)를 쓰지 않는다.
     """
     return (keyword or "").strip().lower()
+
+
+# 후보 1건의 compact 근거 요약(2026-09, 관측성 PR). 기사 본문/제목/URL 전문을 복제하지
+# 않고 **정수 카운트와 짧은 enum만** 남긴다 — 과거 run 하나만으로 "왜 이 후보가 떨어졌나"를
+# 되짚기 위한 최소 집합이다. URL은 도메인 종수로만 접는다(hash/전문 저장 없음).
+#
+# 이 함수는 순수 관찰이며 랭킹 입력을 읽기만 한다(어떤 dict도 변형하지 않는다).
+def evidence_summary(item):
+    """랭킹 item에서 compact 근거 카운트를 뽑는다. 실패해도 None만 반환(랭킹 무관).
+
+    반환 키(값이 None/0이 아닐 때만 record()가 저장한다):
+      article_count            근거 기사 수(정제 전 news_meta.articles)
+      unique_url_count         고유 URL 수
+      unique_domain_count      고유 도메인 수(URL 전문 대신 이것만 남긴다)
+      independent_family_count source_consensus가 세는 독립 홈/트렌드 family 수
+    """
+    articles = ((item.get("news_meta") or {}).get("articles") or [])
+    if not isinstance(articles, list):
+        articles = []
+    urls = set()
+    domains = set()
+    for a in articles:
+        # url이 문자열이 아니면(upstream 스키마 변형) 조용히 건너뛴다. 여기서 예외가
+        # 나면 _diag_record_pass 전체가 중단돼 **그 run의 decisions 전부**가 사라진다 —
+        # 부가 카운트 하나 때문에 진단 본체를 잃지 않는다(§순수 관찰, fail-open).
+        url = a.get("url") if isinstance(a, dict) else None
+        if not isinstance(url, str) or not url:
+            continue
+        urls.add(url)
+        # 도메인만 남긴다 — path/query에는 기사 식별자·추적 파라미터가 실린다.
+        host = url.split("//", 1)[-1].split("/", 1)[0].split("?", 1)[0]
+        if host:
+            domains.add(host.lower())
+    return {
+        "article_count": len(articles),
+        "unique_url_count": len(urls),
+        "unique_domain_count": len(domains),
+        "independent_family_count": _independent_family_count(item),
+    }
+
+
+def _independent_family_count(item):
+    """독립 홈/트렌드 family 수 — source_consensus 축이 세는 것과 동일 정의.
+
+    decisions.source_count(= len(sources) 전체)는 naver_news_aux/phrase까지 포함해
+    consensus family 수와 다르다(2026-09 감사에서 확인된 해석 함정). 두 값을 각각
+    남겨야 "왜 이 후보가 4위였나"를 되짚을 때 축을 잘못 읽지 않는다.
+    """
+    try:
+        from news.candidates import _INDEPENDENT_SEARCH_FAMILIES
+    except Exception:      # noqa: BLE001 — 진단 부가 정보. 실패해도 판정에 영향 없음.
+        return None
+    return len(set((item.get("sources") or {}).keys()) & _INDEPENDENT_SEARCH_FAMILIES)
 
 
 def _safe_article(article):
@@ -125,6 +200,9 @@ class PassSnapshot:
         self.closed = False
         # B2(no_representative)로 제외된 수 — 진단에서 cohesion 탈락과 분리(Codex 최종리뷰 P3).
         self.no_representative_excluded_count = 0
+        # 단계별 후보 수(2026-09 관측성). _diag_record_pass가 채워 넣고, 채택된 pass의
+        # 것만 commit()에서 run 레벨로 승격된다 — 폐기된 pass의 funnel은 섞이지 않는다.
+        self.funnel = None
 
     # -- 상태 --------------------------------------------------------------
 
@@ -258,6 +336,8 @@ class RunDiagnostics:
         # 채택 pass에서 B2(no_representative)로 제외된 수 — LOW_QUALITY_NEWS(cohesion 탈락)와
         # 진단상 섞이므로 selection_diagnostics에서 별도 집계하기 위해 보관(Codex 최종리뷰 P3).
         self.no_representative_excluded_count = 0
+        # 채택 pass의 단계별 funnel(selection_diagnostics_v1.counts에 실린다).
+        self.funnel = None
         self.final_snapshot = None
         self.degraded = False         # run 전역(공통 초기화/payload 조립 오류)
         self.errors = []
@@ -305,6 +385,7 @@ class RunDiagnostics:
         # 채택 pass의 B2 제외 수를 run 레벨로 승격(selection_diagnostics 별도 집계용).
         if snapshot is not None:
             self.no_representative_excluded_count = snapshot.no_representative_excluded_count
+            self.funnel = snapshot.funnel
 
     # -- 판정 --------------------------------------------------------------
 
@@ -324,6 +405,14 @@ class RunDiagnostics:
         decisions = snap.payload_decisions() if snap else []
         if len(decisions) > MAX_DECISIONS:
             raise ValueError("decisions over limit")
+        # 배포 SQL 적용 전에는 새 키를 보내지 않는다(위 COMPACT_FIELDS 주석 참조).
+        # score/article_count/merge_reason 은 기존에도 있던 컬럼이라 제거하지 않는다 —
+        # 비선정 행에 값이 채워지는 것뿐이고, 컬럼은 이미 존재한다.
+        if not compact_fields_enabled():
+            decisions = [
+                {k: v for k, v in d.items() if k not in COMPACT_FIELDS}
+                for d in decisions
+            ]
 
         thresholds = dict(self.thresholds)
         # 수집 원시 후보 수는 카운트 invariant 합계에 넣지 않는 별도 메타값(§8-1).

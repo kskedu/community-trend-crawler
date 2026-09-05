@@ -303,6 +303,9 @@ def _record_selection_diagnostics(run_diag, issues, seed_status_map, candidate_c
         "eligible": selected + rejection_counts.get("RANK_CUTOFF", 0),
         "selected": published,
     }
+    # 채택 pass 의 단계별 funnel 을 그대로 싣는다(관측 전용). pass_name 은 run 행에 이미 있어
+    # pass1/pass2 어느 쪽이 채택됐는지는 그 값으로 판별한다 — 여기서 중복 저장하지 않는다.
+    counts.update(getattr(run_diag, "funnel", None) or {})
     run_diag.mark_selection_diagnostics(
         underfill_reason=underfill_reason,
         counts=counts,
@@ -421,8 +424,29 @@ def _diag_record_pass(diag, candidates, signals, ranked, pr_excluded, merged,
     no_rep_keys = {nk(k) for k in (no_rep_excluded or [])}
     # B2 제외 수를 snapshot에 기록(진단에서 cohesion 탈락과 분리, Codex 최종리뷰 P3).
     diag.no_representative_excluded_count = len(no_rep_keys)
+    # funnel(2026-09, 순수 관찰): 단계별 후보 수. 지금까지 이 수치는 로그에만 남아
+    # 과거 run 을 DB 만으로 되짚을 때 "gate 통과 몇 개가 merge 로 몇 개가 됐는지"를
+    # 알 수 없었다. 채택 pass 의 것만 run 레벨로 승격된다(commit 시점).
+    diag.funnel = {
+        "candidates": len(candidates),
+        "ranked": len(ranked),
+        "merged": len(merged),
+        "kept": len(selected_pre_display),
+        "top": len(top),
+    }
     pre_display_keys = {nk(t["keyword"]) for t in selected_pre_display}
     merged_keys = {nk(m["keyword"]) for m in merged}
+    # --- 관측성(2026-09): 비선정 후보의 근거를 compact 하게 남기기 위한 조회 맵. ---
+    # select_top 은 kept 의 단순 슬라이스이므로(ranker.select_top) kept 의 index+1 이
+    # 곧 컷 이전 순위다. RANK_CUTOFF 후보가 "몇 위였는지"는 이 값 없이는 복원 불가였다.
+    pre_cut_rank = {nk(t["keyword"]): i + 1 for i, t in enumerate(selected_pre_display)}
+    # score/근거는 게이트 통과 시점(ranked)과 merge 이후(merged) 양쪽에 있다. merge 로
+    # 흡수된 후보는 merged 에 없으므로 ranked 를 fallback 으로 둔다.
+    scored_by_key = {nk(r["keyword"]): r for r in ranked}
+    for m in merged:
+        scored_by_key[nk(m["keyword"])] = m
+    # merge 위상: 흡수된 후보와 그 winner 사이의 근거 구조(관찰 전용, 판정 재실행 아님).
+    merged_by_key = {nk(m["keyword"]): m for m in merged}
     # merge로 흡수된 후보 → canonical 대표. related_keywords가 원본 keyword를 보존한다.
     absorbed = {}
     for m in merged:
@@ -444,6 +468,11 @@ def _diag_record_pass(diag, candidates, signals, ranked, pr_excluded, merged,
                 merge_reason=item.get("merge_reason"),
                 related_keywords=item.get("related_keywords"),
                 source_count=len(c.get("sources") or {}),
+                # source_count(전체 family)와 다르다 — source_consensus 축이 세는 독립
+                # family 수. 두 값을 혼동하면 "왜 이 후보가 4위였나"를 잘못 읽는다.
+                independent_family_count=diagnostics.evidence_summary(item).get(
+                    "independent_family_count"
+                ),
             )
             continue
 
@@ -480,10 +509,38 @@ def _diag_record_pass(diag, candidates, signals, ranked, pr_excluded, merged,
             status = diagnostics.STATUS_NOT_SELECTED
             reason = _diag_gate_reason_code(kw, signals)
 
+        # --- compact 진단 보강(2026-09, 순수 관찰) ---
+        # 지금까지 비선정 후보는 score/rank/근거가 전부 NULL 로 남아 과거 run 만으로는
+        # "rank 11 이었는지, 근거가 몇 건이었는지"를 복원할 수 없었다. 기사 본문/URL 을
+        # 복제하지 않고 정수 카운트만 덧붙인다.
+        scored = scored_by_key.get(key)
+        extra = {}
+        if scored is not None:
+            extra["score"] = scored.get("score")
+            extra["pre_cut_rank"] = pre_cut_rank.get(key)
+            ev = diagnostics.evidence_summary(scored)
+            extra["article_count"] = ev.get("article_count")
+            extra["unique_url_count"] = ev.get("unique_url_count")
+            extra["unique_domain_count"] = ev.get("unique_domain_count")
+            extra["independent_family_count"] = ev.get("independent_family_count")
+        winner_kw = absorbed.get(key)
+        if winner_kw is not None:
+            winner = merged_by_key.get(nk(winner_kw))
+            loser = scored_by_key.get(key)
+            if winner is not None and loser is not None:
+                topo = ranker.merge_evidence_topology(winner, loser)
+                extra["merge_mode"] = topo["mode"]
+                extra["shared_evidence_count"] = topo["shared_evidence_count"]
+                extra["residual_support_winner"] = topo["residual_support_a"]
+                extra["residual_support_self"] = topo["residual_support_b"]
+            if winner is not None:
+                extra["merge_reason"] = winner.get("merge_reason")
+
         diag.record(
             kw, status, reason,
             source_count=len(c.get("sources") or {}),
-            canonical_keyword=absorbed.get(key),
+            canonical_keyword=winner_kw,
+            **extra,
         )
 
 
