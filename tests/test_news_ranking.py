@@ -5537,6 +5537,85 @@ class TestRunSelectionStages(unittest.TestCase):
             "datalab": {}, "google": {},
         }
 
+    # --- merge 후 rank 11 승격 (2026-09-05 21:47 후속 확인) ---
+
+    _DUP_ARTICLES = [
+        ("이란 당국자 한국 미국 위해 희생 말라 발언 파문 확산", "https://s1.example.com/1"),
+        ("한국 호르무즈 파병 검토에 이란 직접 공격 간주 경고 나와", "https://s2.example.com/1"),
+        ("이란 고위 당국자 한국 호르무즈 개입 시 전쟁 참여로 간주", "https://s3.example.com/1"),
+        ("이란 한국 호르무즈 파병시 전쟁 참여 간주 좌시 안해 경고", "https://s4.example.com/1"),
+        ("이란 고위당국자 한국 호르무즈 개입시 전쟁 참여 간주 경고", "https://s5.example.com/1"),
+        ("한국 호르무즈 파병시 전쟁 참여로 간주 이란 공개 경고 발표", "https://s6.example.com/1"),
+    ]
+
+    def _promotion_case(self):
+        """ranking eligible 11개 + Top10 안의 genuine duplicate 1쌍.
+
+        중복쌍은 기사 집합이 완전히 동일하지만 어느 제목도 두 keyword 의 anchor 합집합을
+        모두 담지 않는다(운영 21:47 구조 재현). 나머지 9개는 서로 무관한 사건이다.
+        """
+        dup = [_article(t, u, t) for t, u in self._DUP_ARTICLES]
+        cands = [
+            {"keyword": "이란 한국 경고", "sources": {"daum_home": 1}},
+            {"keyword": "이란 당국자 간주", "sources": {"daum_home": 1}},
+        ]
+        news = {
+            "이란 한국 경고": _news(3, 1, 2, 0.9, articles=[dict(a) for a in dup]),
+            "이란 당국자 간주": _news(3, 1, 2, 0.9, articles=[dict(a) for a in dup]),
+        }
+        # 무관한 사건 9개 — score 내림차순이라 마지막이 rank 11 후보가 된다.
+        for i in range(9):
+            kw = f"독립사건{i}"
+            cands.append({"keyword": kw, "sources": {"daum_home": 1}})
+            news[kw] = _news(3, 1, 2, 0.9, articles=[
+                _article(f"{kw} 관련 상세 보도 내용 정리 기사 {j}", f"https://u{i}{j}.example.com/1",
+                         f"{kw} 관련 상세 보도")
+                for j in range(3)
+            ])
+        return cands, {"news": news, "datalab": {}, "google": {}}
+
+    def test_merge_frees_slot_and_rank11_is_promoted(self):
+        """중복 merge 로 자리가 비면 기존 rank 11 후보가 승격돼 selected 10 이 유지된다.
+
+        운영 21:47 사례의 selected-only replay 는 10→9 로 보이지만, 그것은 SELECTED 행만
+        입력한 재구성의 한계다(비선정 행은 근거 기사/score 가 보존되지 않아 전체 파이프
+        재현이 불가능). 실제 계약에서는 dedupe_and_merge 가 select_top **이전**에 돌고
+        select_top 은 단순 슬라이스이므로, merge 로 줄어든 만큼 하위 정상 후보가 그
+        자리를 채운다. 이 테스트가 그 계약을 고정한다.
+        """
+        cands, signals = self._promotion_case()
+        stages = ranker.run_selection_stages(cands, signals)
+        # 전제: ranking eligible 이 TOP_N 보다 많다(11개).
+        self.assertEqual(len(cands), 11)
+        self.assertGreater(len(stages["gate_passed"]), ranker.TOP_N)
+        # 중복쌍이 실제로 하나로 병합됐다.
+        merged_kws = [m["keyword"] for m in stages["merged"]]
+        self.assertEqual(len(stages["merged"]), len(stages["gate_passed"]) - 1)
+        self.assertNotIn("이란 당국자 간주", merged_kws)
+        absorbed = [
+            rel for m in stages["merged"] for rel in (m.get("related_keywords") or [])
+        ]
+        self.assertIn("이란 당국자 간주", absorbed)
+        # 병합 후에도 최종 selected 는 10 을 유지한다(하위 후보 승격).
+        self.assertEqual(len(stages["top"]), ranker.TOP_N)
+        # 승격 근거: merge 직전에는 후보가 11개였고 select_top 은 슬라이스만 한다.
+        self.assertEqual(len(stages["kept"]), ranker.TOP_N)
+
+    def test_underfill_only_when_no_safe_candidate_remains(self):
+        """안전 후보가 부족하면(정확히 TOP_N 개에서 중복 1쌍) 승격 없이 9개로 줄어든다.
+
+        빈자리를 아무 후보로나 강제로 채우지 않는다는 계약 — 위 승격 테스트와 짝이다.
+        """
+        cands, signals = self._promotion_case()
+        # rank 11 후보 하나를 제거해 eligible 을 정확히 TOP_N 으로 만든다.
+        drop = "독립사건8"
+        cands = [c for c in cands if c["keyword"] != drop]
+        signals["news"].pop(drop)
+        stages = ranker.run_selection_stages(cands, signals)
+        self.assertEqual(len(cands), ranker.TOP_N)
+        # 중복 1쌍이 병합되고 채울 후보가 없으므로 9개.
+        self.assertEqual(len(stages["top"]), ranker.TOP_N - 1)
+
     def test_contract_keys_and_top_equals_select_top(self):
         stages = ranker.run_selection_stages(self._cands(), self._signals())
         self.assertEqual(
