@@ -386,6 +386,36 @@ _GATE_REASON_CODES = {
 }
 
 
+def _diag_display_stage_reason_code(keyword, scored_item):
+    """display 정합성/grounding 단계 탈락의 실제 사유를 판정 함수 그대로 되짚는다.
+
+    반환은 배포 SQL reason_code CHECK 에 등록된 값만 쓴다:
+      · CANONICAL_SOURCE_UNGROUNDED — canonical 토큰 조합을 한 기사가 함께 뒷받침 못함.
+        단, migration 적용 전에는 emit 하지 않는다(diagnostics.grounding_reason_enabled()).
+      · DISPLAY_ARTICLE_INCONSISTENT — 그 외(기존 동작 그대로).
+
+    ⚠️ 판정 로직을 복제하지 않는다 — ranker 의 순수 관찰 함수를 호출한다.
+    ⚠️ 순서 계약: run_selection_stages 는 consistency → grounding 순으로 돈다. consistency
+       에서 이미 drop 된 후보는 grounding 을 통과할 기회가 없었으므로 grounding 사유를
+       붙이면 안 된다. 그래서 consistency 를 먼저 물어 살아남은 경우에만 grounding 을 본다.
+    ⚠️ scored_item 이 없으면(근거 복원 불가) 기존 코드로 안전하게 남긴다.
+    """
+    if scored_item is None:
+        return "DISPLAY_ARTICLE_INCONSISTENT"
+    if not diagnostics.grounding_reason_enabled():
+        return "DISPLAY_ARTICLE_INCONSISTENT"
+    try:
+        # 파이프라인과 동일 순서: consistency 가 살려보낸 경우에만 grounding 사유가 성립.
+        survived = ranker.enforce_display_article_consistency([dict(scored_item)])
+        if not survived:
+            return "DISPLAY_ARTICLE_INCONSISTENT"
+        if ranker.is_canonical_source_ungrounded(survived[0]):
+            return diagnostics.REASON_CANONICAL_SOURCE_UNGROUNDED
+    except Exception:                     # noqa: BLE001 — 진단 사유 판정 실패는 랭킹과 무관
+        return "DISPLAY_ARTICLE_INCONSISTENT"
+    return "DISPLAY_ARTICLE_INCONSISTENT"
+
+
 def _diag_gate_reason_code(keyword, signals):
     """compute_scores 내부 continue의 실제 사유를 판정 함수 그대로 호출해 얻는다.
 
@@ -498,12 +528,26 @@ def _diag_record_pass(diag, candidates, signals, ranked, pr_excluded, merged,
             status, reason = diagnostics.STATUS_NOT_SELECTED, "PR_CLUSTER"
         elif key in ranked_keys:
             # gate/PR/merge 어디에도 없는데 사라짐 → display 정합성 invariant 단계에서 탈락.
-            # 이 단계는 제외 목록을 반환하지 않으므로(반환 계약 불변 유지) 두 reject 분기를
+            # 이 단계는 제외 목록을 반환하지 않으므로(반환 계약 불변 유지) reject 분기를
             # 실제 판정 함수로 되짚어 구분한다 — 안 그러면 DISPLAY_GENERIC_ONLY가 영구
             # 도달 불가 코드가 된다(Codex diff review P1).
+            #
+            # 이 elif 에는 서로 **원인이 다른** 두 단계가 함께 들어온다(2026-09-06 진단 감사):
+            #   · enforce_display_article_consistency — display 가 표시 기사와 불일치.
+            #   · enforce_display_source_grounding    — canonical 토큰 조합을 한 기사가
+            #     함께 뒷받침하지 못함(분산/무근거). display 교정으로 구제 불가.
+            # 후자는 "표시 문구 문제"가 아니라 "근거 자체 없음"인데 지금까지 전부
+            # DISPLAY_ARTICLE_INCONSISTENT 로 기록됐다(운영 재현 101건 중 11건).
+            #
+            # 순서가 중요하다: consistency 가 **먼저** 돌아 drop 하면 grounding 은 실행조차
+            # 되지 않으므로, grounding 판정을 먼저 물으면 없는 원인을 만들어낸다
+            # (운영 재현에서 이 순서 위반 시 815건이 오귀속됐다). 그래서 파이프라인과
+            # 동일한 순서(consistency → grounding)로 되짚는다.
             status = diagnostics.STATUS_NOT_SELECTED
-            reason = ("DISPLAY_GENERIC_ONLY" if ranker._is_generic_only_display(kw)
-                      else "DISPLAY_ARTICLE_INCONSISTENT")
+            if ranker._is_generic_only_display(kw):
+                reason = "DISPLAY_GENERIC_ONLY"
+            else:
+                reason = _diag_display_stage_reason_code(kw, scored_by_key.get(key))
         else:
             # compute_scores 내부 continue — 실제 판정 함수로 사유를 확정한다(추측 금지).
             status = diagnostics.STATUS_NOT_SELECTED

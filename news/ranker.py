@@ -2733,6 +2733,35 @@ def _display_grounded_by_single_unit(check_tokens: set, units: List[tuple], alia
     return False
 
 
+def is_canonical_source_ungrounded(item: Dict) -> bool:
+    """이 item 이 canonical grounding fail-closed 로 drop 되는가(순수 관찰 — 진단 전용).
+
+    ⚠️ 판정을 다시 구현하지 않는다. `enforce_display_source_grounding` 의 0단계와 **같은
+    함수·같은 인자**(_invariant_check_tokens → _contextual_alias_forms →
+    _display_grounded_by_single_unit)를 그대로 호출한다. 규칙을 복제하면 향후 grounding
+    이 바뀔 때 진단이 조용히 거짓말을 하게 된다(merge_evidence_topology 와 동일 계약).
+
+    진단이 이 함수를 필요로 하는 이유: 두 enforce_* 단계는 제외 목록을 반환하지 않아
+    (반환 계약 불변 유지) main.py 는 "ranked 에 있었는데 merged 에서 사라짐"만 볼 수 있고,
+    그래서 서로 다른 원인을 한 reason_code 로 뭉쳐 기록해 왔다.
+
+    표시 기사가 없으면 grounding 은 fail-open(개입 안 함)이므로 여기서도 False.
+    """
+    news_meta = item.get("news_meta") or {}
+    articles = news_meta.get("articles") or []
+    units = _displayed_article_units(articles)
+    if not units:
+        return False
+    canonical = item.get("keyword", "")
+    canonical_check = _invariant_check_tokens(canonical)
+    if not canonical_check:
+        return False
+    display_for_alias = item.get("display_keyword") or canonical
+    alias_tokens = canonical_check | _invariant_check_tokens(display_for_alias)
+    alias_map = _contextual_alias_forms(alias_tokens, _displayed_articles(articles))
+    return not _display_grounded_by_single_unit(canonical_check, units, alias_map)
+
+
 def enforce_display_source_grounding(items: List[Dict]) -> List[Dict]:
     """display_keyword의 주요 비-generic 의미 토큰이 표시 기사에서 근거를 갖는지 확인하고,
     무근거 토큰은 안전하게 축약한다. 축약 후 의미가 성립하지 않으면 그 item을 drop한다.
