@@ -716,9 +716,18 @@ def _has_cross_keyword_anchor(
     # 붙었다(양쪽 다 shared DF 의 나머지는 '공개'/'6일' 같은 filler). PR #17/#19 가 공유
     # 근거 분기에만 쓰던 엄격 anchor(_merge_anchor_tokens)를 여기서도 쓴다. 판정 구조·
     # 임계값은 그대로고, 바뀌는 것은 "무엇을 anchor 로 인정하느냐"뿐이다.
+    # 넓은 지명("서울"/"제주")은 **교차 근거가 그것뿐일 때만** anchor 로 인정하지 않는다
+    # (2026-09-06 운영 false merge). 지명 자체를 anchor 집합에서 빼면(1차 검토안) 같은
+    # 경기·같은 사건을 지역명으로 잇는 정상 merge 가 함께 죽는다 — 14일 운영에서 교차
+    # anchor 가 광역지명뿐인 merge 8건 중 6건이 실제로 같은 사건이었다("광주 SSG KIA전"↔
+    # "광주 우천 취소", "제주 하예포구 사망"↔"제주 20대 발견"). 그 6건은 지명 말고도
+    # 교차 근거("SSG"/"우천"/"하예포구"/"20대")를 갖고 있고, false 2건("서울 7-0 대승"↔
+    # "최홍만 서울 집 공개", "제주 실종사건"↔"제주 장동혁 대표")은 지명 하나가 유일한
+    # 접점이며 DF 게이트의 나머지는 "5일"/"오후" 같은 filler 다. 그래서 지명을 지우는
+    # 대신 "지명 말고 남는 것이 있는가"를 묻는다.
     anchors_a = _merge_anchor_tokens(item_a)
     anchors_b = _merge_anchor_tokens(item_b)
-    if shared_tokens & (anchors_a | anchors_b):
+    if (shared_tokens & (anchors_a | anchors_b)) - _BROAD_LOCATION_TOKENS:
         return True
 
     if articles_a is None:
@@ -731,7 +740,7 @@ def _has_cross_keyword_anchor(
     tokens_in_b = set()
     for b in articles_b:
         tokens_in_b |= set(_tokens_of(b))
-    if anchors_a & tokens_in_b or anchors_b & tokens_in_a:
+    if ((anchors_a & tokens_in_b) | (anchors_b & tokens_in_a)) - _BROAD_LOCATION_TOKENS:
         return True
     return False
 
@@ -773,6 +782,22 @@ def _is_weak_numeric_anchor(token: str) -> bool:
     붙은 숫자("2경기"/"1240회"/"18호")는 그 사건에 고유할 수 있으므로 남긴다.
     """
     return token.isdigit() or bool(_YEAR_LIKE_TOKEN_RE.match(token))
+
+
+# 광역 지명 — 그 자체로는 "같은 사건"을 뜻하지 못하는 넓은 지역 토큰. 한국 광역자치단체
+# 17개 중 "경기"를 뺀 16개다. 경계를 **행정 단위**로 못박아 목록이 시간에 따라 늘어나지
+# 않게 한다(광역단체 신설은 수십 년에 한 번). "경기"는 14일 운영에서 anchor 로 쓰인
+# keyword 8종 중 6종이 스포츠 "경기"(K리그 100번째 경기·맨유 경기·하주석 경기)라
+# 지명 의미가 소수여서 제외한다 — 넣으면 진짜 사건 토큰을 약화시킨다.
+#
+# 여기 담긴 것은 **정확히 이 토큰 자체**뿐이다. 토크나이저(_TOKEN_RE)가 형태소 분석 없이
+# 자르므로 "서울대"·"서울역"·"서울시"·"서울세계불꽃축제"·"제주항공"·"부산국제영화제"는
+# 애초에 별개 토큰이라 이 집합에 걸리지 않는다(14일 운영에서 이런 compound 31종 실측).
+# 구체 지명("금천"·"하예포구"·"상암")도 마찬가지로 그대로 강한 anchor 로 남는다.
+_BROAD_LOCATION_TOKENS = {
+    "서울", "부산", "대구", "인천", "광주", "대전", "울산", "세종",
+    "강원", "충북", "충남", "전북", "전남", "경북", "경남", "제주",
+}
 
 
 def _merge_anchor_tokens(item: Dict) -> set:

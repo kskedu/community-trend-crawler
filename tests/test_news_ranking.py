@@ -2291,6 +2291,197 @@ class TestSameIssueMerge(unittest.TestCase):
         self.assertTrue(ranker._is_same_issue(a, b))
         self.assertEqual(len(ranker.dedupe_and_merge([a, b])), 1)
 
+    # --- 넓은 지명이 유일한 교차 anchor 인 merge (2026-09-06 운영 false merge) ---
+    # 구조 계약: "광역 지명 하나만 공통"이면 merge 근거로 부족하고, 지명 **말고도**
+    # 교차 근거가 있으면 기존대로 merge 된다. 특정 뉴스 문자열이 아니라 이 구조를
+    # 검증한다 — 지명 토큰은 운영에서 실제로 관측된 것을 쓰되, 사건 어휘는 임의다.
+
+    def test_broad_location_alone_does_not_bridge_unrelated_events(self):
+        """넓은 지명 하나 + filler 만 공통이면 서로 다른 사건은 merge 되지 않는다."""
+        a = self._ranked_with_articles("행사A 개막", 0.9, [
+            _article("행사A 서울에서 개막", "https://a.example.com/1", "5일 오후 서울 행사A가 열렸다"),
+            _article("서울 행사A 인파", "https://a.example.com/2", "5일 오후 서울 행사A에 인파가 몰렸다"),
+            _article("행사A 안전 대책", "https://a.example.com/3", "5일 오후 서울 행사A 대책이 나왔다"),
+        ])
+        b = self._ranked_with_articles("제도B 서울 확대", 0.7, [
+            _article("서울 제도B 대상 최다", "https://b.example.com/1", "5일 오후 서울 제도B 고지가 나갔다"),
+            _article("제도B 고지 확대", "https://b.example.com/2", "5일 오후 서울 제도B 대상이 늘었다"),
+            _article("서울 제도B 납부", "https://b.example.com/3", "5일 오후 서울 제도B 납부자가 늘었다"),
+        ])
+        ev_a = ranker._evidence_articles_of(a)
+        ev_b = ranker._evidence_articles_of(b)
+        shared = ranker._group_df_tokens(ev_a) & ranker._group_df_tokens(ev_b)
+        # 선행조건: DF 게이트는 통과하고(>=2), 교차 anchor 후보는 지명 하나뿐이어야
+        # 이 테스트가 지명 규칙을 검증한다(다른 게이트가 막아서 통과하면 자명 통과).
+        self.assertGreaterEqual(len(shared), ranker.REPRESENTATIVE_OVERLAP_MIN_SHARED_TOKENS)
+        anchors = ranker._merge_anchor_tokens(a) | ranker._merge_anchor_tokens(b)
+        self.assertEqual(shared & anchors, {"서울"})
+        # 격리: Jaccard 경로가 아니라 DF/anchor 경로여야 한다.
+        self.assertLess(ranker._pairwise_evidence_overlap(ev_a, ev_b),
+                        ranker.MERGE_ARTICLE_OVERLAP_THRESHOLD)
+        self.assertFalse(ranker._is_same_issue(a, b))
+        self.assertEqual(len(ranker.dedupe_and_merge([a, b])), 2)
+
+    def test_broad_location_with_strong_co_anchor_still_merges(self):
+        """지명 외에 사건 anchor 가 함께 교차하면 기존처럼 merge 된다(정상 보존)."""
+        a = self._ranked_with_articles("제주 장소C 사망", 0.9, [
+            _article("제주 장소C서 남성 숨진 채 발견", "https://a.example.com/1", "5일 오후 제주 장소C에서 발견됐다"),
+            _article("제주 장소C 사망 조사", "https://a.example.com/2", "5일 오후 제주 장소C 사망을 조사 중이다"),
+            _article("장소C 사망 신원 확인", "https://a.example.com/3", "5일 오후 제주 장소C 숨진 남성 신원을 확인했다"),
+        ])
+        b = self._ranked_with_articles("제주 실종자 발견", 0.7, [
+            _article("제주서 실종자 장소C서 발견", "https://b.example.com/1", "5일 오후 제주 장소C에서 실종자가 발견됐다"),
+            _article("제주 실종자 발견 당시", "https://b.example.com/2", "5일 오후 제주 장소C 인근에서 발견됐다"),
+            _article("제주 실종자 발견 경위", "https://b.example.com/3", "5일 오후 제주 장소C 발견 경위를 조사한다"),
+        ])
+        anchors = ranker._merge_anchor_tokens(a) | ranker._merge_anchor_tokens(b)
+        ev_a = ranker._evidence_articles_of(a)
+        ev_b = ranker._evidence_articles_of(b)
+        shared = ranker._group_df_tokens(ev_a) & ranker._group_df_tokens(ev_b)
+        # 선행조건: 지명 말고도 교차 anchor 가 실제로 존재해야 이 테스트가 의미를 갖는다.
+        self.assertTrue((shared & anchors) - ranker._BROAD_LOCATION_TOKENS)
+        self.assertTrue(ranker._is_same_issue(a, b))
+        self.assertEqual(len(ranker.dedupe_and_merge([a, b])), 1)
+
+    def test_broad_location_compound_is_not_treated_as_broad(self):
+        """'서울대'/'서울역'처럼 지명을 포함한 고유 compound 는 별개 토큰이라 강한 anchor 로 남는다."""
+        for compound in ("서울대", "서울역", "서울시청", "제주항공", "부산국제영화제"):
+            self.assertNotIn(compound, ranker._BROAD_LOCATION_TOKENS)
+            # 토크나이저가 실제로 쪼개지 않는지까지 확인(쪼개지면 위 단정이 무의미해진다).
+            self.assertEqual(
+                ranker._merge_anchor_tokens({"keyword": compound}), {compound})
+
+    def test_specific_place_name_remains_strong_anchor(self):
+        """구체 지역명(자치구/포구 등)은 약화 대상이 아니다."""
+        for place in ("금천", "강남", "상암", "하예포구"):
+            self.assertNotIn(place, ranker._BROAD_LOCATION_TOKENS)
+
+    def test_broad_location_alone_does_not_bridge_via_article_mention(self):
+        """2절(상대 기사에 anchor 등장)도 지명 하나만으로는 통과하지 못한다."""
+        a = self._ranked_with_articles("서울 7-0 대승", 0.9, [
+            _article("구단D 7-0 대승", "https://a.example.com/1", "5일 오후 서울에서 구단D가 대승했다"),
+            _article("구단D 7-0 완승", "https://a.example.com/2", "5일 오후 서울에서 구단D가 7골을 넣었다"),
+            _article("구단D 대승 인터뷰", "https://a.example.com/3", "5일 오후 서울 경기 후 감독이 말했다"),
+        ])
+        b = self._ranked_with_articles("인물E 서울 집 공개", 0.7, [
+            _article("인물E 서울 자택 공개", "https://b.example.com/1", "5일 오후 인물E가 서울 자택을 공개했다"),
+            _article("인물E 서울 집 화제", "https://b.example.com/2", "5일 오후 인물E의 서울 집이 공개됐다"),
+            _article("인물E 서울 근황", "https://b.example.com/3", "5일 오후 인물E가 서울에서 지내는 근황을 전했다"),
+        ])
+        ev_a = ranker._evidence_articles_of(a)
+        ev_b = ranker._evidence_articles_of(b)
+        tokens_in_a, tokens_in_b = set(), set()
+        for x in ev_a:
+            tokens_in_a |= set(ranker._tokens_of(x))
+        for x in ev_b:
+            tokens_in_b |= set(ranker._tokens_of(x))
+        anchors_a = ranker._merge_anchor_tokens(a)
+        anchors_b = ranker._merge_anchor_tokens(b)
+        # 선행조건: 2절 교차가 실제로 지명뿐이어야 한다.
+        self.assertEqual((anchors_a & tokens_in_b) | (anchors_b & tokens_in_a), {"서울"})
+        self.assertFalse(ranker._is_same_issue(a, b))
+
+    def test_location_compound_still_bridges_genuine_same_event(self):
+        """지명 compound('서울대')는 그 자체가 사건 식별자다 — 약화 대상이 아니다.
+
+        `_BROAD_LOCATION_TOKENS` 를 prefix 매칭으로 넓히면(과확장 mutant) 이 merge 가
+        죽는다. 정확 일치여야 함을 행동으로 고정한다.
+        """
+        # compound 가 1절·2절 **양쪽 모두에서 유일한** 교차 토큰이어야 prefix 과확장
+        # mutant 를 잡는다. 다른 사건 어휘가 하나라도 함께 겹치면 그 어휘로 통과해
+        # 이 테스트가 무의미해진다(실제로 "총장"/"수장"이 새어 mutant 가 살아남았다).
+        a = self._ranked_with_articles("서울대 총장 선출", 0.9, [
+            _article("서울대 새 총장 선출 절차 마무리", "https://a.example.com/1", "5일 오후 서울대 선출 절차가 끝났다"),
+            _article("서울대 총장 선출 결과 공표", "https://a.example.com/2", "5일 오후 서울대 총장 선출 결과가 나왔다"),
+            _article("서울대 총장 선출 마무리", "https://a.example.com/3", "5일 오후 서울대 총장 선출이 마무리됐다"),
+        ])
+        b = self._ranked_with_articles("서울대 기숙사 증축", 0.7, [
+            _article("서울대 기숙사 증축 착공", "https://b.example.com/1", "5일 오후 서울대 기숙사 증축이 시작됐다"),
+            _article("서울대 기숙사 증축 예산 확보", "https://b.example.com/2", "5일 오후 서울대 기숙사 예산이 확보됐다"),
+            _article("서울대 기숙사 증축 일정", "https://b.example.com/3", "5일 오후 서울대 기숙사 증축 일정이 나왔다"),
+        ])
+        ev_a = ranker._evidence_articles_of(a)
+        ev_b = ranker._evidence_articles_of(b)
+        # 선행조건: Jaccard 가 아니라 anchor 경로로 판정돼야 한다.
+        self.assertLess(ranker._pairwise_evidence_overlap(ev_a, ev_b),
+                        ranker.MERGE_ARTICLE_OVERLAP_THRESHOLD)
+        anchors_a = ranker._merge_anchor_tokens(a)
+        anchors_b = ranker._merge_anchor_tokens(b)
+        shared = ranker._group_df_tokens(ev_a) & ranker._group_df_tokens(ev_b)
+        tokens_in_a, tokens_in_b = set(), set()
+        for x in ev_a:
+            tokens_in_a |= set(ranker._tokens_of(x))
+        for x in ev_b:
+            tokens_in_b |= set(ranker._tokens_of(x))
+        # 1절·2절 모두 "서울대" 하나뿐 — prefix 로 넓히면 양쪽 다 비어 merge 가 끊긴다.
+        self.assertEqual(shared & (anchors_a | anchors_b), {"서울대"})
+        self.assertEqual((anchors_a & tokens_in_b) | (anchors_b & tokens_in_a), {"서울대"})
+        self.assertTrue(ranker._is_same_issue(a, b))
+        self.assertEqual(len(ranker.dedupe_and_merge([a, b])), 1)
+
+    def test_game_token_is_not_demoted_as_location(self):
+        """'경기'는 운영에서 스포츠 의미가 지배적이라 지명 집합에 넣지 않는다.
+
+        넣으면(과확장 mutant) 같은 경기를 다룬 정상 merge 가 끊긴다.
+        """
+        self.assertNotIn("경기", ranker._BROAD_LOCATION_TOKENS)
+        a = self._ranked_with_articles("구단J 경기 취소", 0.9, [
+            _article("구단J 경기 우천으로 취소", "https://a.example.com/1", "5일 오후 구단J 경기가 비로 취소됐다"),
+            _article("구단J 경기 순연 결정", "https://a.example.com/2", "5일 오후 구단J 경기 일정이 밀렸다"),
+            _article("구단J 경기 재편성 논의", "https://a.example.com/3", "5일 오후 구단J 경기 재편성이 논의된다"),
+        ])
+        b = self._ranked_with_articles("구단K 경기 순연", 0.7, [
+            _article("구단K 경기 순연 공지", "https://b.example.com/1", "5일 오후 구단K 경기가 순연됐다"),
+            _article("구단K 경기 취소 안내", "https://b.example.com/2", "5일 오후 구단K 경기 취소가 안내됐다"),
+            _article("구단K 경기 새 일정", "https://b.example.com/3", "5일 오후 구단K 경기 일정이 다시 잡혔다"),
+        ])
+        ev_a = ranker._evidence_articles_of(a)
+        ev_b = ranker._evidence_articles_of(b)
+        self.assertLess(ranker._pairwise_evidence_overlap(ev_a, ev_b),
+                        ranker.MERGE_ARTICLE_OVERLAP_THRESHOLD)
+        shared = ranker._group_df_tokens(ev_a) & ranker._group_df_tokens(ev_b)
+        anchors = ranker._merge_anchor_tokens(a) | ranker._merge_anchor_tokens(b)
+        # 교차 anchor 가 "경기" 하나여야 이 테스트가 '경기' 규칙을 검증한다.
+        self.assertEqual(shared & anchors, {"경기"})
+        self.assertTrue(ranker._is_same_issue(a, b))
+
+    def test_broad_location_chain_does_not_collapse_unrelated_events(self):
+        """지명 하나로 여러 무관 사건이 transitive 하게 한 그룹으로 붕괴하지 않는다."""
+        # 제목을 템플릿으로 찍으면 Jaccard 경로(>=0.5)가 먼저 발동해 지명 규칙이
+        # 검증되지 않는다 — 사건마다 다른 문장을 쓴다.
+        items = [
+            self._ranked_with_articles("서울 공연F 매진", 0.9, [
+                _article("공연F 전석 매진 기록", "https://f.example.com/1", "5일 오후 서울 공연장에서 공연F가 매진됐다"),
+                _article("공연F 추가 회차 편성", "https://f.example.com/2", "5일 오후 서울 공연F 티켓이 동났다"),
+                _article("공연F 관객 반응 뜨거워", "https://f.example.com/3", "5일 오후 서울에서 공연F 관객이 몰렸다"),
+            ]),
+            self._ranked_with_articles("서울 도로G 통제", 0.8, [
+                _article("도로G 전면 통제 시작", "https://g.example.com/1", "5일 오후 서울 도로G 차량 진입이 막혔다"),
+                _article("도로G 우회 노선 안내", "https://g.example.com/2", "5일 오후 서울 도로G 우회로가 안내됐다"),
+                _article("도로G 정체 극심", "https://g.example.com/3", "5일 오후 서울 도로G 일대가 밀렸다"),
+            ]),
+            self._ranked_with_articles("서울 판결H 선고", 0.7, [
+                _article("판결H 1심 선고 나와", "https://h.example.com/1", "5일 오후 서울 법원이 판결H를 선고했다"),
+                _article("판결H 양형 이유 공개", "https://h.example.com/2", "5일 오후 서울 재판부가 판결H 이유를 밝혔다"),
+                _article("판결H 항소 여부 관심", "https://h.example.com/3", "5일 오후 서울 판결H 항소가 거론된다"),
+            ]),
+            self._ranked_with_articles("서울 개장I 연기", 0.6, [
+                _article("개장I 일정 미뤄져", "https://i.example.com/1", "5일 오후 서울 개장I 계획이 연기됐다"),
+                _article("개장I 지연 배경 설명", "https://i.example.com/2", "5일 오후 서울 개장I 지연 사유가 나왔다"),
+                _article("개장I 새 일정 검토", "https://i.example.com/3", "5일 오후 서울 개장I 재개 시점을 검토한다"),
+            ]),
+        ]
+        # 선행조건: Jaccard 경로가 아니라 지명/DF 경로로 판정돼야 한다.
+        for x in range(len(items)):
+            for y in range(x + 1, len(items)):
+                self.assertLess(
+                    ranker._pairwise_evidence_overlap(
+                        ranker._evidence_articles_of(items[x]),
+                        ranker._evidence_articles_of(items[y])),
+                    ranker.MERGE_ARTICLE_OVERLAP_THRESHOLD)
+        merged = ranker.dedupe_and_merge([dict(i) for i in items])
+        self.assertEqual(len(merged), 4)
+
 
 class TestArticleDisplayFilter(unittest.TestCase):
     """개선 2: incidental/저관련 기사를 상세 articles에서 기본 제외."""
