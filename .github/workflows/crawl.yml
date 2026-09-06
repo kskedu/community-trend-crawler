@@ -57,4 +57,5 @@ jobs:
           GOOGLE_TRENDS_ENABLED: ${{ vars.GOOGLE_TRENDS_ENABLED || 'false' }}
           GOOGLE_TRENDS_PROVIDER: ${{ vars.GOOGLE_TRENDS_PROVIDER || 'rss' }}
           NEWS_DIAG_COMPACT_FIELDS: ${{ vars.NEWS_DIAG_COMPACT_FIELDS || '' }}
+          NEWS_DIAG_GROUNDING_REASON: ${{ vars.NEWS_DIAG_GROUNDING_REASON || '' }}
         run: python main.py "${{ steps.mode.outputs.RUN_MODE }}"
