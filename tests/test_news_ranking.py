@@ -2079,6 +2079,80 @@ class TestSameIssueMerge(unittest.TestCase):
         # 검색의도 suffix 제외는 기존 계약 그대로.
         self.assertEqual(ranker._merge_anchor_tokens({"keyword": "인물B 결혼 생각"}), {"인물B", "생각"})
 
+    def test_merge_anchor_tokens_excludes_year_expressions(self):
+        # 순수 숫자("2026")뿐 아니라 연도 표현("2026년"/"2026년도")도 같은 계열의 약한 anchor다.
+        # 접두 (19|20) + 4자리 + (년|년도) 형태만 제외한다 — `년`이 붙는 다른 표현은 전부 보존.
+        self.assertEqual(ranker._merge_anchor_tokens({"keyword": "가을축제 2026년"}), {"가을축제"})
+        self.assertEqual(ranker._merge_anchor_tokens({"keyword": "전시회J 2026년도"}), {"전시회J"})
+        self.assertEqual(ranker._merge_anchor_tokens({"keyword": "행사 2027"}), {"행사"})
+        # 기간·기념·일반 어휘의 "년"은 사건 고유 정보라 남는다(오탐 경계 고정).
+        self.assertEqual(
+            ranker._merge_anchor_tokens({"keyword": "데뷔 20주년 콘서트"}), {"데뷔", "20주년", "콘서트"}
+        )
+        self.assertEqual(ranker._merge_anchor_tokens({"keyword": "계약 3년 연장"}), {"계약", "3년", "연장"})
+        self.assertIn("향년", ranker._merge_anchor_tokens({"keyword": "향년 88세 별세"}))
+        self.assertIn("그랜드캐년", ranker._merge_anchor_tokens({"keyword": "그랜드캐년 여행"}))
+        # 실제 연도 범위(19|20) 밖의 4자리 + "년"은 연도가 아니므로 남는다 — 규칙이
+        # "숫자4+년" 전부가 아니라 실제 연도대에만 걸린다는 경계.
+        self.assertIn("2126년", ranker._merge_anchor_tokens({"keyword": "축제 2126년"}))
+        # 반면 순수 숫자는 연도 범위와 무관하게 isdigit 규칙으로 제외된다(기존 계약).
+        self.assertNotIn("2126", ranker._merge_anchor_tokens({"keyword": "축제 2126"}))
+
+    def _year_suffixed_festival(self, score=0.78):
+        # '가을축제 2026' 과 같은 구조지만 keyword 의 연도가 "2026년" 형태.
+        return self._ranked_with_articles("가을축제 2026년", score, [
+            _article("[포토] 도시 가을축제 2026년, 밤하늘을 수놓다", "https://fy.example.com/1",
+                     "6일 강변공원에서 열린 가을축제 2026년 행사"),
+            _article("[포토] 가을축제 2026년, 화려한 밤", "https://fy.example.com/2",
+                     "6일 밤 가을축제 2026년 현장"),
+            _article("통신사, 축제장 전용망 운영", "https://fy.example.com/3", "인파 안전관리"),
+            _article("축제 인파 100만 운집", "https://fy.example.com/4", "강변"),
+        ])
+
+    def _year_suffixed_unrelated(self, score=0.47):
+        return self._ranked_with_articles("선수A 상대B 결승", score, [
+            _article("선수A, 2026년 오픈 결승서 상대B 격파", "https://sy.example.com/1",
+                     "6일 선수A가 2026년 오픈 결승에서"),
+            _article("선수A 2026년 시즌 5번째 우승", "https://sy.example.com/2", "6일 상대B를 상대로 결승"),
+            _article("[포토] 선수A 결승 세리머니", "https://sy.example.com/3", "오픈"),
+            _article("상대B 꺾은 선수A", "https://sy.example.com/4", "배드민턴"),
+        ])
+
+    def test_year_suffixed_token_does_not_bridge_unrelated_event(self):
+        # 'X 2026' 과 완전히 같은 결함 구조인데 연도만 "2026년" 형태. 공유 기사 0,
+        # shared DF 는 {연도 표현, 날짜 filler} 뿐이고 연도가 winner keyword 에 들어 있다.
+        a, b = self._year_suffixed_festival(), self._year_suffixed_unrelated()
+        ev_a, ev_b = ranker._evidence_articles_of(a), ranker._evidence_articles_of(b)
+        sh_a, sh_b, _, _ = ranker._split_shared_evidence(ev_a, ev_b)
+        self.assertEqual((len(sh_a), len(sh_b)), (0, 0))               # 전제: NO_SHARED
+        shared = ranker._group_df_tokens(ev_a) & ranker._group_df_tokens(ev_b)
+        self.assertIn("2026년", shared)                                 # 전제: 연도 표현이 DF 공유
+        self.assertGreaterEqual(len(shared), ranker.REPRESENTATIVE_OVERLAP_MIN_SHARED_TOKENS)
+        self.assertFalse(shared & ranker._merge_anchor_tokens(a))       # 전제: 변별 anchor 안 겹침
+        self.assertFalse(shared & ranker._merge_anchor_tokens(b))
+        self.assertFalse(ranker._is_same_issue(a, b))
+        self.assertFalse(ranker._is_same_issue(b, a))                  # 대칭
+
+    def test_year_suffixed_keyword_genuine_same_event_still_merges(self):
+        # 같은 연도("2026년")를 공유해도 변별 anchor(행사명/주최사)가 상대 근거에 반복
+        # 등장하면 종전처럼 merge 된다 — 연도 제외는 변별력 있는 근거를 없애지 않는다.
+        a = self._ranked_with_articles("전시회J 2026년 참가", 0.8, [
+            _article("회사K, 전시회J 2026년 참가 확정", "https://gy.example.com/1", "6일 전시회J 부스"),
+            _article("전시회J 2026년 한국 기업 대거 참가", "https://gy.example.com/2", "회사K 부스"),
+            _article("전시회J 2026년 개막… 회사K 신작 공개", "https://gy.example.com/3", "개막"),
+        ])
+        b = self._ranked_with_articles("회사K 전시회J 부스", 0.7, [
+            _article("회사K 전시회J 부스 신작 4종 공개", "https://hy.example.com/1", "6일 전시회J 2026년"),
+            _article("회사K, 전시회J 부스서 신작 시연", "https://hy.example.com/2", "전시회J 2026년 참가"),
+            _article("전시회J 회사K 부스 인파", "https://hy.example.com/3", "개막"),
+        ])
+        # 전제: 연도를 뺀 뒤에도 변별 anchor 가 실제로 겹친다(이 테스트가 무엇을 지키는지 명시).
+        shared = ranker._group_df_tokens(ranker._evidence_articles_of(a)) & ranker._group_df_tokens(
+            ranker._evidence_articles_of(b))
+        self.assertTrue(shared & (ranker._merge_anchor_tokens(a) | ranker._merge_anchor_tokens(b)))
+        self.assertTrue(ranker._is_same_issue(a, b))
+        self.assertEqual(len(ranker.dedupe_and_merge([a, b])), 1)
+
     def test_cross_keyword_anchor_requires_discriminative_anchor(self):
         # shared 토큰이 keyword 에 "들어 있다"는 것만으로는 교차 anchor 가 아니다.
         # 연도·검색의도 suffix 는 자명하게 겹치므로 변별력 있는 anchor 만 인정한다.
