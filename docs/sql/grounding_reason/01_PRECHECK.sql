@@ -39,12 +39,22 @@ SELECT '2. CANONICAL_SOURCE_UNGROUNDED 등록 여부' AS section,
 UNION ALL
 
 -- 참고: 현재 저장된 reason_code 분포(오귀속 규모 파악용).
-SELECT '3. 최근 7일 reason_code 분포' AS section,
-       d.reason_code                   AS name,
-       count(*)::text                  AS detail
+-- ⚠️ runs 와 join 하지 않는다 — decisions 의 FK 컬럼명을 추측하면 42703 이 난다
+--    (실제로 r.id 로 썼다가 실패했다). 기간 필터 없이 decisions 만 집계한다.
+SELECT '3. reason_code 분포(전체 보존분)' AS section,
+       d.reason_code                     AS name,
+       count(*)::text                    AS detail
   FROM public.news_keyword_decisions d
-  JOIN public.news_keyword_runs      r ON r.id = d.run_id
- WHERE r.started_at >= now() - interval '7 days'
  GROUP BY d.reason_code
+
+UNION ALL
+
+-- 다음 단계(기간 필터 등)를 위해 두 테이블의 실제 컬럼명을 같이 뽑는다(추측 금지).
+SELECT '4. 테이블 컬럼 실측' AS section,
+       c.table_name || '.' || c.column_name AS name,
+       c.data_type                          AS detail
+  FROM information_schema.columns c
+ WHERE c.table_schema = 'public'
+   AND c.table_name IN ('news_keyword_decisions', 'news_keyword_runs')
 
  ORDER BY section, name;
