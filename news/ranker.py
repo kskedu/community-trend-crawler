@@ -25,6 +25,7 @@
   실패를 방어한다(§7-3).
 """
 import logging
+import re
 from typing import Callable, Dict, List, Optional
 
 from news.candidates import _INDEPENDENT_SEARCH_FAMILIES
@@ -706,8 +707,17 @@ def _has_cross_keyword_anchor(
     보정 경로는 잔여(비공유) 기사만 명시 전달해, 공유 roundup 기사가 anchor 등장 근거를
     스스로 충족시키는 우회를 막는다(Codex 계획리뷰 P1).
     """
-    anchors_a = _keyword_anchor_tokens(item_a)
-    anchors_b = _keyword_anchor_tokens(item_b)
+    # 교차 anchor 는 **변별력 있는** anchor 여야 한다(2026-09-06 운영 false merge 2건).
+    # _keyword_anchor_tokens 는 일반 사건 서술어만 빼고 검색의도 suffix("결혼")·display
+    # 일반어·순수 숫자("2026")를 남긴다. 그 토큰이 keyword 문자열에 들어 있다는 이유만으로
+    # "shared_tokens ∩ anchors" 가 자명하게 참이 되고, 아래 두 번째 절도 상대 기사에
+    # 그 토큰이 있다는 이유만으로 참이 된다 — '권은비 결혼 생각'↔'바타 지예은' 은 잔여
+    # 근거끼리 '결혼' 하나로, '안세영 미야자키 결승'↔'불꽃축제 2026' 은 '2026' 하나로
+    # 붙었다(양쪽 다 shared DF 의 나머지는 '공개'/'6일' 같은 filler). PR #17/#19 가 공유
+    # 근거 분기에만 쓰던 엄격 anchor(_merge_anchor_tokens)를 여기서도 쓴다. 판정 구조·
+    # 임계값은 그대로고, 바뀌는 것은 "무엇을 anchor 로 인정하느냐"뿐이다.
+    anchors_a = _merge_anchor_tokens(item_a)
+    anchors_b = _merge_anchor_tokens(item_b)
     if shared_tokens & (anchors_a | anchors_b):
         return True
 
@@ -745,17 +755,52 @@ def _evidence_articles_of(item: Dict) -> List[Dict]:
     return [a for a in articles if _is_same_issue_evidence_article(a)]
 
 
+# 연도 표현 — merge anchor 로 쓰기에 변별력이 없는 토큰. "2026"/"2026년"/"2026년도" 처럼
+# **4자리 연도 + (년|년도) 뿐**인 형태만 매칭한다. 접두 (19|20) 로 실제 연도 범위에 묶어
+# "2126"/"1899" 같은 우연한 4자리를 배제하고, `년`이 붙는 다른 표현은 전부 보존한다:
+#   보존: "3년"·"1년"(기간) · "20주년"·"10주년"(기념) · "향년"·"내년"·"청년"·"그랜드캐년"(어휘)
+#   보존: "2경기"·"1240회"·"5G"·"18호"·"8월"(숫자+단위/고유 표현)
+# 14일 운영 keyword 토큰 전수(378종 2,033회)에 걸어 확인: 매칭 5종 140회
+# (2026·2026년·2027년·2029년·2027), 오탐 0.
+_YEAR_LIKE_TOKEN_RE = re.compile(r"^(?:19|20)\d{2}(?:년|년도)?$")
+
+
+def _is_weak_numeric_anchor(token: str) -> bool:
+    """merge anchor 로 인정하지 않을 숫자/연도 토큰인지(anchor 판정 전용).
+
+    순수 숫자("2026", "1240")와 연도 표현("2026년")이 대상이다. 둘은 같은 계열의 결함
+    ('불꽃축제 2026' 이 무관한 6개 사건을 흡수) 이라 한 곳에서 판정한다. 단위·서수가
+    붙은 숫자("2경기"/"1240회"/"18호")는 그 사건에 고유할 수 있으므로 남긴다.
+    """
+    return token.isdigit() or bool(_YEAR_LIKE_TOKEN_RE.match(token))
+
+
 def _merge_anchor_tokens(item: Dict) -> set:
     """공유 URL bridge 보정(corroboration) 전용의 더 엄격한 anchor 집합.
 
     `_keyword_anchor_tokens`에서 검색의도 어휘(_SEARCH_INTENT_SUFFIXES: "결혼" 등)와
     display 일반어(_all_display_generic)를 추가로 제외한다. 단독 일반 토큰("결혼")이
     span=0으로 자명하게 grounding돼 roundup bridge를 재허용하는 것을 막고, 고유명사성
-    anchor("정평"/"허양임")만 남긴다. 기존 `_keyword_anchor_tokens` 소비처(공유 URL이
-    없는 기존 merge 경로)는 건드리지 않는다 — 이 헬퍼는 아래 `_is_same_issue`의
-    공유 URL 분기에서만 사용한다(no-shared 경로 bit-identical 유지, Codex 계획리뷰).
+    anchor("정평"/"허양임")만 남긴다. 도입 당시(PR #17/#19)에는 `_is_same_issue`의 공유
+    근거 분기에서만 썼으나, 2026-09-06 부터 `_has_cross_keyword_anchor`(DF 경로의 교차
+    anchor 판정)도 이 집합을 쓴다 — 약한 토큰이 keyword 에 들어 있다는 이유로 무관한
+    사건이 붙는 결함을 막기 위해서다. `_keyword_anchor_tokens` 자체와 그 나머지 소비처
+    (동일 coverage anchor 합집합, 독립 보도 corroboration)는 그대로다.
     """
-    return _keyword_anchor_tokens(item) - _SEARCH_INTENT_SUFFIXES - _all_display_generic()
+    # 순수 숫자 토큰("2026", "1240")과 연도 표현("2026년")도 제외한다(2026-09-06 운영
+    # false merge). 연도/회차는 사건 정체성이 아니라 그 해의 **모든** 기사에 반복되는
+    # 어휘라, keyword 에 들어 있으면 무관한 사건과도 DF/anchor 조건을 자명하게 통과시킨다 —
+    # '불꽃축제 2026' 이 정치·세금·스포츠 6개 후보를 한 run 에서 흡수했고, 14일 동안
+    # '게임스컴 2026 참가'·'키아프 서울 2026' 도 같은 모양의 거대 component 를 만들었다.
+    # "숫자만으로 된 토큰은 잡음"이라는 기준은 _is_noise(keyword.isdigit()) 가 keyword
+    # 단위로 이미 쓰는 것과 동일하다.
+    #
+    # 이 제외는 **merge anchor 판정 전용**이다. tokenization/ranking/canonical/display 는
+    # 그대로이며, 연도가 keyword 에서 사라지거나 표시가 바뀌지 않는다.
+    return {
+        t for t in _keyword_anchor_tokens(item) - _SEARCH_INTENT_SUFFIXES - _all_display_generic()
+        if not _is_weak_numeric_anchor(t)
+    }
 
 
 def _title_tokens_of(article: Dict) -> set:
