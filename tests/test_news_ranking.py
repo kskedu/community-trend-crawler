@@ -2061,6 +2061,163 @@ class TestSameIssueMerge(unittest.TestCase):
         self.assertEqual(len(merged), 2)  # 일반 사건 단어만 겹침 → merge 금지
 
 
+    # ---- 2026-09-06 운영 false merge 2건: 약한 keyword 토큰이 교차 anchor 로 인정되는 결함 ----
+    # run 34002188125:1 에서 '권은비 결혼 생각'→'바타 지예은'(BOTH_RESIDUAL, 공유 roundup 1건),
+    # '안세영 미야자키 결승'→'불꽃축제 2026'(NO_SHARED) 이 붙었다. 두 pair 의 공통 구조:
+    # shared DF 토큰이 {약한 keyword 토큰, filler 1개} 뿐인데, 그 약한 토큰("결혼"/"2026")이
+    # keyword 문자열에 들어 있다는 이유로 _has_cross_keyword_anchor 가 참이 됐다.
+    # 아래 테스트는 특정 문자열이 아니라 그 구조를 고정한다 — 이름은 바꿔도 통과해야 한다.
+
+    def test_merge_anchor_tokens_excludes_pure_numeric_tokens(self):
+        # 순수 숫자 토큰(연도/회차)은 사건 정체성이 아니다 — _is_noise 가 keyword 단위로
+        # 쓰는 기준과 동일. 숫자+문자 결합("2경기"/"1240회")은 남긴다(경계 고정).
+        self.assertEqual(ranker._merge_anchor_tokens({"keyword": "가을축제 2026"}), {"가을축제"})
+        self.assertEqual(
+            ranker._merge_anchor_tokens({"keyword": "선수A 2경기 연속골"}), {"선수A", "2경기", "연속골"}
+        )
+        self.assertIn("1240회", ranker._merge_anchor_tokens({"keyword": "1240회 로또"}))
+        # 검색의도 suffix 제외는 기존 계약 그대로.
+        self.assertEqual(ranker._merge_anchor_tokens({"keyword": "인물B 결혼 생각"}), {"인물B", "생각"})
+
+    def test_cross_keyword_anchor_requires_discriminative_anchor(self):
+        # shared 토큰이 keyword 에 "들어 있다"는 것만으로는 교차 anchor 가 아니다.
+        # 연도·검색의도 suffix 는 자명하게 겹치므로 변별력 있는 anchor 만 인정한다.
+        year_kw = {"keyword": "가을축제 2026"}
+        other = {"keyword": "선수A 결승"}
+        self.assertFalse(ranker._has_cross_keyword_anchor(year_kw, other, {"2026", "6일"}, [], []))
+        # 변별력 있는 토큰이 겹치면 종전과 같이 참.
+        self.assertTrue(ranker._has_cross_keyword_anchor(year_kw, other, {"가을축제", "6일"}, [], []))
+        intent_kw = {"keyword": "인물B 결혼 생각"}
+        self.assertFalse(ranker._has_cross_keyword_anchor(intent_kw, other, {"결혼", "공개"}, [], []))
+        self.assertTrue(ranker._has_cross_keyword_anchor(intent_kw, other, {"인물B", "공개"}, [], []))
+
+    def _year_festival(self, score=0.78):
+        return self._ranked_with_articles("가을축제 2026", score, [
+            _article("[포토] 도시 가을축제 2026, 밤하늘을 수놓다", "https://f.example.com/1",
+                     "6일 강변공원에서 열린 가을축제 2026"),
+            _article("[포토] 가을축제 2026, 화려한 밤", "https://f.example.com/2", "6일 밤 가을축제 2026 현장"),
+            _article("통신사, 축제장 전용망 운영", "https://f.example.com/3", "인파 안전관리"),
+            _article("축제 인파 100만 운집", "https://f.example.com/4", "강변"),
+        ])
+
+    def _unrelated_final(self, score=0.47):
+        return self._ranked_with_articles("선수A 상대B 결승", score, [
+            _article("선수A, 2026 오픈 결승서 상대B 격파", "https://s.example.com/1",
+                     "6일 선수A가 2026 오픈 결승에서"),
+            _article("선수A 2026 시즌 5번째 우승", "https://s.example.com/2", "6일 상대B를 상대로 결승"),
+            _article("[포토] 선수A 결승 세리머니", "https://s.example.com/3", "오픈"),
+            _article("상대B 꺾은 선수A", "https://s.example.com/4", "배드민턴"),
+        ])
+
+    def test_year_token_in_keyword_does_not_bridge_unrelated_event(self):
+        # '안세영 미야자키 결승'→'불꽃축제 2026' 유형(NO_SHARED). 공유 기사 0, shared DF 는
+        # {연도, 날짜 filler} 뿐이고 연도가 winner keyword 에 들어 있다.
+        a, b = self._year_festival(), self._unrelated_final()
+        ev_a, ev_b = ranker._evidence_articles_of(a), ranker._evidence_articles_of(b)
+        sh_a, sh_b, _, _ = ranker._split_shared_evidence(ev_a, ev_b)
+        self.assertEqual((len(sh_a), len(sh_b)), (0, 0))               # 전제: NO_SHARED
+        shared = ranker._group_df_tokens(ev_a) & ranker._group_df_tokens(ev_b)
+        self.assertIn("2026", shared)                                   # 전제: 연도가 DF 공유
+        self.assertFalse(shared & ranker._merge_anchor_tokens(a))       # 전제: 변별 anchor 안 겹침
+        self.assertFalse(shared & ranker._merge_anchor_tokens(b))
+        self.assertFalse(ranker._is_same_issue(a, b))
+
+    def test_intent_suffix_with_single_roundup_bridge_does_not_merge(self):
+        # '권은비 결혼 생각'→'바타 지예은' 유형(BOTH_RESIDUAL). 연예 종합 roundup **1건**이
+        # 양쪽 검색에 잡혀 shared=1, 잔여는 서로 다른 인물의 서로 다른 사건. 잔여끼리의
+        # shared DF 는 {검색의도 suffix, generic filler} 뿐.
+        roundup = _article("'복귀' 가수C·'결혼' 인물D♥인물E·'근황' 인물B", "https://r.example.com/1", "이주의 연예")
+        a = self._ranked_with_articles("인물B 결혼 생각", 0.45, [
+            _article('인물B "결혼 생각 있다" 솔직 공개', "https://e.example.com/1", "결혼 생각 공개"),
+            _article('인물B, 결혼관 고백 "결혼 생각 없지 않아"', "https://e.example.com/2", "팬미팅서 공개"),
+            _article("인물B 팬미팅서 결혼 생각 언급", "https://e.example.com/3", "솔직한 결혼관"),
+            roundup,
+        ])
+        b = self._ranked_with_articles("인물E 인물D", 0.69, [
+            _article("인물D♥인물E, 결혼 비하인드 공개", "https://b.example.com/1", "지인이 먼저 공개"),
+            _article("인물D♥인물E 12월 결혼… 열애 1년 만에", "https://b.example.com/2", "웨딩 공개"),
+            _article("[공식] '♥인물E와 결혼' 인물D, 겹경사", "https://b.example.com/3", "예비 신부"),
+            roundup,
+        ])
+        ev_a, ev_b = ranker._evidence_articles_of(a), ranker._evidence_articles_of(b)
+        sh_a, sh_b, rest_a, rest_b = ranker._split_shared_evidence(ev_a, ev_b)
+        self.assertEqual((len(sh_a), len(sh_b)), (1, 1))               # 전제: roundup 1건 bridge
+        self.assertTrue(len(rest_a) >= 2 and len(rest_b) >= 2)         # 전제: BOTH_RESIDUAL
+        shared = ranker._group_df_tokens(rest_a) & ranker._group_df_tokens(rest_b)
+        self.assertIn("결혼", shared)
+        self.assertFalse(ranker._is_same_issue(a, b))
+        self.assertFalse(ranker._is_same_issue(b, a))                  # 대칭
+
+    def test_generic_wedding_vocabulary_does_not_merge_two_couples(self):
+        # 14일 운영 반복 패턴('송하예 조매력 결혼'→'김승윤 장동윤 결혼' 등): 서로 다른 커플이
+        # roundup 1건 공유 + 결혼 일반 어휘만 겹쳐 붙었다. 양쪽 keyword 모두 suffix 를 갖는다.
+        # 두 커플의 기사는 서로 다른 기자가 쓴 서로 다른 문장이다 — 같은 템플릿에 이름만 바꾸면
+        # 기사쌍 Jaccard(MERGE_ARTICLE_OVERLAP_THRESHOLD) 경로가 먼저 발화해 anchor 경로를
+        # 시험하지 못한다(격리 전제를 아래서 단정).
+        roundup = _article("[종합] 결혼 발표 잇따라… 커플F, 커플G", "https://r.example.com/2", "연예계 결혼")
+        a = self._ranked_with_articles("커플F 결혼", 0.9, [
+            _article("커플F, 10월 결혼 발표… 서울호텔 예식", "https://c1.example.com/1", "가족끼리 조용히 올린다"),
+            _article("커플F 결혼 발표에 축하 쏟아져", "https://c1.example.com/2", "동료 배우들 SNS 축하"),
+            _article("커플F 예비신부 누구? 비연예인", "https://c1.example.com/3", "결혼 발표 후 관심 집중"),
+            roundup,
+        ])
+        b = self._ranked_with_articles("커플G 결혼", 0.7, [
+            _article("커플G 12월 결혼… 제주서 웨딩", "https://c2.example.com/1", "열애 2년 만에 결혼 발표"),
+            _article('커플G 측 "결혼 발표 맞다" 공식 인정', "https://c2.example.com/2", "소속사 확인"),
+            _article("커플G 웨딩 촬영 비하인드", "https://c2.example.com/3", "제주리조트에서 진행"),
+            roundup,
+        ])
+        ev_a, ev_b = ranker._evidence_articles_of(a), ranker._evidence_articles_of(b)
+        sh_a, _, rest_a, rest_b = ranker._split_shared_evidence(ev_a, ev_b)
+        self.assertEqual(len(sh_a), 1)                                  # 전제: roundup 1건 bridge
+        # 격리 전제: 잔여 기사쌍 Jaccard 는 임계 미만 — 이 테스트가 막는 것은 anchor 경로다.
+        self.assertLess(ranker._pairwise_evidence_overlap(rest_a, rest_b), ranker.MERGE_ARTICLE_OVERLAP_THRESHOLD)
+        shared = ranker._group_df_tokens(rest_a) & ranker._group_df_tokens(rest_b)
+        # 전제: 잔여 shared DF 가 결혼 일반 어휘뿐(크기 게이트는 통과) — 변별 anchor 는 안 겹친다.
+        self.assertGreaterEqual(len(shared), ranker.REPRESENTATIVE_OVERLAP_MIN_SHARED_TOKENS)
+        self.assertFalse(shared & (ranker._merge_anchor_tokens(a) | ranker._merge_anchor_tokens(b)))
+        merged = ranker.dedupe_and_merge([a, b])
+        self.assertEqual(len(merged), 2, [m["keyword"] for m in merged])
+
+    def test_year_keyword_transitive_chain_does_not_collapse(self):
+        # 운영 run 에서 '불꽃축제 2026' 이 정치·세금·스포츠 6개를 한 component 로 접었다.
+        # 네 후보가 {연도, 날짜} 만 공유하고 변별 anchor 는 어느 쌍도 안 겹칠 때 4개가 남아야 한다.
+        pol = self._ranked_with_articles("의원H 프로필", 0.6, [
+            _article("의원H, 2026 국정감사 질의", "https://p.example.com/1", "6일 국회에서 2026"),
+            _article("의원H 프로필 화제", "https://p.example.com/2", "6일 2026 국감"),
+        ])
+        tax = self._ranked_with_articles("구I 종부세", 0.57, [
+            _article("구I 2026년 종부세 대상 확대", "https://t.example.com/1", "6일 2026 종부세"),
+            _article("종부세 2026 개편안", "https://t.example.com/2", "6일 구I 2026"),
+        ])
+        items = [self._year_festival(), pol, tax, self._unrelated_final()]
+        # 격리 전제: 어떤 쌍도 변별 anchor 를 상대 DF 토큰과 공유하지 않는다(강한 anchor 경로 배제).
+        for i in range(len(items)):
+            for j in range(i + 1, len(items)):
+                ev_i = ranker._evidence_articles_of(items[i]); ev_j = ranker._evidence_articles_of(items[j])
+                shared = ranker._group_df_tokens(ev_i) & ranker._group_df_tokens(ev_j)
+                self.assertIn("2026", shared)
+                self.assertFalse(shared & (ranker._merge_anchor_tokens(items[i]) | ranker._merge_anchor_tokens(items[j])))
+        merged = ranker.dedupe_and_merge([dict(x) for x in items])
+        self.assertEqual(len(merged), 4, [m["keyword"] for m in merged])
+
+    def test_year_keyword_genuine_same_event_still_merges(self):
+        # 연도가 keyword 에 있어도 변별 anchor(행사명/주최사)가 상대 근거에 반복 등장하면 종전처럼
+        # merge 된다 — 이 수정은 "무엇을 anchor 로 인정하느냐"만 바꾼다.
+        a = self._ranked_with_articles("전시회J 2026 참가", 0.8, [
+            _article("회사K, 전시회J 2026 참가 확정", "https://g.example.com/1", "6일 전시회J 부스"),
+            _article("전시회J 2026 한국 기업 대거 참가", "https://g.example.com/2", "회사K 부스"),
+            _article("전시회J 2026 개막… 회사K 신작 공개", "https://g.example.com/3", "개막"),
+        ])
+        b = self._ranked_with_articles("회사K 전시회J 부스", 0.7, [
+            _article("회사K 전시회J 부스 신작 4종 공개", "https://h.example.com/1", "6일 전시회J 2026"),
+            _article("회사K, 전시회J 부스서 신작 시연", "https://h.example.com/2", "전시회J 2026 참가"),
+            _article("전시회J 회사K 부스 인파", "https://h.example.com/3", "개막"),
+        ])
+        self.assertTrue(ranker._is_same_issue(a, b))
+        self.assertEqual(len(ranker.dedupe_and_merge([a, b])), 1)
+
+
 class TestArticleDisplayFilter(unittest.TestCase):
     """개선 2: incidental/저관련 기사를 상세 articles에서 기본 제외."""
 

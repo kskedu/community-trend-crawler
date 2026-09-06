@@ -706,8 +706,17 @@ def _has_cross_keyword_anchor(
     보정 경로는 잔여(비공유) 기사만 명시 전달해, 공유 roundup 기사가 anchor 등장 근거를
     스스로 충족시키는 우회를 막는다(Codex 계획리뷰 P1).
     """
-    anchors_a = _keyword_anchor_tokens(item_a)
-    anchors_b = _keyword_anchor_tokens(item_b)
+    # 교차 anchor 는 **변별력 있는** anchor 여야 한다(2026-09-06 운영 false merge 2건).
+    # _keyword_anchor_tokens 는 일반 사건 서술어만 빼고 검색의도 suffix("결혼")·display
+    # 일반어·순수 숫자("2026")를 남긴다. 그 토큰이 keyword 문자열에 들어 있다는 이유만으로
+    # "shared_tokens ∩ anchors" 가 자명하게 참이 되고, 아래 두 번째 절도 상대 기사에
+    # 그 토큰이 있다는 이유만으로 참이 된다 — '권은비 결혼 생각'↔'바타 지예은' 은 잔여
+    # 근거끼리 '결혼' 하나로, '안세영 미야자키 결승'↔'불꽃축제 2026' 은 '2026' 하나로
+    # 붙었다(양쪽 다 shared DF 의 나머지는 '공개'/'6일' 같은 filler). PR #17/#19 가 공유
+    # 근거 분기에만 쓰던 엄격 anchor(_merge_anchor_tokens)를 여기서도 쓴다. 판정 구조·
+    # 임계값은 그대로고, 바뀌는 것은 "무엇을 anchor 로 인정하느냐"뿐이다.
+    anchors_a = _merge_anchor_tokens(item_a)
+    anchors_b = _merge_anchor_tokens(item_b)
     if shared_tokens & (anchors_a | anchors_b):
         return True
 
@@ -751,11 +760,23 @@ def _merge_anchor_tokens(item: Dict) -> set:
     `_keyword_anchor_tokens`에서 검색의도 어휘(_SEARCH_INTENT_SUFFIXES: "결혼" 등)와
     display 일반어(_all_display_generic)를 추가로 제외한다. 단독 일반 토큰("결혼")이
     span=0으로 자명하게 grounding돼 roundup bridge를 재허용하는 것을 막고, 고유명사성
-    anchor("정평"/"허양임")만 남긴다. 기존 `_keyword_anchor_tokens` 소비처(공유 URL이
-    없는 기존 merge 경로)는 건드리지 않는다 — 이 헬퍼는 아래 `_is_same_issue`의
-    공유 URL 분기에서만 사용한다(no-shared 경로 bit-identical 유지, Codex 계획리뷰).
+    anchor("정평"/"허양임")만 남긴다. 도입 당시(PR #17/#19)에는 `_is_same_issue`의 공유
+    근거 분기에서만 썼으나, 2026-09-06 부터 `_has_cross_keyword_anchor`(DF 경로의 교차
+    anchor 판정)도 이 집합을 쓴다 — 약한 토큰이 keyword 에 들어 있다는 이유로 무관한
+    사건이 붙는 결함을 막기 위해서다. `_keyword_anchor_tokens` 자체와 그 나머지 소비처
+    (동일 coverage anchor 합집합, 독립 보도 corroboration)는 그대로다.
     """
-    return _keyword_anchor_tokens(item) - _SEARCH_INTENT_SUFFIXES - _all_display_generic()
+    # 순수 숫자 토큰("2026", "1240")도 제외한다(2026-09-06 운영 false merge). 연도/회차는
+    # 사건 정체성이 아니라 그 해의 **모든** 기사에 반복되는 어휘라, keyword 에 들어 있으면
+    # 무관한 사건과도 DF/anchor 조건을 자명하게 통과시킨다 — '불꽃축제 2026' 이 정치·세금·
+    # 스포츠 6개 후보를 한 run 에서 흡수했고, 14일 동안 '게임스컴 2026 참가'·'키아프 서울
+    # 2026' 도 같은 모양의 거대 component 를 만들었다. "숫자만으로 된 토큰은 잡음"이라는
+    # 기준은 _is_noise(keyword.isdigit()) 가 keyword 단위로 이미 쓰는 것과 동일하다.
+    # "2경기"/"1240회"/"5G"처럼 숫자+문자 결합은 남긴다(경계: 순수 digit 만).
+    return {
+        t for t in _keyword_anchor_tokens(item) - _SEARCH_INTENT_SUFFIXES - _all_display_generic()
+        if not t.isdigit()
+    }
 
 
 def _title_tokens_of(article: Dict) -> set:
