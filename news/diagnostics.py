@@ -94,6 +94,32 @@ RUN_TYPES = ("full", "news_top_only", "baseline")
 #      미등록 상태에서 이 값을 보내면 RPC INSERT 가 CHECK 위반으로 진단 적재 전체가 실패한다.
 SKIP_REASON_STALE_WRITE = "STALE_WRITE_SKIPPED"
 
+
+# canonical grounding fail-closed 전용 reason_code. 지금까지 이 탈락은
+# DISPLAY_ARTICLE_INCONSISTENT 로 기록됐지만 원인이 다르다:
+#   · DISPLAY_ARTICLE_INCONSISTENT — display_keyword 가 표시 기사와 불일치(기사 자체는
+#     정상 근거를 가짐). canonical 로 강등해도 안 되면 reject.
+#   · CANONICAL_SOURCE_UNGROUNDED  — canonical(keyword) 토큰 조합을 **한 기사가 함께**
+#     뒷받침하지 못함(분산/무근거). display 교정으로 구제 불가라 item 전체 drop.
+# 14일 운영에서 재현 가능한 101건 중 11건(약 11%)이 후자인데 전자로 기록돼, 진단만 보고
+# "표시 문구 문제"로 오독하게 된다.
+#
+#   ⚠️ 이 값은 배포 SQL 의 news_keyword_decisions.reason_code CHECK 에 등록돼 있어야 한다.
+#      미등록 상태에서 보내면 RPC INSERT 가 CHECK 위반으로 **그 run 의 진단 적재 전체가
+#      조용히 실패**한다(STALE_WRITE_SKIPPED·UNSAFE_CRIME_ATTRIBUTION 선례). 그래서
+#      기본값 OFF 로 두고 migration 적용 후 env 로 켠다 — 아래 grounding_reason_enabled().
+REASON_CANONICAL_SOURCE_UNGROUNDED = "CANONICAL_SOURCE_UNGROUNDED"
+
+
+def grounding_reason_enabled():
+    """CANONICAL_SOURCE_UNGROUNDED 를 emit 할지. migration 적용 후에만 True(기본 OFF).
+
+    compact_fields_enabled() 와 동일한 안전 계약이다 — DB CHECK 가 준비되기 전에 새 코드를
+    보내면 진단 적재 전체가 죽으므로, 배포 순서를 코드가 아니라 운영 스위치로 강제한다.
+    OFF 일 때는 기존과 **완전히 동일한** DISPLAY_ARTICLE_INCONSISTENT 를 기록한다.
+    """
+    return os.getenv("NEWS_DIAG_GROUNDING_REASON", "").strip().lower() in ("1", "true", "yes", "on")
+
 # 기사 메타 allowlist — 본문/description 저장 금지(사용자 확정).
 _ARTICLE_FIELDS = (
     "title", "url", "source", "published_at",

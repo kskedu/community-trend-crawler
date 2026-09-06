@@ -1,0 +1,50 @@
+-- ============================================================
+-- [1/3] PRECHECK — 읽기 전용. 파일 전체를 복사해 실행하세요.
+--
+-- 목적: news_keyword_decisions.reason_code CHECK 제약의 현재 허용값을 확인한다.
+--       CANONICAL_SOURCE_UNGROUNDED 가 이미 있으면 02(APPLY)는 건너뛴다.
+--
+-- ⚠️ 상용 DB. 이 파일은 SELECT 만 한다 — 아무것도 바꾸지 않는다.
+-- ============================================================
+
+-- Supabase SQL Editor 는 **마지막 SELECT 하나만** 표시하므로 UNION ALL 로 합친다.
+SELECT '1. reason_code CHECK 제약 정의' AS section,
+       con.conname                      AS name,
+       pg_get_constraintdef(con.oid)    AS detail
+  FROM pg_constraint con
+  JOIN pg_class     rel ON rel.oid = con.conrelid
+  JOIN pg_namespace nsp ON nsp.oid = rel.relnamespace
+ WHERE nsp.nspname = 'public'
+   AND rel.relname = 'news_keyword_decisions'
+   AND con.contype = 'c'
+   AND pg_get_constraintdef(con.oid) ILIKE '%reason_code%'
+
+UNION ALL
+
+SELECT '2. CANONICAL_SOURCE_UNGROUNDED 등록 여부' AS section,
+       'already_allowed'                          AS name,
+       CASE WHEN EXISTS (
+              SELECT 1
+                FROM pg_constraint con
+                JOIN pg_class     rel ON rel.oid = con.conrelid
+                JOIN pg_namespace nsp ON nsp.oid = rel.relnamespace
+               WHERE nsp.nspname = 'public'
+                 AND rel.relname = 'news_keyword_decisions'
+                 AND con.contype = 'c'
+                 AND pg_get_constraintdef(con.oid) LIKE '%CANONICAL_SOURCE_UNGROUNDED%')
+            THEN 'YES — 02_APPLY 를 건너뛰고 03_POSTCHECK 로 가세요'
+            ELSE 'NO — 02_APPLY 를 실행해야 합니다'
+       END                                        AS detail
+
+UNION ALL
+
+-- 참고: 현재 저장된 reason_code 분포(오귀속 규모 파악용).
+SELECT '3. 최근 7일 reason_code 분포' AS section,
+       d.reason_code                   AS name,
+       count(*)::text                  AS detail
+  FROM public.news_keyword_decisions d
+  JOIN public.news_keyword_runs      r ON r.id = d.run_id
+ WHERE r.started_at >= now() - interval '7 days'
+ GROUP BY d.reason_code
+
+ ORDER BY section, name;

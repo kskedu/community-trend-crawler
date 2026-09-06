@@ -1395,3 +1395,184 @@ class CompactObservabilityTest(unittest.TestCase):
             _, decisions = run.build_payload("ts:on")
         self.assertEqual(decisions[0].get("pre_cut_rank"), 11,
                          "OFF 경로가 snapshot 을 파괴해 ON 에서도 값이 사라졌다")
+
+
+class GroundingReasonAttributionTest(unittest.TestCase):
+    """canonical grounding fail-closed 가 display inconsistency 로 오귀속되던 문제.
+
+    구조 계약을 검증한다 — 특정 뉴스 문자열이 아니라 "실제 탈락 분기와 기록되는
+    reason_code 가 일치하는가"를 본다.
+    """
+
+    @staticmethod
+    def _art(title, idx):
+        return {"title": title, "url": "https://x.example.com/%d" % idx,
+                "originallink": "https://x.example.com/%d" % idx, "snippet": "",
+                "is_incidental": False, "relevance_score": 0.9,
+                "is_primary_cluster": True}
+
+    def _item(self, keyword, titles, display=None):
+        return {"keyword": keyword, "display_keyword": display or keyword, "score": 0.8,
+                "news_meta": {"articles": [self._art(t, i) for i, t in enumerate(titles)]},
+                "sources": {"daum_home": 1}, "used_signals": ["news"]}
+
+    def _grounding_fail_item(self):
+        """canonical 토큰이 어절 경계로는 어느 한 기사에도 없는 item(substring 만 존재)."""
+        return self._item("정보 유출", [
+            "개인정보 유출 사고 발생", "개인정보 유출 규모 확대", "개인정보 유출 대응 착수"])
+
+    def _display_inconsistent_item(self):
+        """canonical 토큰이 서로 다른 기사에 흩어진 item — consistency 단계에서 먼저 drop."""
+        return self._item("따릉이 명예", [
+            "따릉이 이용자 급증 소식", "명예 훼손 소송 별건 보도", "따릉이 정비 확대"])
+
+    # --- 1. grounding fail -> grounding 의미의 reason_code ---
+    def test_grounding_failure_gets_grounding_reason_when_enabled(self):
+        item = self._grounding_fail_item()
+        # 선행조건: 이 item 이 정말 consistency 를 통과하고 grounding 에서 죽어야 한다.
+        survived = ranker.enforce_display_article_consistency([dict(item)])
+        self.assertTrue(survived, "consistency 에서 먼저 죽으면 grounding 사유 검증이 무의미")
+        self.assertFalse(ranker.enforce_display_source_grounding([dict(x) for x in survived]),
+                         "grounding 이 drop 하지 않으면 이 테스트가 자명 통과한다")
+        self.assertTrue(ranker.is_canonical_source_ungrounded(survived[0]))
+        with patch.dict(os.environ, {"NEWS_DIAG_GROUNDING_REASON": "1"}, clear=False):
+            reason = main_module._diag_display_stage_reason_code(item["keyword"], item)
+        self.assertEqual(reason, diagnostics.REASON_CANONICAL_SOURCE_UNGROUNDED)
+
+    # --- 2. genuine display inconsistency -> 기존 reason 유지 ---
+    def test_genuine_display_inconsistency_keeps_existing_reason(self):
+        item = self._display_inconsistent_item()
+        # 선행조건: consistency 단계에서 죽어야 한다(grounding 은 실행되지도 않는다).
+        self.assertFalse(ranker.enforce_display_article_consistency([dict(item)]))
+        with patch.dict(os.environ, {"NEWS_DIAG_GROUNDING_REASON": "1"}, clear=False):
+            reason = main_module._diag_display_stage_reason_code(item["keyword"], item)
+        self.assertEqual(reason, "DISPLAY_ARTICLE_INCONSISTENT")
+
+    def test_consistency_drop_never_gets_grounding_reason(self):
+        """순서 계약: consistency 가 먼저 drop 한 후보에 grounding 사유를 붙이면 안 된다.
+
+        `is_canonical_source_ungrounded` 자체는 True 여도(grounding 이 실행됐다면 죽었을
+        것이므로) 실제로는 grounding 에 도달하지 못했다 — 운영 재현에서 이 순서를 어기면
+        815건이 오귀속됐다.
+        """
+        item = self._display_inconsistent_item()
+        self.assertTrue(ranker.is_canonical_source_ungrounded(item),
+                        "이 fixture 는 predicate 가 True 여야 순서 계약을 검증한다")
+        self.assertFalse(ranker.enforce_display_article_consistency([dict(item)]))
+        with patch.dict(os.environ, {"NEWS_DIAG_GROUNDING_REASON": "1"}, clear=False):
+            reason = main_module._diag_display_stage_reason_code(item["keyword"], item)
+        self.assertEqual(reason, "DISPLAY_ARTICLE_INCONSISTENT")
+
+    # --- 3. grounding pass -> 정상 경로 불변 ---
+    def test_grounded_item_is_not_dropped(self):
+        item = self._item("손흥민 결승골", [
+            "손흥민 결승골 작렬", "손흥민 결승골로 승리", "손흥민 결승골 하이라이트"])
+        self.assertFalse(ranker.is_canonical_source_ungrounded(item))
+        kept = ranker.enforce_display_article_consistency([dict(item)])
+        self.assertTrue(ranker.enforce_display_source_grounding([dict(x) for x in kept]))
+
+    # --- 4. selected/drop 결과 불변 (flag 는 진단 전용) ---
+    def test_flag_does_not_change_selection_outcome(self):
+        items = [self._grounding_fail_item(), self._display_inconsistent_item(),
+                 self._item("손흥민 결승골", ["손흥민 결승골 작렬", "손흥민 결승골로 승리",
+                                          "손흥민 결승골 하이라이트"])]
+
+        def survivors():
+            out = ranker.enforce_display_article_consistency([dict(i) for i in items])
+            out = ranker.enforce_display_source_grounding([dict(i) for i in out])
+            return [i["keyword"] for i in out]
+
+        with patch.dict(os.environ, {"NEWS_DIAG_GROUNDING_REASON": ""}, clear=False):
+            off = survivors()
+        with patch.dict(os.environ, {"NEWS_DIAG_GROUNDING_REASON": "1"}, clear=False):
+            on = survivors()
+        self.assertEqual(off, on, "진단 flag 가 selected/drop 결과를 바꿨다")
+        self.assertEqual(off, ["손흥민 결승골"])
+
+    # --- 5. compact diagnostics 에 새 reason 이 정상 노출 ---
+    def test_new_reason_flows_through_payload(self):
+        run = diagnostics.RunDiagnostics()
+        snap = diagnostics.PassSnapshot("pass1(strict)")
+        snap.record("정보 유출", diagnostics.STATUS_NOT_SELECTED,
+                    diagnostics.REASON_CANONICAL_SOURCE_UNGROUNDED)
+        run.commit(snap)
+        _, decisions = run.build_payload("ts:1")
+        codes = {d["keyword"]: d["reason_code"] for d in decisions}
+        self.assertEqual(codes["정보 유출"], "CANONICAL_SOURCE_UNGROUNDED")
+        # 규칙 제외로 집계되고 RANK_CUTOFF(순위 컷)로 오분류되지 않는다.
+        counts = snap.counts()
+        self.assertEqual(counts["rule_excluded_count"], 1)
+        self.assertEqual(counts["not_selected_count"], 0)
+        self.assertEqual(counts["candidate_count"], 1)
+
+    # --- 6. backward compatible: 미등록/과거 row ---
+    def test_default_is_off_for_backward_compatibility(self):
+        """migration 전에는 새 코드를 절대 emit 하지 않는다(CHECK 위반 시 진단 전체 실패)."""
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(diagnostics.grounding_reason_enabled())
+            reason = main_module._diag_display_stage_reason_code(
+                "정보 유출", self._grounding_fail_item())
+        self.assertEqual(reason, "DISPLAY_ARTICLE_INCONSISTENT")
+
+    def test_missing_scored_item_falls_back_safely(self):
+        """근거를 복원할 수 없으면(과거 row 등) 기존 코드로 안전하게 남긴다."""
+        with patch.dict(os.environ, {"NEWS_DIAG_GROUNDING_REASON": "1"}, clear=False):
+            self.assertEqual(
+                main_module._diag_display_stage_reason_code("아무거나", None),
+                "DISPLAY_ARTICLE_INCONSISTENT")
+
+    def test_reason_resolution_never_raises(self):
+        """망가진 item 이 와도 진단 사유 판정이 랭킹을 죽이지 않는다."""
+        with patch.dict(os.environ, {"NEWS_DIAG_GROUNDING_REASON": "1"}, clear=False):
+            for broken in ({}, {"keyword": None}, {"news_meta": None},
+                           {"keyword": "x", "news_meta": {"articles": None}}):
+                self.assertEqual(
+                    main_module._diag_display_stage_reason_code("x", broken),
+                    "DISPLAY_ARTICLE_INCONSISTENT")
+
+    def test_predicate_does_not_reimplement_grounding(self):
+        """predicate 는 표시 기사가 없으면 fail-open(개입 안 함) — enforce 계약과 동일."""
+        self.assertFalse(ranker.is_canonical_source_ungrounded(
+            {"keyword": "아무거나", "news_meta": {"articles": []}}))
+
+    # --- 호출부 결속: helper 가 실제 파이프라인에서 쓰이는가 ---
+    def test_pipeline_records_grounding_reason_end_to_end(self):
+        """_rank_and_select 를 통과한 실제 기록까지 확인한다.
+
+        helper 를 직접 부르는 테스트만 있으면 호출부를 원복해도(=수정이 실제로는
+        연결 안 돼도) 전부 통과한다 — mutation 으로 실측된 공백이라 e2e 로 못박는다.
+        """
+        kws = ["정보 유출", "손흥민 결승골"]
+        cands = _candidates(*kws)
+        sig = _signals(*kws)
+        # canonical '정보'/'유출' 이 '개인정보 유출' 안에만 있어 어절 경계로는 무근거 —
+        # consistency(substring 허용)는 통과하고 grounding(어절 경계)에서만 죽는다.
+        for i, a in enumerate(sig["news"]["정보 유출"]["articles"]):
+            a["title"] = "개인정보 유출 사고 %d보" % i
+            a["is_primary_cluster"] = True
+        sig["news"]["정보 유출"]["representative_article"] = (
+            sig["news"]["정보 유출"]["articles"][0])
+
+        snap = diagnostics.PassSnapshot("pass1")
+        with patch.dict(os.environ, {"NEWS_DIAG_GROUNDING_REASON": "1"}, clear=False):
+            main_module._rank_and_select(cands, sig, "pass1(strict)", diag=snap)
+        codes = {r["keyword"]: r["reason_code"] for r in snap.payload_decisions()}
+        self.assertEqual(codes.get("정보 유출"),
+                         diagnostics.REASON_CANONICAL_SOURCE_UNGROUNDED)
+
+    def test_pipeline_keeps_legacy_reason_when_flag_off(self):
+        """flag OFF 면 파이프라인 기록도 기존 코드 그대로(운영 기본값)."""
+        kws = ["정보 유출", "손흥민 결승골"]
+        cands = _candidates(*kws)
+        sig = _signals(*kws)
+        for i, a in enumerate(sig["news"]["정보 유출"]["articles"]):
+            a["title"] = "개인정보 유출 사고 %d보" % i
+            a["is_primary_cluster"] = True
+        sig["news"]["정보 유출"]["representative_article"] = (
+            sig["news"]["정보 유출"]["articles"][0])
+
+        snap = diagnostics.PassSnapshot("pass1")
+        with patch.dict(os.environ, {"NEWS_DIAG_GROUNDING_REASON": ""}, clear=False):
+            main_module._rank_and_select(cands, sig, "pass1(strict)", diag=snap)
+        codes = {r["keyword"]: r["reason_code"] for r in snap.payload_decisions()}
+        self.assertEqual(codes.get("정보 유출"), "DISPLAY_ARTICLE_INCONSISTENT")
