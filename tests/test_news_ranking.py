@@ -2482,6 +2482,226 @@ class TestSameIssueMerge(unittest.TestCase):
         merged = ranker.dedupe_and_merge([dict(i) for i in items])
         self.assertEqual(len(merged), 4)
 
+    # --- 잔여 근거가 양쪽에 남아도 공유 근거가 두꺼우면 같은 사건(2026-09-07 18:19) ---
+    #
+    # 운영 결함: '김지용 중수청장 후보'(rank1)와 '초대 중수청장 김지용'(rank2)이 같은
+    # 지명 사건인데 Top10 에 두 줄로 노출됐다. 공유 7건 전부가 양쪽 keyword 를 함께
+    # 다루는 독립 보도인데도 양쪽에 기사가 1건씩 더 있다는 이유로 BOTH_RESIDUAL 로
+    # 갈려 PR #24 구제 경로에 닿지 못했다.
+
+    def _nomination_articles(self):
+        """운영 evidence 를 본뜬 공유 기사 — 전부 인물+직책을 함께 담은 독립 보도."""
+        return [
+            _article("초대 중수청장에 김지용 전 검사장 제청",
+                     "https://a.example.com/1"),
+            _article("초대 중수청장 후보에 檢출신 김지용 변호사",
+                     "https://b.example.com/2"),
+            _article("중수청장 후보 김지용 추천 배경은 정치색채 옅고 조직안정에 방점",
+                     "https://c.example.com/3"),
+            _article("새 형사사법 안정 이끌 첫 중수청장 후보 김지용 장단 톺아보니",
+                     "https://d.example.com/4"),
+        ]
+
+    def test_high_shared_coverage_merges_despite_residual_on_both_sides(self):
+        """1. 김지용 유형 — 동일 인물+직책 지명 사건, 높은 overlap → 하나로 merge."""
+        shared = self._nomination_articles()
+        a = self._ranked_with_articles("김지용 중수청장 후보", 0.92, shared + [
+            _article("조국혁신당 중수청장 후보에 반기 또 검찰 출신 철저히 검증",
+                     "https://e.example.com/9")])
+        b = self._ranked_with_articles("초대 중수청장 김지용", 0.91, shared + [
+            _article("중수청 초대 수장에 김지용 2800명 화학적 결합 시험대",
+                     "https://f.example.com/9")])
+        # 선행조건: 양쪽에 잔여가 남는 BOTH_RESIDUAL 이어야 이 경로를 검증한다.
+        topo = ranker.merge_evidence_topology(a, b)
+        self.assertEqual(topo["mode"], ranker.MERGE_MODE_BOTH_RESIDUAL)
+        self.assertEqual((topo["residual_support_a"], topo["residual_support_b"]), (1, 1))
+        self.assertTrue(ranker._is_same_issue(a, b))
+        self.assertTrue(ranker._is_same_issue(b, a))  # 대칭
+        merged = ranker.dedupe_and_merge([dict(a), dict(b)])
+        self.assertEqual(len(merged), 1)
+
+    def test_paraphrased_word_order_still_merges(self):
+        """2. 표현 순서 차이(`X 직책 후보` vs `초대 직책 X`)만으로 갈리지 않는다."""
+        shared = self._nomination_articles()
+        a = self._ranked_with_articles("김지용 중수청장 후보", 0.92, shared + [
+            _article("여당 중수청장 후보 인선 절차 마무리", "https://g.example.com/1")])
+        b = self._ranked_with_articles("초대 중수청장 김지용", 0.91, shared + [
+            _article("중수청 초대 수장 지명 절차 마무리", "https://h.example.com/1")])
+        # keyword 문자열 유사도로 통과한 것이 아님을 못박는다.
+        self.assertFalse(ranker._is_similar_keyword(a["keyword"], b["keyword"]))
+        self.assertEqual(len(ranker.dedupe_and_merge([dict(a), dict(b)])), 1)
+
+    def test_same_person_different_event_does_not_merge(self):
+        """3. 같은 인물 + 다른 사건 → merge 금지."""
+        a = self._ranked_with_articles("김지용 중수청장 후보", 0.92, [
+            _article("초대 중수청장에 김지용 전 검사장 제청", "https://a.example.com/1"),
+            _article("중수청장 후보 김지용 추천 배경 조직안정 방점", "https://b.example.com/2"),
+            _article("김지용 중수청장 후보 인사청문 일정 확정", "https://c.example.com/3"),
+        ])
+        b = self._ranked_with_articles("김지용 재산 공개", 0.80, [
+            _article("김지용 재산 32억 신고 배우자 예금 포함", "https://d.example.com/4"),
+            _article("공직자 재산공개 김지용 아파트 두 채 보유", "https://e.example.com/5"),
+            _article("김지용 재산 신고 내역 상세 공개됐다", "https://f.example.com/6"),
+        ])
+        self.assertFalse(ranker._is_same_issue(a, b))
+        self.assertEqual(len(ranker.dedupe_and_merge([dict(a), dict(b)])), 2)
+
+    def test_same_role_different_person_does_not_merge(self):
+        """4. 동일 직책 + 다른 사람 → merge 금지.
+
+        두 인물이 각자의 사건을 보도받으면 공유 근거 자체가 생기지 않아, 이 PR 이
+        넓힌 경로에 애초에 도달하지 못한다(NO_SHARED 로 갈린다).
+
+        ⚠️ 알려진 한계(이 PR 범위 밖, 동일 coverage 분기에도 동일하게 존재):
+        `_article_mentions_anchor` 는 anchor **아무 토큰 하나**만 등장해도 "그 keyword 를
+        다룬다"고 본다. 그래서 두 keyword 가 직책어('중수청장','후보')를 공유하면
+        인물명 없이도 전건 조건이 충족될 수 있다. 그 구성을 만들려면 서로 다른 인물의
+        기사 묶음이 **완전히 같아야** 하는데, 그러면 애초에 같은 사건을 보도한 것이다.
+        """
+        a = self._ranked_with_articles("김지용 중수청장 후보", 0.92, [
+            _article("초대 중수청장 후보에 김지용 전 검사장 제청", "https://a.example.com/1"),
+            _article("김지용 중수청장 후보 인사청문 일정 확정", "https://b.example.com/2"),
+            _article("김지용 전 검사장 지명 배경 조직안정 방점", "https://c.example.com/3"),
+        ])
+        b = self._ranked_with_articles("박승철 공정위원장 지명", 0.85, [
+            _article("신임 공정위원장에 박승철 교수 지명", "https://d.example.com/4"),
+            _article("박승철 공정위원장 지명 재계 반응 엇갈려", "https://e.example.com/5"),
+            _article("박승철 교수 공정거래 정책 방향 주목", "https://f.example.com/6"),
+        ])
+        ev_a = ranker._evidence_articles_of(a)
+        ev_b = ranker._evidence_articles_of(b)
+        _, _, rest_a, rest_b = ranker._split_shared_evidence(ev_a, ev_b)
+        # 공유 근거가 없어 이 PR 이 넓힌 경로에 도달하지 않는다.
+        self.assertEqual(ranker.merge_evidence_topology(a, b)["mode"],
+                         ranker.MERGE_MODE_NO_SHARED)
+        self.assertFalse(ranker._is_same_issue(a, b))
+        self.assertEqual(len(ranker.dedupe_and_merge([dict(a), dict(b)])), 2)
+
+    def test_roundup_sharing_does_not_merge_distinct_events(self):
+        """5. 나열(roundup) 기사 공유만으로는 서로 다른 사건이 합쳐지지 않는다.
+
+        나열은 본질적으로 한 문서다 — 전재로 URL 이 늘어도 near-dup 으로 접히면 1건이라
+        독립 보도 수에 미치지 못한다. **알려진 한계**: 서로 다른 매체가 각자 작성한
+        나열 기사가 3건 이상이고 그 전부가 양쪽 keyword 를 함께 언급하면 이 조건을
+        통과할 수 있다. 이는 이 PR 이 만든 구멍이 아니라
+        `_corroborated_by_independent_reports` 자체의 기존 한계이며, 동일 coverage
+        분기(PR #24)에도 그대로 존재한다.
+        """
+        roundup_title = "연예 종합 고지용 이혼 문근영 결혼 황정민 의혹 정리"
+        roundup = [_article(roundup_title, "https://r%d.example.com/1" % i)
+                   for i in range(4)]  # 같은 나열 기사의 전재 4건
+        a = self._ranked_with_articles("고지용 이혼", 0.90, roundup + [
+            _article("고지용 이혼 조정 절차 마무리 단계", "https://s.example.com/1")])
+        b = self._ranked_with_articles("문근영 결혼", 0.88, roundup + [
+            _article("문근영 결혼식 비공개로 진행된다", "https://t.example.com/1")])
+        ev_a = ranker._evidence_articles_of(a)
+        ev_b = ranker._evidence_articles_of(b)
+        shared_a, _, _, _ = ranker._split_shared_evidence(ev_a, ev_b)
+        # 전재 4건이 near-dup 으로 1건이 되어 독립 보도 수 미달.
+        self.assertEqual(ranker._independent_report_count(shared_a), 1)
+        self.assertFalse(ranker._is_same_issue(a, b))
+        self.assertEqual(len(ranker.dedupe_and_merge([dict(a), dict(b)])), 2)
+
+    def test_shared_coverage_not_covering_both_keywords_does_not_merge(self):
+        """공유 기사 중 한 건이라도 양쪽 keyword 를 함께 다루지 않으면 이 경로는 닫힌다.
+
+        전건(全件) 조건이 이 구제의 안전판이다 — 과반 조건이었다면 통과했을 구성.
+        """
+        shared = self._nomination_articles() + [
+            # 양쪽 keyword 를 함께 다루지 않는 기사 1건(인물명이 없다).
+            _article("수사 기관 개편 논의 경과와 향후 일정 정리", "https://z.example.com/9"),
+        ]
+        a = self._ranked_with_articles("김지용 중수청장 후보", 0.92, shared + [
+            _article("여당 인선 절차 마무리 국면", "https://g.example.com/1")])
+        b = self._ranked_with_articles("초대 중수청장 김지용", 0.91, shared + [
+            _article("야당 인선 절차 반발 국면", "https://h.example.com/1")])
+        ev_a = ranker._evidence_articles_of(a)
+        ev_b = ranker._evidence_articles_of(b)
+        shared_a, shared_b, _, _ = ranker._split_shared_evidence(ev_a, ev_b)
+        self.assertFalse(ranker._corroborated_by_independent_reports(a, b, shared_a))
+        self.assertFalse(ranker._corroborated_by_independent_reports(a, b, shared_b))
+
+    def test_syndicated_shared_coverage_alone_does_not_merge(self):
+        """전재로 URL 만 늘어난 공유 근거는 near-dup 으로 접히면 독립 보도 수에 못 미친다."""
+        title = "초대 중수청장 후보에 김지용 전 검사장 제청"
+        syndicated = [_article(title, "https://n%d.example.com/1" % i) for i in range(5)]
+        a = self._ranked_with_articles("김지용 중수청장 후보", 0.92, syndicated + [
+            _article("여당 인선 절차 마무리 국면", "https://g.example.com/1")])
+        b = self._ranked_with_articles("초대 중수청장 김지용", 0.91, syndicated + [
+            _article("야당 인선 절차 반발 국면", "https://h.example.com/1")])
+        ev_a = ranker._evidence_articles_of(a)
+        ev_b = ranker._evidence_articles_of(b)
+        shared_a, _, _, _ = ranker._split_shared_evidence(ev_a, ev_b)
+        self.assertLess(ranker._independent_report_count(shared_a),
+                        ranker._SAME_EVENT_MIN_INDEPENDENT_REPORTS)
+        self.assertFalse(ranker._corroborated_by_independent_reports(a, b, shared_a))
+
+    def test_duplicate_removal_backfills_next_eligible_candidate(self):
+        """10. 중복이 접히면 기존 select_top 계약으로 후순위 후보가 자연 승격한다."""
+        shared = self._nomination_articles()
+        items = [
+            self._ranked_with_articles("김지용 중수청장 후보", 0.92, shared + [
+                _article("조국혁신당 중수청장 후보에 반기", "https://e.example.com/9")]),
+            self._ranked_with_articles("초대 중수청장 김지용", 0.91, shared + [
+                _article("중수청 초대 수장에 김지용 시험대", "https://f.example.com/9")]),
+        ]
+        # 무관한 후보들로 나머지를 채운다(각자 고유 사건).
+        for n in range(9):
+            items.append(self._ranked_with_articles("무관이슈%d" % n, 0.80 - n * 0.01, [
+                _article("무관이슈%d 관련 첫 보도 내용" % n, "https://u%d.example.com/1" % n),
+                _article("무관이슈%d 후속 취재 결과 정리" % n, "https://v%d.example.com/2" % n),
+            ]))
+        merged = ranker.dedupe_and_merge([dict(i) for i in items])
+        top = ranker.select_top(merged)
+        self.assertEqual(len(top), 10)   # 중복 1건 제거 후에도 10개 유지
+        keys = [t["keyword"] for t in top]
+        self.assertEqual(len(keys), len(set(keys)))
+        self.assertIn("무관이슈8", keys)  # rank11 이던 후보가 승격
+
+    def test_rescue_is_symmetric_regardless_of_argument_order(self):
+        """이 구제는 인자 순서에 무관해야 한다(양쪽 공유 근거를 모두 근거로 인정).
+
+        `dedupe_and_merge` 는 score 내림차순으로 `_is_same_issue(m, other)` 를 호출하므로,
+        한쪽 공유 근거만 검사하면 두 후보의 score 순서에 따라 병합 여부가 흔들린다
+        (동일 coverage 분기에도 같은 계약이 있다 — Codex diff 리뷰 P2).
+
+        near-dup 신디케이션이 섞이면 shared_a 와 shared_b 는 서로 다른 기사 객체 집합이
+        되므로, 한쪽만 보는 구현은 여기서 비대칭이 된다.
+        """
+        shared = self._nomination_articles()
+        # A 에만 있는 전재본과 B 에만 있는 전재본 — 서로 near-dup 이라 각자 공유로 승격되고
+        # shared_a 와 shared_b 의 원소가 달라진다.
+        syn_base = "초대 중수청장에 김지용 전 검사장 제청 절차 착수 배경 인사 검증 국회 청문 일정"
+        syn_a = _article(syn_base + " 상보", "https://syn-a.example.com/1")
+        syn_b = _article(syn_base + " 속보", "https://syn-b.example.com/1")
+        a = self._ranked_with_articles("김지용 중수청장 후보", 0.92, shared + [syn_a] + [
+            _article("여당 인선 절차 마무리 국면", "https://g.example.com/1")])
+        b = self._ranked_with_articles("초대 중수청장 김지용", 0.91, shared + [syn_b] + [
+            _article("야당 인선 절차 반발 국면", "https://h.example.com/1")])
+        # 선행조건: 두 공유 집합이 실제로 다른 기사 객체를 담아야 비대칭이 관측된다.
+        ev_a = ranker._evidence_articles_of(a)
+        ev_b = ranker._evidence_articles_of(b)
+        shared_a, shared_b, _, _ = ranker._split_shared_evidence(ev_a, ev_b)
+        self.assertNotEqual({x["url"] for x in shared_a}, {x["url"] for x in shared_b})
+        self.assertEqual(ranker._is_same_issue(a, b), ranker._is_same_issue(b, a))
+        self.assertTrue(ranker._is_same_issue(a, b))
+        # 호출 순서(score 정렬)를 뒤집어도 같은 그룹이 나와야 한다.
+        self.assertEqual(len(ranker.dedupe_and_merge([dict(a), dict(b)])), 1)
+        self.assertEqual(len(ranker.dedupe_and_merge([dict(b), dict(a)])), 1)
+
+    def test_underfill_allowed_when_no_safe_backfill_candidate(self):
+        """11. 승격할 안전 후보가 없으면 강제 보충 없이 underfill 을 허용한다."""
+        shared = self._nomination_articles()
+        items = [
+            self._ranked_with_articles("김지용 중수청장 후보", 0.92, shared + [
+                _article("조국혁신당 중수청장 후보에 반기", "https://e.example.com/9")]),
+            self._ranked_with_articles("초대 중수청장 김지용", 0.91, shared + [
+                _article("중수청 초대 수장에 김지용 시험대", "https://f.example.com/9")]),
+        ]
+        merged = ranker.dedupe_and_merge([dict(i) for i in items])
+        top = ranker.select_top(merged)
+        self.assertEqual(len(top), 1)  # filler 를 만들지 않는다
+
 
 class TestArticleDisplayFilter(unittest.TestCase):
     """개선 2: incidental/저관련 기사를 상세 articles에서 기본 제외."""

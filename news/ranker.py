@@ -1236,7 +1236,36 @@ def _is_same_issue(item_a: Dict, item_b: Dict) -> bool:
         return True
     if _anchor_grounded_in_articles(_merge_anchor_tokens(item_b), rest_a):
         return True
-    return False
+    # 공유 근거가 "양쪽 keyword 를 함께 다루는 독립 보도"로 두껍게 쌓였으면 같은 사건으로
+    # 본다 — 동일 coverage 분기와 **같은 함수·같은 계약**(_corroborated_by_independent_reports).
+    #
+    # 배경(2026-09-07 18:19 운영): '김지용 중수청장 후보'(rank1)와 '초대 중수청장 김지용'
+    # (rank2)이 같은 지명 사건인데 Top10 에 두 줄로 노출됐다. 기사 8/8 중 7건이 공유
+    # (Jaccard 0.778)이고 공유 7건 전부가 양쪽 keyword 를 함께 다루는 독립 보도인데도,
+    # **양쪽에 기사가 1건씩 더 있었다는 이유만으로** IDENTICAL_COVERAGE 가 아닌 이 분기로
+    # 갈려 PR #24 의 구제 경로에 닿지 못했다. 그 1건씩을 지우면(7/7) 즉시 merge 된다 —
+    # 즉 근거가 **더 많아서** 못 합쳐지는 불연속이지 임계 문제가 아니다. 위 잔여 기반
+    # 조건들은 잔여가 양쪽 1건뿐이면 구조적으로 통과 불가다(_same_issue_evidence_signals
+    # 의 "양쪽 singleton 불가" 가드).
+    #
+    # 나열(roundup) 한 건이 bridge 가 되는 구조는 이 조건을 통과하지 못한다 — 공유 기사
+    # **전건**이 양쪽 keyword 를 함께 다뤄야 하고(len(together) != len(shared) 조기 탈락),
+    # 전재로 URL 이 늘어도 near-dup 으로 접으면 1건이라 독립 보도 수에 미달한다. 7일 운영
+    # 감사에서 실제 판별력이 확인됐다: 무관 pair('여의도 불꽃축제'|'불꽃축제 2026',
+    # 동일 coverage 8/8)를 그대로 거부하고, 새로 붙은 7쌍은 전부 같은 사건이었다.
+    #
+    # ⚠️ 알려진 한계(이 변경이 만든 것이 아니라 _corroborated_by_independent_reports 자체의
+    # 한계 — 동일 coverage 분기에도 똑같이 존재한다): 서로 다른 매체가 각자 작성한 나열
+    # 기사가 3건 이상이고 그 전부가 양쪽 keyword 를 함께 언급하면 통과할 수 있다. 또
+    # _article_mentions_anchor 는 anchor 토큰 **하나**만 맞아도 인정하므로, 두 keyword 가
+    # 직책어를 공유하면 인물명 없이도 전건 조건이 채워질 수 있다. 이 경로를 좁히려면 위
+    # 두 분기를 함께 바꿔야 하므로 여기서는 다루지 않는다.
+    #
+    # 잔여 기사는 판정 근거로 쓰지 않는다 — 공유 근거만 본다. 잔여를 근거로 넣으면
+    # 무관 기사가 섞였을 때 그 자체가 merge 근거가 되는 우회가 생긴다.
+    return _corroborated_by_independent_reports(
+        item_a, item_b, shared_a
+    ) or _corroborated_by_independent_reports(item_a, item_b, shared_b)
 
 
 # merge 위상(topology) enum — 관찰 전용. _is_same_issue 의 분기 이름과 1:1 이며,
