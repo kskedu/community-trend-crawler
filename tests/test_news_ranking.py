@@ -2520,6 +2520,54 @@ class TestSameIssueMerge(unittest.TestCase):
         merged = ranker.dedupe_and_merge([dict(a), dict(b)])
         self.assertEqual(len(merged), 1)
 
+    def test_high_shared_coverage_merges_with_uneven_residual(self):
+        """1-b. 잔여가 1/2 로 불균형해도 같은 사건이면 merge (2026-09-07 18:48 운영).
+
+        운영 결함: '이란 심각한 결과'(rank5)와 '이란 한글 경고'(rank8)가 같은 사건인데
+        따로 선정됐다 — rank5 의 summary 가 rank8 의 keyword 와 같은 문장일 정도로 동일
+        보도였다(기사 9건 중 6건 공유, Jaccard 0.667).
+
+        김지용 사례(잔여 1/1)와 **탈락 지점이 다르다**: 여기서는 잔여가 1/2 라
+        "양쪽 singleton 불가" 가드를 통과하고, 그 다음 DF>=2 공유 토큰이 0개라 탈락한다.
+        같은 분기의 서로 다른 하위 경로를 함께 고정한다.
+        """
+        shared = [
+            _article("한국 콕 집어 경계한 이란 한글로 위험한 선택에는 대가 이례적 경고",
+                     "https://a.example.com/1"),
+            _article("위험한 선택엔 대가 한글로 썼다 이란 호르무즈 파병 韓에 경고메시지",
+                     "https://b.example.com/2"),
+            _article("이란 외교부 한글 메시지 한국 침략에 가담 말라",
+                     "https://c.example.com/3"),
+            _article("이란의 한글 경고 韓 호르무즈 참여땐 심각한 결과",
+                     "https://d.example.com/4"),
+            _article("이란 韓 겨냥해 한글로 경고 호르무즈 군사 참여엔 심각한 결과",
+                     "https://e.example.com/5"),
+            _article("이란 한국에 이례적 한글 경고 위험한 선택엔 대가",
+                     "https://f.example.com/6"),
+        ]
+        a = self._ranked_with_articles("이란 심각한 결과", 0.60, shared + [
+            _article("미국은 압박 이란은 협박 호르무즈에 낀 한국", "https://g.example.com/1")])
+        b = self._ranked_with_articles("이란 한글 경고", 0.55, shared + [
+            _article("미국은 보내라 이란은 참전 간주 파병 딜레마 빠진 정부",
+                     "https://h.example.com/1"),
+            _article("위험한 선택에는 대가 이란 한국에 이례적 한글 경고",
+                     "https://i.example.com/1")])
+        topo = ranker.merge_evidence_topology(a, b)
+        self.assertEqual(topo["mode"], ranker.MERGE_MODE_BOTH_RESIDUAL)
+        # 선행조건: 잔여가 불균형(1/2)이라 singleton 가드가 아닌 다른 지점에서 탈락한다.
+        self.assertEqual((topo["residual_support_a"], topo["residual_support_b"]), (1, 2))
+        ev_a = ranker._evidence_articles_of(a)
+        ev_b = ranker._evidence_articles_of(b)
+        _, _, rest_a, rest_b = ranker._split_shared_evidence(ev_a, ev_b)
+        self.assertLess(ranker._pairwise_evidence_overlap(rest_a, rest_b),
+                        ranker.MERGE_ARTICLE_OVERLAP_THRESHOLD)
+        self.assertLess(
+            len(ranker._group_df_tokens(rest_a) & ranker._group_df_tokens(rest_b)),
+            ranker.REPRESENTATIVE_OVERLAP_MIN_SHARED_TOKENS)
+        self.assertTrue(ranker._is_same_issue(a, b))
+        self.assertTrue(ranker._is_same_issue(b, a))
+        self.assertEqual(len(ranker.dedupe_and_merge([dict(a), dict(b)])), 1)
+
     def test_paraphrased_word_order_still_merges(self):
         """2. 표현 순서 차이(`X 직책 후보` vs `초대 직책 X`)만으로 갈리지 않는다."""
         shared = self._nomination_articles()
