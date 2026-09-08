@@ -1333,22 +1333,61 @@ def _display_group_articles(members: List[Dict]) -> List[Dict]:
     return articles
 
 
+def _josa_surface_fold(article_token_sets: List[set]) -> Dict[str, str]:
+    """그룹 기사 안에서 관측된 "조사 결합 표면형 → base 형" 매핑.
+
+    _tokens는 형태소 분석 없이 정규식으로만 자르므로 "한은서"와 "한은서와"가 **서로 다른
+    토큰**이 된다. 그러면 기사 대부분이 조사 결합형으로 쓴 엔티티는 base 형의 분포율이
+    바닥으로 떨어지고, 대신 조사가 붙은 표면형이 "그룹 공통 사건토큰"으로 올라선다.
+    display 대표 선택이 그 표면형을 근거로 삼으면 사용자에게 문장 중간에서 끊긴 표기가
+    노출된다(2026-09-08 09:47 운영: canonical "한은서 윤종훈 결혼" 대신 "윤종훈 연하
+    한은서와"가 display로 채택 — '한은서' 0.125 vs '한은서와' 0.750).
+
+    접는 조건은 두 가지를 **모두** 만족할 때뿐이다:
+      1. 마지막 1글자가 실제 한국어 조사·어미(_ONE_CHAR_JOSA_EOMI)다. 이 집합은
+         _word_contains_token(2번 규칙)이 이미 쓰는 기존 계약을 그대로 재사용한다 —
+         새 어휘 규칙을 만들지 않는다.
+      2. base 형이 **같은 그룹 안에서 독립적으로 관측**된다. 임의의 1글자 절단은
+         "결혼설"→"결혼설"(설은 조사 아님, 애초에 1번 탈락)이나 "동거인은"→"동거인"
+         (base 미관측)처럼 근거 없는 축약을 낳으므로, 다른 기사가 실제로 base 형을
+         쓴 경우에만 같은 표기로 본다. 이 corroboration 요구가 하드코딩 없이
+         오탐을 막는다.
+
+    display 경로 전용이다 — merge/ranking/score 판정에는 쓰이지 않는다.
+    """
+    if not article_token_sets:
+        return {}
+    all_tokens: set = set().union(*article_token_sets)
+    return {
+        t: t[:-1]
+        for t in all_tokens
+        if len(t) >= 3 and t[-1] in _ONE_CHAR_JOSA_EOMI and t[:-1] in all_tokens
+    }
+
+
 def _token_article_coverage(articles: List[Dict]) -> Dict[str, float]:
     """그룹 기사 집합에서 각 토큰의 기사 분포율(= 그 토큰이 등장한 기사 수 / 전체 기사 수).
 
     사용자 확정 기준(2026-07-02): 대표성은 "공통토큰 개수"가 아니라 "그룹 전체 기사에
     얼마나 넓게 걸쳐 반복 등장하는가"로 본다. 일부 기사에만 나오는 상대국/지역/기업명은
     coverage가 낮아 자연히 감점된다(하드코딩 국가/기업명 리스트 없이 데이터로 처리).
+
+    조사 결합 표면형은 그룹 안에서 base 형이 함께 관측될 때만 base로 접어 집계한다
+    (_josa_surface_fold) — "한은서"/"한은서와"가 각각 반쪽 분포율을 갖고 조사 결합형이
+    공통 사건토큰 자리를 차지하던 문제를 없앤다.
     """
     from news.summarizer import _tokens
 
     n = len(articles)
     if n == 0:
         return {}
+    per_article = [
+        set(_tokens(f"{a.get('title', '')} {a.get('snippet', '')}")) for a in articles
+    ]
+    fold = _josa_surface_fold(per_article)
     hits: Dict[str, int] = {}
-    for a in articles:
-        text = f"{a.get('title', '')} {a.get('snippet', '')}"
-        for tok in set(_tokens(text)):
+    for toks in per_article:
+        for tok in {fold.get(t, t) for t in toks}:
             hits[tok] = hits.get(tok, 0) + 1
     return {t: c / n for t, c in hits.items()}
 
@@ -1396,6 +1435,72 @@ def _all_display_generic() -> set:
 _SEARCH_INTENT_SUFFIXES = {
     "뜻", "의미", "누구", "프로필", "나이", "인스타", "결혼", "근황", "학력", "직업",
 }
+
+
+# display 전용 — 제목 선두의 대괄호 라벨을 라벨 종류와 무관하게 제거한 본문 view.
+# normalizer.title_evidence_text와 목적이 다르다: 저쪽은 **merge/grounding 근거**라
+# 알려진 섹션/포맷 라벨만 보수적으로 제거해야 하지만(모르는 라벨은 근거로 남겨야 함),
+# 여기서는 "기사가 그 단어를 사건으로 서술했는가"만 보므로 [프로필]/[인터뷰]처럼
+# 카테고리 라벨로 쓰인 대괄호는 종류를 가리지 않고 본문에서 빼야 한다.
+# 근거(2026-09-01~09-08 운영 실측): "김승원 의원 프로필" 그룹은 기사 4건 중 3건이
+# "[프로필] ..." 형태라 raw coverage가 0.750으로 올라가지만, 본문만 보면 0.000이다.
+# 같은 기간 "결혼"은 본문 기준으로도 coverage가 유지된다(1.000).
+_LEADING_BRACKET_LABEL_RE = re.compile(r"^\s*\[[^\[\]]{1,30}\]\s*")
+
+
+def _title_body_after_labels(title: str) -> str:
+    """선두 대괄호 라벨을 모두 제거한 제목 본문(display 판정 전용, 원문 불변)."""
+    text = title or ""
+    while True:
+        match = _LEADING_BRACKET_LABEL_RE.match(text)
+        if not match:
+            break
+        text = text[match.end():]
+    return text.strip()
+
+
+def _suffix_is_grounded_event(keyword: str, group_articles: List[Dict]) -> bool:
+    """keyword의 마지막 어절(검색의도 suffix 후보)이 이 그룹에서 **기사가 실제로 서술한
+    사건어**인지.
+
+    배경(2026-09-08 09:47 운영): canonical "한은서 윤종훈 결혼"이 display 대표 경쟁에서
+    "윤종훈 연하 한은서와"에 밀려, 기사 8/8이 명시한 핵심 사건어 "결혼"이 빠진 채 조사가
+    붙은 문장 조각이 노출됐다. 원인은 "결혼"이 _SEARCH_INTENT_SUFFIXES에 있어 무조건
+    -1 페널티를 받은 것이다.
+
+    그 집합 자체는 옳다 — "손흥민 결혼"처럼 **검색 의도**로 붙는 경우가 실제로 있고,
+    그 집합은 merge anchor 판정(PR #27)에도 쓰여 건드리면 안 된다. 구분해야 하는 것은
+    어휘가 아니라 **이 그룹에서 그 단어가 사건으로 보도됐는가**이다:
+
+      · 검색의도로만 붙은 suffix는 기사가 그 단어를 쓰지 않는다
+        (7일 실측: "나이" 5건 전부 coverage < 0.5, 최고 0.143).
+      · 실제 사건이면 기사 대부분이 그 단어로 사건을 서술한다
+        (같은 기간 "결혼" 105건 중 93건이 >= 0.5, 이번 사례는 8/8 = 1.000).
+
+    판정은 기존 공통 사건토큰 계약을 그대로 쓴다 — suffix 어절이
+    _common_event_tokens_from_articles(= coverage >= DISPLAY_TOKEN_MIN_COVERAGE이고
+    일반 서술어가 아닌 토큰)에 들어 있으면 근거된 사건으로 본다. 임계를 새로 만들거나
+    낮추지 않는다.
+
+    단, 카테고리 라벨 오탐은 별도로 막는다: "[프로필] 김승원 ..."처럼 선두 대괄호
+    라벨로만 등장하면 기사가 그 단어를 **사건으로 서술한 것이 아니다**(7일 실측: raw
+    0.750 → 본문 0.000). 그래서 본문(_title_body_after_labels) 기준으로 한 번 더
+    확인한다. 두 조건을 모두 만족할 때만 면제한다.
+    """
+    words = (keyword or "").split()
+    if not words:
+        return False
+    suffix = words[-1]
+    if suffix not in _SEARCH_INTENT_SUFFIXES:
+        return False
+    # 판정은 **본문 기준 한 번**으로 충분하다: 선두 라벨을 제거한 본문 토큰은 원문 토큰의
+    # 부분집합이라, 본문에서 임계를 넘으면 원문에서도 넘는다(7일 운영 suffix 후보 128건
+    # 전수에서 두 검사의 판정이 갈린 경우 0건). 원문 기준 검사를 따로 두면 중복이다.
+    body_articles = [
+        {"title": _title_body_after_labels(a.get("title", "")), "snippet": a.get("snippet", "")}
+        for a in group_articles
+    ]
+    return suffix in _common_event_tokens_from_articles(body_articles)
 
 
 def _ends_with_search_intent_suffix(keyword: str) -> bool:
@@ -1464,13 +1569,18 @@ def _keyword_coverage(member: Dict, group_articles: List[Dict]) -> float:
     보면, 다어절 엔티티 통짜 측정("보스니아"·"헤르체고비나" 둘 다 있는 기사만 카운트)과
     부분일치 오탐 방지를 동시에 만족한다.
 
-    한계(Codex diff 재리뷰 P3, 의도적 보수 처리): 형태소 분석이 없어 조사/접미가
-    붙은 표기("김영환이", "손흥민은")는 별도 토큰이라 exact subset이 어긋나 coverage가
-    과소계산될 수 있다. 다만 coverage는 임계(DISPLAY_TOKEN_MIN_COVERAGE) 이진 감점에만
-    쓰이고, 과소계산은 "대표성을 낮게 보는" 안전한 방향이라 지엽 엔티티를 과대평가하는
-    오탐(더 위험)보다 낫다. 핵심어가 조사 때문에 부당 감점되더라도 그 후보가 canonical
-    keyword(movement 비교용)로는 그대로 유지되므로 데이터 안정성에는 영향이 없다.
-    형태소 기반 정밀화는 별도 과제로 남긴다.
+    조사 결합 표기 보정(2026-09-08): 형태소 분석은 여전히 하지 않되, 그룹 안에서
+    base 형이 함께 관측된 조사 결합형만 base로 접어 비교한다(_josa_surface_fold —
+    _token_article_coverage와 **같은 매핑**). 이 보정이 없으면 기사 대부분이 "한은서와"로
+    쓴 엔티티의 coverage가 0.125로 떨어져, 정작 정확한 표기를 가진 canonical이 지엽
+    엔티티로 오인돼 감점된다(2026-09-08 09:47 운영 관찰). 접기 근거는 기존
+    _ONE_CHAR_JOSA_EOMI 계약 + 같은 그룹 내 base 형 관측뿐이라 새 어휘 규칙이 없다.
+
+    남은 한계(의도적 보수 처리): base 형이 그룹 어디에도 없으면 접지 않으므로 여전히
+    과소계산될 수 있다. 과소계산은 "대표성을 낮게 보는" 안전한 방향이라 지엽 엔티티를
+    과대평가하는 오탐(더 위험)보다 낫다. 핵심어가 조사 때문에 부당 감점되더라도 그
+    후보가 canonical keyword(movement 비교용)로는 그대로 유지되므로 데이터 안정성에는
+    영향이 없다. 형태소 기반 정밀화는 별도 과제로 남긴다.
     """
     from news.summarizer import _tokens
 
@@ -1479,10 +1589,14 @@ def _keyword_coverage(member: Dict, group_articles: List[Dict]) -> float:
     kw_toks = set(_tokens(member["keyword"] or ""))
     if not kw_toks:
         return 0.0
+    per_article = [
+        set(_tokens(f"{a.get('title', '')} {a.get('snippet', '')}")) for a in group_articles
+    ]
+    fold = _josa_surface_fold(per_article)
     hits = 0
-    for a in group_articles:
-        art_toks = set(_tokens(f"{a.get('title', '')} {a.get('snippet', '')}"))
-        if kw_toks <= art_toks:
+    for art_toks in per_article:
+        # 원 표면형과 접힌 base 형을 모두 인정한다(접기가 근거를 줄이지 않도록 합집합).
+        if kw_toks <= (art_toks | {fold.get(t, t) for t in art_toks}):
             hits += 1
     return hits / len(group_articles)
 
@@ -1518,7 +1632,13 @@ def _representative_score(member: Dict, common_tokens: set, group_articles: List
     kw_toks = set(_tokens(kw))
     common_hits = len(kw_toks & common_tokens)
     generic_penalty = -1 if _is_generic_only_display(kw) else 0
-    suffix_penalty = -1 if _ends_with_search_intent_suffix(kw) else 0
+    # 검색의도 suffix라도 이 그룹 기사가 그 단어를 사건으로 서술했으면 페널티를 면제한다
+    # (2026-09-08: "한은서 윤종훈 결혼"의 "결혼"이 8/8 기사에 근거된 핵심 사건어).
+    suffix_penalty = (
+        -1
+        if _ends_with_search_intent_suffix(kw) and not _suffix_is_grounded_event(kw, group_articles)
+        else 0
+    )
     coverage_penalty = -1 if _keyword_coverage(member, group_articles) < DISPLAY_TOKEN_MIN_COVERAGE else 0
     broad_penalty = -1 if kw.strip() in _TOO_BROAD_SINGLE_WORDS else 0
     return (
@@ -1712,8 +1832,20 @@ def _build_display_keyword(members: List[Dict]) -> str:
     #        · "금리 전망" + "인하"(다른 기사 분리 또는 멀리 흩어짐) → 차단
     #      title/snippet은 합치지 않고 각 필드 별도로 검사한다(단순 연결로 연속 phrase처럼
     #      취급 금지). 원문에 없는 새 토큰 순서·의미 배열은 생성하지 않는다.
+    #    되풀이 판정에는 조사 결합 변이도 포함한다(2026-09-08): best가 "한은서 윤종훈
+    #    결혼"이고 second가 "윤종훈 연하 한은서와"이면 "한은서와"는 새 정보가 아니라
+    #    같은 엔티티의 조사 결합 표기다. 이를 residual로 취급하면 "한은서 윤종훈 결혼
+    #    연하 한은서와"처럼 같은 이름이 두 번 나오는 display가 만들어진다. 판정 기준은
+    #    _word_contains_token(기존 조사/alias/복합 계약)으로, 새 규칙을 만들지 않는다.
     best_word_set = set(_tokens(best))
-    residual = [t for t in _tokens(second) if t not in best_word_set]
+
+    def _is_repeat_of_best(tok: str) -> bool:
+        return any(
+            _word_contains_token(tok, b, best_word_set) or _word_contains_token(b, tok, best_word_set)
+            for b in best_word_set
+        )
+
+    residual = [t for t in _tokens(second) if not _is_repeat_of_best(t)]
     if not residual:
         return _display_or_canonical(best, canonical)
 

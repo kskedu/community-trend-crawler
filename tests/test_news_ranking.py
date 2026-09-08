@@ -5001,6 +5001,207 @@ class TestSenseMixingDisplay(unittest.TestCase):
         self.assertTrue(ranker._ends_with_search_intent_suffix("아이유 프로필"))
 
 
+class TestGroundedEventTokenInDisplay(unittest.TestCase):
+    """여러 독립 기사에서 반복 grounding되는 핵심 event가 entity 수식어(조사 결합 표기)
+    때문에 display_keyword에서 탈락하지 않는지 검증.
+
+    운영 사례(2026-09-08 09:47 KST, run 09e4aa54): canonical "한은서 윤종훈 결혼"이
+    기사 8/8에 "결혼"을 두고도 display는 "윤종훈 연하 한은서와"로 나왔다. 원인은 두 가지가
+    함께 작동한 것이다 —
+      (1) _tokens가 형태소를 모르므로 "한은서"(1/8)와 "한은서와"(6/8)가 별도 토큰이 되어
+          조사 결합형이 "그룹 공통 사건토큰" 자리를 차지했고,
+      (2) "결혼"이 _SEARCH_INTENT_SUFFIXES에 있어 canonical이 무조건 -1 페널티를 받았다.
+    두 축 중 하나만 고치면 여전히 뒤집히지 않는다(2×2 실측) — 그래서 두 테스트 축을
+    모두 둔다.
+
+    특정 인물명/사건어를 하드코딩하지 않는다: 판정은 (a) 기존 조사·어미 계약
+    (_ONE_CHAR_JOSA_EOMI / _word_contains_token)과 (b) 기존 공통토큰 임계
+    (DISPLAY_TOKEN_MIN_COVERAGE)만 쓴다.
+    """
+
+    def _rk(self, kw, score, articles, sources=None):
+        return {
+            "keyword": kw, "score": score,
+            "source_breakdown": {"news": score}, "rank_reason": "",
+            "news_meta": {"articles": articles}, "used_signals": ["news"],
+            "sources": sources if sources is not None else {"daum": 1},
+        }
+
+    def _rel(self, title, url, snippet=""):
+        a = _article(title, url, snippet)
+        a["relevance_reason"] = "keyword_main_topic"
+        return a
+
+    def _wedding_articles(self):
+        """운영 기사 분포를 그대로 본뜬 fixture — 대부분이 조사 결합형("B와")을 쓰고
+        base 형("B")은 일부 기사에만 나온다. 사건어는 전 기사에 등장한다."""
+        return [
+            self._rel("배우A♥배우B, 11월 결혼…10살 차 배우 부부 탄생", "https://n1.com/1"),
+            self._rel("드라마C 배우A, 10살 연하 배우B와 11월 결혼", "https://n2.com/2"),
+            self._rel("드라마C 배우A, 배우B와 11월 결혼 소감", "https://n3.com/3"),
+            self._rel("드라마C 배우A 장가간다…10살 연하 배우B와 11월 결혼", "https://n4.com/4"),
+            self._rel("배우A, 배우B와 11월1일 결혼 설레는 마음", "https://n5.com/5"),
+            self._rel("드라마C 배우A, 10살 연하 배우B와 결혼 발표", "https://n6.com/6"),
+            self._rel("배우A, 10살 연하 배우B와 결혼 귀중한 인연", "https://n7.com/7"),
+            self._rel("11월 결혼 배우A, 10년 지기 따로 있었다", "https://n8.com/8"),
+        ]
+
+    # ── 1. 핵심 사건 토큰 보존(운영 회귀 witness) ──────────────────────────────
+    def test_grounded_event_token_survives_in_display(self):
+        arts = self._wedding_articles()
+        # 선행조건: 사건어는 전 기사에, base 엔티티는 소수 기사에만 raw 등장.
+        raw = [set(cand_summarizer._tokens(a["title"])) for a in arts]
+        self.assertEqual(sum(1 for t in raw if "결혼" in t), 8, "사건어는 8/8 근거")
+        self.assertLessEqual(sum(1 for t in raw if "배우B" in t), 2, "base 형은 소수")
+        self.assertGreaterEqual(sum(1 for t in raw if "배우B와" in t), 5, "조사 결합형이 다수")
+
+        ranked = [
+            self._rk("배우B 배우A 결혼", 0.84, arts, {"daum": 1}),
+            self._rk("배우A 연하 배우B와", 0.54, arts, {"aux": True}),
+        ]
+        merged = ranker.dedupe_and_merge(ranked)
+        self.assertEqual(len(merged), 1, "같은 사건이므로 merge")
+        display = merged[0]["display_keyword"]
+        # 핵심: 8/8 기사가 명시한 사건어가 display 에 남아야 한다.
+        self.assertIn("결혼", display, f"핵심 event 가 탈락함: {display!r}")
+        # canonical 은 불변(movement 비교 기준).
+        self.assertEqual(merged[0]["keyword"], "배우B 배우A 결혼")
+
+    # ── 2. 문장 조각(조사 결합형 노출) 회귀 차단 ──────────────────────────────
+    def test_display_does_not_end_with_particle_glued_entity(self):
+        arts = self._wedding_articles()
+        ranked = [
+            self._rk("배우B 배우A 결혼", 0.84, arts, {"daum": 1}),
+            self._rk("배우A 연하 배우B와", 0.54, arts, {"aux": True}),
+        ]
+        display = ranker.dedupe_and_merge(ranked)[0]["display_keyword"]
+        # 조사 결합 표기가 그대로 노출되면 문장 중간에서 끊긴 표현이 된다.
+        self.assertNotIn("배우B와", display, f"조사 결합형이 노출됨: {display!r}")
+        # 같은 엔티티가 두 번 반복돼서도 안 된다.
+        self.assertEqual(display.count("배우B"), 1, f"엔티티 중복: {display!r}")
+
+    def test_josa_variant_is_not_treated_as_new_information(self):
+        """residual 계산이 조사 변이를 '새 정보'로 오인하지 않는지(직접 단위 검증)."""
+        arts = self._wedding_articles()
+        fold = ranker._josa_surface_fold(
+            [set(cand_summarizer._tokens(f"{a['title']} {a.get('snippet','')}")) for a in arts]
+        )
+        self.assertEqual(fold.get("배우B와"), "배우B", "조사 결합형은 base 로 접혀야 한다")
+
+    def test_fold_requires_base_form_observed_in_group(self):
+        """조사·어미로 끝나 보여도 base 형이 그룹에 없으면 접지 않는다(근거 없는 축약 방지).
+
+        "동거인은"은 마지막 글자가 조사(_ONE_CHAR_JOSA_EOMI)지만 "동거인"이 그룹 어디에도
+        없다. 이때 접으면 관측되지 않은 토큰을 만들어내는 것이므로 접기를 거부해야 한다.
+        (corroboration 조건이 빠지면 이 단정이 깨진다.)
+        """
+        per_article = [
+            {"동거인은", "배우A"}, {"배우A", "결혼"}, {"배우A", "발표"}, {"배우A", "소감"},
+        ]
+        self.assertEqual(
+            ranker._josa_surface_fold(per_article), {},
+            "base 형이 관측되지 않으면 접지 않아야 한다",
+        )
+        # base 형이 실제로 등장하면 그때는 접는다(대조군).
+        per_article_with_base = per_article + [{"동거인", "배우A"}]
+        self.assertEqual(
+            ranker._josa_surface_fold(per_article_with_base).get("동거인은"), "동거인",
+            "base 형이 관측되면 접어야 한다",
+        )
+
+    # ── 3. "결혼 생각"(인터뷰 언급) 승격 금지 ────────────────────────────────
+    def test_marriage_only_mentioned_in_interview_is_not_promoted(self):
+        arts = [
+            self._rel("배우A, 결혼 생각 없다…비혼 선언", "https://n1.com/1"),
+            self._rel("배우A 신작 인터뷰 화제", "https://n2.com/2"),
+            self._rel("배우A 근황 공개", "https://n3.com/3"),
+            self._rel("배우A 시상식 참석", "https://n4.com/4"),
+        ]
+        # 사건어 coverage 가 임계 미만이므로 공통 사건토큰이 아니다.
+        self.assertNotIn("결혼", ranker._common_event_tokens_from_articles(arts))
+        self.assertFalse(
+            ranker._suffix_is_grounded_event("배우A 결혼", arts),
+            "단순 언급은 grounded event 가 아니다",
+        )
+
+    # ── 4. "결혼설"(추측)을 확정 결혼으로 표현 금지 ───────────────────────────
+    def test_marriage_rumor_is_not_confirmed_event(self):
+        arts = [
+            self._rel("배우A 결혼설 부인", "https://n1.com/1"),
+            self._rel("배우A 측 결혼설 일축", "https://n2.com/2"),
+            self._rel("배우A 결혼설에 침묵", "https://n3.com/3"),
+            self._rel("배우A 열애설 결혼설 해명", "https://n4.com/4"),
+        ]
+        common = ranker._common_event_tokens_from_articles(arts)
+        # "결혼설"은 "결혼"과 별개 토큰이고, '설'은 조사·어미가 아니라 접히지 않는다.
+        self.assertNotIn("결혼", common, "추측 표현이 확정 사건어로 승격되면 안 된다")
+        self.assertFalse(ranker._suffix_is_grounded_event("배우A 결혼", arts))
+        self.assertNotIn(
+            "결혼설",
+            ranker._josa_surface_fold([set(cand_summarizer._tokens(a["title"])) for a in arts]),
+            "'설'은 조사·어미가 아니므로 접기 대상이 아니다",
+        )
+
+    # ── 5. 같은 인물의 다른 사건에 event token 오삽입 금지 ────────────────────
+    def test_same_person_different_event_does_not_gain_event_token(self):
+        arts = [
+            self._rel("배우A, 신작 드라마 주연 확정", "https://n1.com/1"),
+            self._rel("배우A 신작 드라마 촬영 시작", "https://n2.com/2"),
+            self._rel("배우A 신작 드라마 제작발표회", "https://n3.com/3"),
+            self._rel("배우A 신작 드라마 편성 확정", "https://n4.com/4"),
+        ]
+        ranked = [self._rk("배우A 드라마", 0.8, arts, {"daum": 1})]
+        display = ranker.dedupe_and_merge(ranked)[0]["display_keyword"]
+        self.assertNotIn("결혼", display, f"무관한 사건어가 삽입됨: {display!r}")
+
+    # ── 6. 정상 single-entity keyword 가 불필요하게 길어지지 않음 ─────────────
+    def test_normal_singleton_display_not_lengthened(self):
+        arts = [
+            self._rel("기업A 3분기 실적 발표", "https://n1.com/1"),
+            self._rel("기업A 3분기 실적 개선", "https://n2.com/2"),
+            self._rel("기업A 3분기 실적 시장 예상 상회", "https://n3.com/3"),
+            self._rel("기업A 3분기 실적 컨퍼런스콜", "https://n4.com/4"),
+        ]
+        ranked = [self._rk("기업A 실적", 0.8, arts, {"daum": 1})]
+        display = ranker.dedupe_and_merge(ranked)[0]["display_keyword"]
+        self.assertEqual(display, "기업A 실적", f"단독 후보가 변형됨: {display!r}")
+
+    # ── 7. 카테고리 라벨([프로필])은 event grounding 으로 인정하지 않음 ───────
+    def test_bracket_category_label_is_not_grounded_event(self):
+        """운영 실측(2026-09-01~08): "[프로필] ..." 3/4 기사라 raw coverage 0.750 이지만
+        본문 기준으로는 0.000 이다. 라벨은 기사가 사건을 서술한 것이 아니다."""
+        arts = [
+            self._rel("검찰개혁 강경파 인물A 낙점", "https://n1.com/1"),
+            self._rel("[프로필] 인물A 법무장관 후보자, 판사 출신", "https://n2.com/2"),
+            self._rel("[프로필] 인물A 법무부 장관 후보자", "https://n3.com/3"),
+            self._rel("[프로필] 법무장관 후보자에 인물A", "https://n4.com/4"),
+        ]
+        # raw 로는 임계를 넘지만
+        self.assertIn("프로필", ranker._common_event_tokens_from_articles(arts))
+        # 본문 기준 재확인에서 걸러진다.
+        self.assertFalse(
+            ranker._suffix_is_grounded_event("인물A 프로필", arts),
+            "선두 대괄호 라벨은 event grounding 이 아니다",
+        )
+
+    # ── 8. 검색의도 suffix 는 기존대로 감점 유지 ─────────────────────────────
+    def test_pure_search_intent_suffix_still_penalized(self):
+        arts = [
+            self._rel("배우A 근황 공개", "https://n1.com/1"),
+            self._rel("배우A 신작 출연", "https://n2.com/2"),
+            self._rel("배우A 시상식 참석", "https://n3.com/3"),
+            self._rel("배우A 인터뷰 화제", "https://n4.com/4"),
+        ]
+        self.assertFalse(ranker._suffix_is_grounded_event("배우A 나이", arts))
+        self.assertEqual(
+            ranker._representative_score(
+                self._rk("배우A 나이", 0.9, arts), set(), arts
+            )[1],
+            -1,
+            "기사가 서술하지 않은 검색의도 suffix 는 계속 감점돼야 한다",
+        )
+
+
 class TestShortGenericSingletonDisplayBoost(unittest.TestCase):
     """짧은 일반 생활명사 단독(singleton) display 보강 — "안경" → "AI 안경".
 
