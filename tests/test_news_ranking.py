@@ -1027,6 +1027,192 @@ class TestSameIssueMerge(unittest.TestCase):
         self.assertEqual(len(merged), 1)
         self.assertEqual(merged[0]["merge_reason"], "same_article_cluster")
 
+    # ─────────────────────────────────────────────────────────────────────
+    # SUBSET_COVERAGE 독립보도 구제(2026-09-09 19:19 운영 witness)
+    #
+    # 같은 거래를 매도자/매수자 관점으로 각각 표현한 두 keyword 가, 공유 근거가
+    # 두꺼운데도 "역할 방향이 반대라" 잔여 anchor 조건을 통과할 수 없어 Top10 에
+    # 두 줄로 노출되던 결함. 특정 인물/기업/술어 하드코딩 없이 기존 계약
+    # (_corroborated_by_independent_reports)만 재사용해 판정한다.
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _txn_articles(self):
+        """동일 거래를 다룬 독립 보도 7건 — 대부분 매수자 관점, 일부 매도자 관점.
+        운영 evidence(이재용/홍라희 718만주)를 구조만 본뜬 fixture."""
+        return [
+            self._rel("인물A, 모친 인물B 기업X 지분 718만주 장외 매수 예고", "https://n1.com/1"),
+            self._rel("인물A, 인물B 기업X 주식 718만주 매수 1조9000억 규모", "https://n2.com/2"),
+            self._rel("인물A 회장, 母 인물B 기업X 지분 1.9조 매수", "https://n3.com/3"),
+            self._rel("인물A, 모친 인물B 기업X 지분 1.9조 매수 상속세 대출 상환", "https://n4.com/4"),
+            self._rel("인물A, 인물B 기업X 주식 1.9조원어치 장외매수", "https://n5.com/5"),
+            self._rel("인물A 회장, 모친 인물B 보유 기업X 718만주 매수", "https://n6.com/6"),
+            self._rel("인물B, 기업X 주식 1.9조 인물A에 매도", "https://n7.com/7"),
+        ]
+
+    def _rel(self, title, url, snippet=""):
+        a = _article(title, url, snippet)
+        a["relevance_reason"] = "keyword_main_topic"
+        return a
+
+    def _side(self, title, url, snippet=""):
+        """매도자 관점 제목 — 상대 keyword 기준으로는 객체 쪽 언급이라 운영에서
+        object_side_mention 으로 강등돼 same-issue 근거에서 빠지는 기사."""
+        a = _article(title, url, snippet)
+        a["relevance_reason"] = "object_side_mention"
+        a["relevance_score"] = 0.35
+        return a
+
+    def test_same_transaction_seller_and_buyer_view_merges(self):
+        """§9-1 동일 거래를 매도자/매수자 관점으로 표현 → genuine duplicate merge."""
+        arts = self._txn_articles()
+        seller_view = arts[-1]["url"]
+        # B 는 매도자 관점 기사가 근거에서 빠져 A 의 진부분집합이 된다(SUBSET_COVERAGE).
+        a_arts = list(arts)
+        b_arts = [x for x in arts if x["url"] != seller_view] + [
+            self._side(arts[-1]["title"], seller_view)
+        ]
+        A = self._ranked_with_articles("인물A 인물B 매수", 0.84, a_arts)
+        B = self._ranked_with_articles("인물A 지분 매수", 0.64, b_arts)
+
+        # 선행조건: topology 가 실제로 SUBSET_COVERAGE 여야 이 경로를 검증한다.
+        ea = [x for x in a_arts if ranker._is_same_issue_evidence_article(x)]
+        eb = [x for x in b_arts if ranker._is_same_issue_evidence_article(x)]
+        sa, sb, ra, rb = ranker._split_shared_evidence(ea, eb)
+        self.assertTrue(sa and (not ra or not rb), "SUBSET_COVERAGE 여야 함")
+        self.assertTrue(ra or rb, "IDENTICAL_COVERAGE 면 다른 분기 검증이 됨")
+        # 잔여 기반 anchor 조건은 역할 방향이 반대라 구조적으로 통과 불가.
+        subset_item, other_rest = (A, rb) if not ra else (B, ra)
+        self.assertFalse(
+            ranker._anchor_grounded_in_articles(
+                ranker._merge_anchor_tokens(subset_item), other_rest),
+            "잔여 anchor 조건이 통과하면 이 테스트가 구제 경로를 검증하지 못한다",
+        )
+
+        self.assertTrue(ranker._is_same_issue(A, B))
+        self.assertTrue(ranker._is_same_issue(B, A), "판정은 인자 순서에 대칭이어야 한다")
+        merged = ranker.dedupe_and_merge([A, B])
+        self.assertEqual(len(merged), 1, "같은 거래는 한 줄로 합쳐져야 한다")
+
+    def test_different_transactions_same_parties_do_not_merge(self):
+        """§9-2 동일 인물들의 서로 다른 거래 → merge 금지.
+
+        공유 근거가 한쪽 사건만 다루면(다른 사건 기사가 공유 집합에 없으면) 전건
+        조건(len(together) != len(shared))에서 탈락해 구제되지 않아야 한다.
+
+        주의: 여기서 "다루는가"는 _article_mentions_anchor(any-token) 기준이다.
+        두 keyword 가 인물명 같은 공통 anchor 를 공유하면 그 토큰만으로 전건 조건이
+        채워질 수 있다 — 이 한계는 이번 변경이 만든 것이 아니라 동일 coverage(PR #24)
+        분기에 이미 존재하며, 좁히려면 세 분기를 함께 바꿔야 한다(known risk).
+        그래서 이 테스트는 anchor 가 겹치지 않는 서로 다른 거래로 검증한다."""
+        shared = [
+            self._rel("기관C, 기업X 자사주 500만주 처분 공시", "https://s1.com/1"),
+            self._rel("기관C, 기업X 자사주 블록딜 처분", "https://s2.com/2"),
+            self._rel("기관C 보유 기업X 자사주 처분 완료", "https://s3.com/3"),
+        ]
+        a_arts = list(shared) + [
+            self._rel("기관C, 기업X 자사주 처분 세부 일정", "https://n9.com/9"),
+        ]
+        b_arts = list(shared)
+        A = self._ranked_with_articles("기관C 자사주 처분", 0.8, a_arts)
+        B = self._ranked_with_articles("인물D 미술품 기증", 0.7, b_arts)
+
+        ea = [x for x in a_arts if ranker._is_same_issue_evidence_article(x)]
+        eb = [x for x in b_arts if ranker._is_same_issue_evidence_article(x)]
+        sa, sb, ra, rb = ranker._split_shared_evidence(ea, eb)
+        self.assertTrue(sa and (not ra or not rb), "SUBSET_COVERAGE 경로를 검증해야 한다")
+        self.assertFalse(
+            ranker._is_same_issue(A, B),
+            "공유 기사가 상대 keyword 를 전혀 다루지 않으면 구제되면 안 된다",
+        )
+        self.assertEqual(len(ranker.dedupe_and_merge([A, B])), 2)
+
+    def test_same_company_different_stock_deal_does_not_merge(self):
+        """§9-3 같은 기업이지만 다른 주식 거래 → merge 금지."""
+        deal1 = [
+            self._rel("인물A, 기업X 지분 718만주 장외 매수", "https://n1.com/1"),
+            self._rel("인물A 회장, 기업X 주식 1.9조 매수", "https://n2.com/2"),
+            self._rel("인물A, 기업X 지분 매수 상속세 상환", "https://n3.com/3"),
+        ]
+        deal2 = [
+            self._rel("기관C, 기업X 자사주 500만주 처분 결정", "https://p1.com/1"),
+            self._rel("기관C, 기업X 자사주 처분 공시", "https://p2.com/2"),
+            self._rel("기관C 보유 기업X 자사주 블록딜 처분", "https://p3.com/3"),
+        ]
+        A = self._ranked_with_articles("인물A 기업X 매수", 0.8, deal1)
+        B = self._ranked_with_articles("기관C 자사주 처분", 0.7, deal2)
+        self.assertFalse(ranker._is_same_issue(A, B))
+        self.assertEqual(len(ranker.dedupe_and_merge([A, B])), 2)
+
+    def test_sparse_shared_evidence_stays_fail_closed(self):
+        """§9-4 sparse evidence 로는 동일 거래 확정 불가 → 기존 fail-closed 유지.
+
+        공유 근거가 독립 보도 임계(_SAME_EVENT_MIN_INDEPENDENT_REPORTS)에 미달하면
+        구제하지 않는다. 임계 자체는 건드리지 않는다."""
+        shared = [
+            self._rel("인물A, 인물B 기업X 지분 매수", "https://n1.com/1"),
+            self._rel("인물A, 인물B 기업X 지분 매수", "https://n1.com/1"),  # 동일 URL(전재)
+        ]
+        a_arts = shared + [self._rel("인물B, 기업X 주식 인물A에 매도", "https://n9.com/9")]
+        b_arts = list(shared)
+        A = self._ranked_with_articles("인물A 인물B 매수", 0.8, a_arts)
+        B = self._ranked_with_articles("인물A 지분 매수", 0.6, b_arts)
+        ea = [x for x in a_arts if ranker._is_same_issue_evidence_article(x)]
+        eb = [x for x in b_arts if ranker._is_same_issue_evidence_article(x)]
+        sa, _, _, _ = ranker._split_shared_evidence(ea, eb)
+        self.assertLess(
+            ranker._independent_report_count(sa),
+            ranker._SAME_EVENT_MIN_INDEPENDENT_REPORTS,
+            "독립 보도 수가 임계 미만인 상태를 검증해야 한다",
+        )
+        self.assertFalse(ranker._is_same_issue(A, B))
+
+    def test_identical_coverage_path_still_merges(self):
+        """§9-5 충분한 evidence 로 동일 coverage 가 되면 기존 경로 그대로 merge."""
+        arts = self._txn_articles()
+        A = self._ranked_with_articles("인물A 인물B 매수", 0.84, list(arts))
+        B = self._ranked_with_articles("인물A 기업X 매수", 0.72, list(arts))
+        ea = [x for x in arts if ranker._is_same_issue_evidence_article(x)]
+        sa, sb, ra, rb = ranker._split_shared_evidence(ea, ea)
+        self.assertFalse(ra or rb, "동일 coverage(IDENTICAL) 경로여야 한다")
+        self.assertTrue(ranker._is_same_issue(A, B))
+        self.assertEqual(len(ranker.dedupe_and_merge([A, B])), 1)
+
+    def test_roundup_bridge_does_not_merge_via_subset_rescue(self):
+        """구제 경로가 나열(roundup) bridge 로 우회되지 않는지.
+
+        전재로 URL 이 늘어도 near-dup 으로 접히면 독립 보도 1건이라 임계에 미달한다."""
+        roundup = "오늘의 경제: 인물A 지분 매수 / 기관C 자사주 처분 / 기업Y 실적 발표"
+        synd = [self._rel(roundup, f"https://s{i}.com/{i}") for i in range(1, 5)]
+        a_arts = synd + [self._rel("인물A, 인물B 기업X 지분 매수 상세", "https://n1.com/1")]
+        b_arts = list(synd)
+        A = self._ranked_with_articles("인물A 지분 매수", 0.8, a_arts)
+        B = self._ranked_with_articles("기관C 자사주 처분", 0.7, b_arts)
+        self.assertFalse(
+            ranker._is_same_issue(A, B),
+            "나열 기사만 공유하는 무관 pair 가 구제 경로로 붙으면 안 된다",
+        )
+
+    def test_subset_rescue_backfills_next_candidate(self):
+        """§9-7 중복 제거 후 ranking-eligible 후보가 기존 select_top 으로 자연 승격."""
+        arts = self._txn_articles()
+        seller_view = arts[-1]["url"]
+        b_arts = [x for x in arts if x["url"] != seller_view] + [
+            self._side(arts[-1]["title"], seller_view)
+        ]
+        other = [
+            self._rel("기업Y 3분기 실적 발표", "https://y1.com/1"),
+            self._rel("기업Y 3분기 실적 개선", "https://y2.com/2"),
+        ]
+        ranked = [
+            self._ranked_with_articles("인물A 인물B 매수", 0.84, list(arts)),
+            self._ranked_with_articles("인물A 지분 매수", 0.64, b_arts),
+            self._ranked_with_articles("기업Y 실적", 0.50, other),
+        ]
+        merged = ranker.dedupe_and_merge(ranked)
+        self.assertEqual(len(merged), 2, "중복 1쌍이 합쳐져 2건이 남아야 한다")
+        kws = [m["keyword"] for m in merged]
+        self.assertIn("기업Y 실적", kws, "무관 후보는 그대로 남아 승격 가능해야 한다")
+
     def test_display_keyword_includes_case_context(self):
         shared_title = "공수처, '30억 돈거래 의혹' 김영환 지사 사무실 등 압수수색"
         a1 = _article(shared_title, "https://news.example.com/b1")

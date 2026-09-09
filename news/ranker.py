@@ -1225,7 +1225,43 @@ def _is_same_issue(item_a: Dict, item_b: Dict) -> bool:
         if _is_similar_keyword(kw_a, kw_b):
             return True
         subset_item, other_rest = (item_a, rest_b) if not rest_a else (item_b, rest_a)
-        return _anchor_grounded_in_articles(_merge_anchor_tokens(subset_item), other_rest)
+        if _anchor_grounded_in_articles(_merge_anchor_tokens(subset_item), other_rest):
+            return True
+        # 공유 근거가 "양쪽 keyword 를 함께 다루는 독립 보도"로 두껍게 쌓였으면 같은 사건으로
+        # 본다 — 동일 coverage(PR #24)·양쪽 잔여(PR #31) 분기와 **같은 함수·같은 계약**
+        # (_corroborated_by_independent_reports). 세 topology 분기가 이로써 같은 구제
+        # 경로를 공유한다.
+        #
+        # 배경(2026-09-09 19:19 운영): '이재용 홍라희 매수'(rank1)와 '이재용 지분 매수'
+        # (rank4)가 같은 주식 거래인데 Top10 에 두 줄로 노출됐다. 두 후보의 기사 URL 은
+        # 8/8 동일(Jaccard 1.000)이었지만, 한 기사가 매도자 관점 제목이라
+        # '이재용 지분 매수' 기준으로 keyword 가 객체 쪽에만 나와 object_side_mention
+        # (relevance 0.35)으로 강등됐고, 그 1건이 same-issue 근거에서 빠지면서 topology
+        # 가 IDENTICAL_COVERAGE 가 아닌 이 분기로 갈렸다. 위 잔여 기반 anchor 조건은
+        # **역할 방향이 반대라 구조적으로 통과할 수 없다** — subset 쪽 anchor '매수'가
+        # 매도자 관점 잔여 기사에 나올 리 없기 때문이다. 28분 뒤 19:47 run 에서는 그
+        # 강등이 없어 IDENTICAL_COVERAGE 로 갈려 즉시 merge 됐다. 즉 근거가 부족해서가
+        # 아니라 **관점 표현 차이로 근거 1건이 빠져** 분기가 달라진 불연속이다.
+        #
+        # 나열(roundup) 한 건이 bridge 가 되는 구조는 이 조건을 통과하지 못한다 — 공유
+        # 기사 **전건**이 양쪽 keyword 를 함께 다뤄야 하고(len(together) != len(shared)
+        # 조기 탈락), 전재로 URL 이 늘어도 near-dup 으로 접으면 1건이라 독립 보도 수에
+        # 미달한다. 7일 운영 감사에서 판별력이 확인됐다: 이 분기에서 merge 되지 않던
+        # selected pair 6쌍 중 조건을 통과하는 4쌍은 전부 같은 사건이었고(같은 거래·같은
+        # 순방·동일 대표기사 2쌍), 통과하지 못한 2쌍은 그대로 분리 유지된다.
+        #
+        # ⚠️ 알려진 한계(이 변경이 만든 것이 아니라 _corroborated_by_independent_reports
+        # 자체의 한계 — 다른 두 분기에도 똑같이 존재한다): 서로 다른 매체가 각자 작성한
+        # 나열 기사가 3건 이상이고 그 전부가 양쪽 keyword 를 함께 언급하면 통과할 수 있다.
+        # 또 _article_mentions_anchor 는 anchor 토큰 **하나**만 맞아도 인정하므로, 두
+        # keyword 가 공통어를 공유하면 구별 토큰 없이도 전건 조건이 채워질 수 있다.
+        # 이 경로를 좁히려면 세 분기를 함께 바꿔야 하므로 여기서는 다루지 않는다.
+        #
+        # 잔여 기사는 판정 근거로 쓰지 않는다 — 공유 근거만 본다. 잔여를 근거로 넣으면
+        # 무관 기사가 섞였을 때 그 자체가 merge 근거가 되는 우회가 생긴다.
+        return _corroborated_by_independent_reports(
+            item_a, item_b, shared_a
+        ) or _corroborated_by_independent_reports(item_a, item_b, shared_b)
 
     # 양쪽 모두 잔여 근거 보유 — 기존 신호를 잔여 근거로만 재평가.
     if _same_issue_evidence_signals(item_a, item_b, rest_a, rest_b):
