@@ -1029,6 +1029,39 @@ def _article_mentions_anchor(article: Dict, anchors: set) -> bool:
     return any(_word_contains_token(t, c, anchors) for t in toks for c in anchors)
 
 
+def _distinguishing_anchor_attested(item_a: Dict, item_b: Dict, shared: List[Dict]) -> bool:
+    """두 keyword 를 **구별하는** anchor 가 공유 근거에 실제로 나타나는지.
+
+    _article_mentions_anchor 는 anchor 집합 중 **하나만** 맞아도 참이다(any-token).
+    그래서 두 keyword 가 인물·기관명 같은 공통 anchor 를 공유하면, 공유 기사가
+    한쪽 사건만 다루더라도 그 공통 토큰만으로 "양쪽을 함께 다룬다"가 성립해
+    _corroborated_by_independent_reports 의 전건 조건이 자명하게 채워진다.
+
+    예('기관C 자사주 처분' vs '기관C 사옥 매각', 공유 기사 4건 전부 자사주 처분 보도):
+    B 의 anchor {기관C, 사옥, 매각} 중 '기관C' 하나로 전건 통과 → false merge.
+    '사옥'/'매각' 은 어느 공유 기사에도 없는데도 같은 사건으로 판정된다.
+
+    그래서 각 keyword 의 **고유 anchor**(상대에게 없는 토큰)가 공유 근거 중 최소
+    한 건에는 실제로 등장할 것을 요구한다. "최소 1건"인 이유는 전건을 요구하면
+    매체별 표현 차이로 갈리는 진짜 중복까지 막기 때문이다 — 운영 witness
+    ('이재용 홍라희 매수' vs '이재용 지분 매수')에서 고유 anchor '지분'은 공유 7건
+    중 3건에만 등장한다. 반면 서로 다른 사건이면 고유 anchor 가 **0건** 등장한다
+    (위 자사주/사옥 예: 0/4). 이 0 대 1 경계가 판별선이다.
+
+    고유 anchor 가 아예 없는 쪽(anchor 가 상대의 부분집합)은 이 판정을 건너뛴다 —
+    구별할 토큰 자체가 없으면 이 신호로는 아무것도 말할 수 없고, 그 경우는
+    기존 전건·독립보도 조건이 계속 담당한다.
+    """
+    anchors_a = _keyword_anchor_tokens(item_a)
+    anchors_b = _keyword_anchor_tokens(item_b)
+    for own in (anchors_a - anchors_b, anchors_b - anchors_a):
+        if not own:
+            continue
+        if not any(_article_mentions_anchor(a, own) for a in shared):
+            return False
+    return True
+
+
 def _corroborated_by_independent_reports(
     item_a: Dict, item_b: Dict, shared: List[Dict]
 ) -> bool:
@@ -1259,9 +1292,20 @@ def _is_same_issue(item_a: Dict, item_b: Dict) -> bool:
         #
         # 잔여 기사는 판정 근거로 쓰지 않는다 — 공유 근거만 본다. 잔여를 근거로 넣으면
         # 무관 기사가 섞였을 때 그 자체가 merge 근거가 되는 우회가 생긴다.
-        return _corroborated_by_independent_reports(
-            item_a, item_b, shared_a
-        ) or _corroborated_by_independent_reports(item_a, item_b, shared_b)
+        #
+        # 이 분기는 한쪽 근거가 상대의 부분집합이라, 공유 근거가 상대 keyword 의 사건을
+        # 실제로 다루는지 확인할 잔여 기사가 한쪽에 없다. 그래서 any-token 전건 조건이
+        # 공통 anchor 하나로 자명하게 채워지는 우회를 별도로 막는다
+        # (_distinguishing_anchor_attested — '기관C 자사주 처분' vs '기관C 사옥 매각'처럼
+        # 기관명만 공유하고 실제 사건이 다른 pair 차단). 동일 coverage·양쪽 잔여 분기의
+        # 계약은 건드리지 않는다.
+        return (
+            _corroborated_by_independent_reports(item_a, item_b, shared_a)
+            and _distinguishing_anchor_attested(item_a, item_b, shared_a)
+        ) or (
+            _corroborated_by_independent_reports(item_a, item_b, shared_b)
+            and _distinguishing_anchor_attested(item_a, item_b, shared_b)
+        )
 
     # 양쪽 모두 잔여 근거 보유 — 기존 신호를 잔여 근거로만 재평가.
     if _same_issue_evidence_signals(item_a, item_b, rest_a, rest_b):

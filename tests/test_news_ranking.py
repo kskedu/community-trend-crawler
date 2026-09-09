@@ -1192,26 +1192,142 @@ class TestSameIssueMerge(unittest.TestCase):
             "나열 기사만 공유하는 무관 pair 가 구제 경로로 붙으면 안 된다",
         )
 
-    def test_subset_rescue_backfills_next_candidate(self):
-        """§9-7 중복 제거 후 ranking-eligible 후보가 기존 select_top 으로 자연 승격."""
+    def test_subset_rescue_backfills_rank11_and_keeps_top10(self):
+        """§9-7 중복 제거 후 rank11 이 기존 select_top 계약으로 승격해 Top10 이 유지된다.
+
+        운영 19:20 run 에는 ranking-eligible 후순위 후보가 실제로 존재했으나
+        (`일본뇌염 환자 발생` score 0.5386, 기사 8), 진단은 SELECTED 후보만 articles 를
+        저장해 과거 raw 입력으로는 backfill 을 재현할 수 없다. 그래서 동일 구조를
+        synthetic 으로 고정한다: eligible 11개 + Top10 안 genuine duplicate 1쌍.
+        """
         arts = self._txn_articles()
         seller_view = arts[-1]["url"]
         b_arts = [x for x in arts if x["url"] != seller_view] + [
             self._side(arts[-1]["title"], seller_view)
         ]
-        other = [
-            self._rel("기업Y 3분기 실적 발표", "https://y1.com/1"),
-            self._rel("기업Y 3분기 실적 개선", "https://y2.com/2"),
+        ranked = [
+            self._ranked_with_articles("인물A 인물B 매수", 0.84, list(arts)),
+            self._ranked_with_articles("인물A 지분 매수", 0.83, b_arts),
+        ]
+        # 무관한 eligible 후보 9개 → 총 11개(중복 1쌍 포함).
+        for n in range(9):
+            ranked.append(self._ranked_with_articles("무관사건%d" % n, 0.80 - n * 0.01, [
+                self._rel("무관사건%d 관련 첫 보도 내용 정리" % n, "https://p%d.com/1" % n),
+                self._rel("무관사건%d 후속 취재 결과 발표" % n, "https://q%d.com/2" % n),
+            ]))
+        self.assertEqual(len(ranked), 11, "eligible 후보가 11개여야 경계를 검증한다")
+
+        # 수정 전에는 중복이 남아 rank11(무관사건8)이 잘렸다.
+        merged = ranker.dedupe_and_merge([dict(r) for r in ranked])
+        top = ranker.select_top(merged)
+        self.assertEqual(len(merged), 10, "중복 1쌍이 접혀 10건이 남아야 한다")
+        self.assertEqual(len(top), 10, "Top10 이 유지돼야 한다(underfill 아님)")
+        keys = [t["keyword"] for t in top]
+        self.assertEqual(len(keys), len(set(keys)), "중복 노출이 없어야 한다")
+        self.assertIn("무관사건8", keys, "rank11 이던 후보가 승격해야 한다")
+        self.assertNotIn("인물A 지분 매수", keys, "흡수된 후보는 별도 노출되지 않는다")
+
+    def test_subset_rescue_allows_underfill_when_no_backfill_candidate(self):
+        """안전한 후순위 후보가 없으면 filler 없이 9개 underfill 을 그대로 허용한다."""
+        arts = self._txn_articles()
+        seller_view = arts[-1]["url"]
+        b_arts = [x for x in arts if x["url"] != seller_view] + [
+            self._side(arts[-1]["title"], seller_view)
         ]
         ranked = [
             self._ranked_with_articles("인물A 인물B 매수", 0.84, list(arts)),
-            self._ranked_with_articles("인물A 지분 매수", 0.64, b_arts),
-            self._ranked_with_articles("기업Y 실적", 0.50, other),
+            self._ranked_with_articles("인물A 지분 매수", 0.83, b_arts),
         ]
-        merged = ranker.dedupe_and_merge(ranked)
-        self.assertEqual(len(merged), 2, "중복 1쌍이 합쳐져 2건이 남아야 한다")
-        kws = [m["keyword"] for m in merged]
-        self.assertIn("기업Y 실적", kws, "무관 후보는 그대로 남아 승격 가능해야 한다")
+        for n in range(8):   # 총 10개 → 중복 접히면 9개, 채울 후보 없음
+            ranked.append(self._ranked_with_articles("무관사건%d" % n, 0.80 - n * 0.01, [
+                self._rel("무관사건%d 관련 첫 보도 내용 정리" % n, "https://p%d.com/1" % n),
+                self._rel("무관사건%d 후속 취재 결과 발표" % n, "https://q%d.com/2" % n),
+            ]))
+        self.assertEqual(len(ranked), 10)
+        top = ranker.select_top(ranker.dedupe_and_merge([dict(r) for r in ranked]))
+        self.assertEqual(len(top), 9, "억지 filler 없이 underfill 을 허용한다")
+        self.assertEqual(len({t["keyword"] for t in top}), 9)
+
+    def test_subset_rescue_does_not_merge_distinct_events_sharing_entity(self):
+        """SUBSET_COVERAGE 전용 negative — any-token anchor 한계가 이 분기에서
+        false merge 를 만들지 않는지 직접 검증한다.
+
+        fixture 는 다음을 **단정**한다:
+          · topology 가 SUBSET_COVERAGE (다른 분기로 새면 검증이 무효)
+          · 공유 근거의 독립 보도 수 >= 임계
+          · 동일 기관 토큰이 양쪽 keyword 와 공유 기사 전반에 반복 등장
+          · 그러나 실제 사건은 서로 다름(자사주 처분 vs 사옥 매각)
+        """
+        org = "기관C"
+        shared = [
+            self._rel(f"{org}, 기업X 자사주 500만주 처분 공시", "https://s1.com/1"),
+            self._rel(f"{org}, 기업X 자사주 블록딜 처분 완료", "https://s2.com/2"),
+            self._rel(f"{org} 보유 기업X 자사주 처분 절차 마무리", "https://s3.com/3"),
+            self._rel(f"{org}, 기업X 자사주 처분 대금 사용처 공개", "https://s4.com/4"),
+        ]
+        a_arts = list(shared) + [
+            self._rel(f"{org}, 기업X 자사주 처분 세부 일정 안내", "https://n9.com/9"),
+        ]
+        b_arts = list(shared)
+        A = self._ranked_with_articles(f"{org} 자사주 처분", 0.80, a_arts)
+        B = self._ranked_with_articles(f"{org} 사옥 매각", 0.70, b_arts)
+
+        ea = [x for x in a_arts if ranker._is_same_issue_evidence_article(x)]
+        eb = [x for x in b_arts if ranker._is_same_issue_evidence_article(x)]
+        sa, sb, ra, rb = ranker._split_shared_evidence(ea, eb)
+        # 1) topology 단정 — SUBSET_COVERAGE 여야만 이 분기를 검증한다.
+        self.assertTrue(sa or sb, "NO_SHARED 로 새면 안 된다")
+        self.assertTrue(ra or rb, "IDENTICAL_COVERAGE 로 새면 안 된다")
+        self.assertTrue(not ra or not rb, "BOTH_RESIDUAL 로 새면 안 된다")
+        # 2) 공유 근거의 독립 보도 수가 임계 이상 — 구제 조건의 수량 요건은 충족.
+        self.assertGreaterEqual(
+            ranker._independent_report_count(sa),
+            ranker._SAME_EVENT_MIN_INDEPENDENT_REPORTS,
+            "독립 보도 수가 임계 이상이어야 구제 경로가 실제로 시험된다",
+        )
+        # 3) 동일 기관 토큰이 양쪽 keyword 에 반복 등장한다.
+        self.assertIn(org, A["keyword"])
+        self.assertIn(org, B["keyword"])
+        self.assertTrue(all(org in x["title"] for x in sa))
+        # 4) 그럼에도 서로 다른 사건이므로 merge 되면 안 된다.
+        self.assertFalse(
+            ranker._is_same_issue(A, B),
+            "공유 기사가 상대 keyword 의 사건을 다루지 않으면 구제되면 안 된다",
+        )
+        self.assertFalse(ranker._is_same_issue(B, A), "판정은 대칭이어야 한다")
+        self.assertEqual(len(ranker.dedupe_and_merge([A, B])), 2)
+
+    def test_subset_rescue_merges_when_one_keyword_has_no_distinguishing_anchor(self):
+        """구별 anchor 가 없는 쪽(anchor 가 상대의 부분집합)은 guard 판정을 건너뛴다.
+
+        `_distinguishing_anchor_attested` 가 이 경우까지 False 로 막으면, 한쪽 keyword 가
+        다른 쪽의 축약형인 진짜 중복이 분리된다. 구별할 토큰이 없으면 이 신호로는
+        아무것도 말할 수 없으므로 기존 전건·독립보도 조건에 판정을 맡긴다."""
+        shared = [
+            self._rel("인물A 인물B 기업X 매수 공시 발표 내용", "https://s1.com/1"),
+            self._rel("인물A 인물B 기업X 매수 절차 완료 발표", "https://s2.com/2"),
+            self._rel("인물A 인물B 기업X 매수 대금 납입 완료", "https://s3.com/3"),
+            self._rel("인물A 인물B 기업X 매수 일정 확정 공개", "https://s4.com/4"),
+        ]
+        a_arts = list(shared) + [
+            self._rel("인물A 기업X 매수 후속 조치 안내", "https://n9.com/9"),
+        ]
+        A = self._ranked_with_articles("인물A 인물B 기업X 매수", 0.80, a_arts)
+        B = self._ranked_with_articles("인물A 매수", 0.70, list(shared))
+
+        anchors_a = ranker._keyword_anchor_tokens(A)
+        anchors_b = ranker._keyword_anchor_tokens(B)
+        self.assertFalse(anchors_b - anchors_a, "B 의 구별 anchor 가 비어야 이 경로다")
+        self.assertFalse(
+            ranker._is_similar_keyword(A["keyword"], B["keyword"]),
+            "문자열 유사로 먼저 통과하면 guard 경로를 검증하지 못한다",
+        )
+        ea = [x for x in a_arts if ranker._is_same_issue_evidence_article(x)]
+        eb = [x for x in shared if ranker._is_same_issue_evidence_article(x)]
+        sa, sb, ra, rb = ranker._split_shared_evidence(ea, eb)
+        self.assertTrue(sa and (ra or rb) and (not ra or not rb), "SUBSET_COVERAGE 여야 한다")
+        self.assertTrue(ranker._distinguishing_anchor_attested(A, B, sa))
+        self.assertTrue(ranker._is_same_issue(A, B))
 
     def test_display_keyword_includes_case_context(self):
         shared_title = "공수처, '30억 돈거래 의혹' 김영환 지사 사무실 등 압수수색"
