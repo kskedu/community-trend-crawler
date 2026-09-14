@@ -2219,9 +2219,6 @@ def _boost_short_generic_singleton_display(item: Dict, kw: str) -> Dict:
     news_meta.articles 원본을 쓰면 중복/미표시 기사가 majority를 왜곡할 수 있음).
     """
     from news.summarizer import _tokens
-    from news.dedup import dedup_articles
-    from news.candidates import filter_articles_for_display
-    from news.builder import ARTICLES_MIN, ARTICLES_MAX
 
     kw = (kw or "").strip()
     kw_toks = _tokens(kw)
@@ -2234,10 +2231,7 @@ def _boost_short_generic_singleton_display(item: Dict, kw: str) -> Dict:
         return item
 
     news_meta = item.get("news_meta") or {}
-    displayed = filter_articles_for_display(
-        dedup_articles(news_meta.get("articles") or []), min_count=ARTICLES_MIN
-    )[:ARTICLES_MAX]
-    articles = displayed
+    articles = _displayed_articles(news_meta.get("articles"))
     # 기사별 title 토큰열(순서 유지) — prev-token 위치 판정에 순서가 필요하다.
     title_token_lists = [_tokens(a.get("title", "") or "") for a in articles]
     kw_article_toks = [toks for toks in title_token_lists if kw_tok in toks]
@@ -2523,9 +2517,6 @@ def detect_broad_category_singletons(items: List[Dict]) -> List[Dict]:
     - 표시 기사 2건 미만이면 dispersed=None(판정 불가, 보수적).
     """
     from news.summarizer import _tokens
-    from news.dedup import dedup_articles
-    from news.candidates import filter_articles_for_display, build_display_articles
-    from news.builder import ARTICLES_MIN, ARTICLES_MAX
 
     diagnostics: List[Dict] = []
     for item in items:
@@ -2541,16 +2532,11 @@ def detect_broad_category_singletons(items: List[Dict]) -> List[Dict]:
         kw_tok = kw_toks[0]
 
         # 실제 상세 팝업 노출 기사와 동일 집합으로 subject를 집계한다(Codex diff P2):
-        # builder가 display_articles를 만들 때 filter_articles_for_display 이후
-        # build_display_articles(anchor 재확인)를 한 번 더 통과시키므로, 관찰 로그가
-        # 실제 노출 기사와 어긋나지 않도록 여기서도 동일 단계를 밟는다. 대상은
-        # display==keyword이므로 effective_keyword=kw.
+        # 그 2단 파생은 _display_popup_articles 단일 진실원에 있다(builder와 동일).
+        # 대상은 display==keyword이므로 effective_keyword=kw.
         news_meta = item.get("news_meta") or {}
-        filtered = filter_articles_for_display(
-            dedup_articles(news_meta.get("articles") or []), min_count=ARTICLES_MIN
-        )[:ARTICLES_MAX]
-        articles = build_display_articles(
-            kw, filtered, news_meta.get("representative_article")
+        articles = _display_popup_articles(
+            kw, news_meta.get("articles"), news_meta.get("representative_article")
         )
 
         subjects: List[str] = []
@@ -2709,11 +2695,7 @@ def detect_homonym_entity_singletons(items: List[Dict]) -> List[Dict]:
       경우를 관찰하기 위한 별도 키(차단 후보 목록이 아님 — Codex 1차 P1-3/3차 P3).
     """
     from news.summarizer import _tokens
-    from news.dedup import dedup_articles
-    from news.candidates import (
-        build_display_articles, cluster_articles, filter_articles_for_display,
-    )
-    from news.builder import ARTICLES_MIN, ARTICLES_MAX
+    from news.candidates import cluster_articles
 
     diagnostics: List[Dict] = []
     for item in items:
@@ -2727,11 +2709,9 @@ def detect_homonym_entity_singletons(items: List[Dict]) -> List[Dict]:
 
         news_meta = item.get("news_meta") or {}
         effective_keyword = item.get("display_keyword") or kw
-        filtered = filter_articles_for_display(
-            dedup_articles(news_meta.get("articles") or []), min_count=ARTICLES_MIN
-        )[:ARTICLES_MAX]
-        displayed = build_display_articles(
-            effective_keyword, filtered, news_meta.get("representative_article")
+        displayed = _display_popup_articles(
+            effective_keyword, news_meta.get("articles"),
+            news_meta.get("representative_article"),
         )
 
         primary = [a for a in displayed if a.get("is_primary_cluster")]
@@ -2845,19 +2825,47 @@ def _invariant_check_tokens(text: str) -> set:
     return {t for t in _tokens(text) if len(t) >= 2 and t not in _INVARIANT_SKIP_TOKENS}
 
 
-def _displayed_articles(articles: List[Dict]) -> List[Dict]:
-    """실제 화면에 노출되는 기사 집합을 builder와 동일하게 산출한다(dedup → filter → [:MAX]).
-    _displayed_article_units와 문맥 alias(_contextual_alias_forms)가 **동일 노출 집합**을
-    보도록 단일 진실원으로 분리한다.
+def _displayed_articles(articles: Optional[List[Dict]]) -> List[Dict]:
+    """실제 화면에 노출되는 기사 집합(dedup → filter → [:MAX]).
+
+    파생 자체는 candidates.displayed_articles() 단일 진실원에 있다 — builder(노출
+    payload)와 **같은 함수**를 호출해야 "표시 기사"의 의미가 갈라지지 않는다.
+    ranker 안에서는 이 짧은 이름으로만 쓴다.
     """
-    from news.dedup import dedup_articles
-    from news.candidates import filter_articles_for_display
-    from news.builder import ARTICLES_MIN, ARTICLES_MAX
+    from news.candidates import displayed_articles
 
-    return filter_articles_for_display(dedup_articles(articles or []), min_count=ARTICLES_MIN)[:ARTICLES_MAX]
+    return displayed_articles(articles)
 
 
-def _displayed_article_units(articles: List[Dict]) -> List[tuple]:
+def _display_popup_articles(
+    effective_keyword: str, articles: Optional[List[Dict]], representative: Optional[Dict]
+) -> List[Dict]:
+    """상세 팝업에 실제 노출되는 기사 목록 — builder.build_ranked_entry와 동일 파생.
+
+    표시 기사 집합(_displayed_articles) 위에 build_display_articles(display_keyword
+    기준 anchor 재확인)를 한 번 더 태운 것이 최종 노출 목록이다. 관찰 진단
+    (detect_broad_category_singletons / detect_homonym_entity_singletons)이 실제 노출
+    기사와 어긋나지 않으려면 이 2단 파생을 그대로 따라야 한다(각 지점 Codex diff P2).
+    """
+    from news.candidates import build_display_articles
+
+    return build_display_articles(
+        effective_keyword, _displayed_articles(articles), representative
+    )
+
+
+def _article_units(articles: List[Dict]) -> List[tuple]:
+    """기사별 (토큰집합, 원문) 리스트. 입력은 이미 파생된 노출 집합이어야 한다."""
+    from news.summarizer import _tokens
+
+    units = []
+    for a in articles:
+        text = f"{title_evidence_text(a.get('title', ''))} {a.get('snippet', '')}"
+        units.append((set(_tokens(text)), text))
+    return units
+
+
+def _displayed_article_units(articles: Optional[List[Dict]]) -> List[tuple]:
     """실제 화면에 노출되는 기사 집합을 builder와 동일하게 산출해, 기사별 (토큰집합, 원문)
     리스트로 반환한다. builder.build_ranked_entry가 dedup_articles → filter_articles_for_display
     → [:ARTICLES_MAX] 순으로 노출 집합을 만들므로(Codex diff 리뷰 P2), invariant도 같은
@@ -2867,14 +2875,7 @@ def _displayed_article_units(articles: List[Dict]) -> List[tuple]:
     있어도 통과하던 split-token 오탐(Codex diff 리뷰 P1: "배우B 사망"이 배우B 기사 + 원로배우
     사망 기사로 각각 존재해도 통과)을 막기 위함이다.
     """
-    from news.summarizer import _tokens
-
-    displayed = _displayed_articles(articles)
-    units = []
-    for a in displayed:
-        text = f"{title_evidence_text(a.get('title', ''))} {a.get('snippet', '')}"
-        units.append((set(_tokens(text)), text))
-    return units
+    return _article_units(_displayed_articles(articles))
 
 
 def _supported_by_single_article(check_toks: set, units: List[tuple]) -> bool:
@@ -3082,6 +3083,28 @@ def _display_grounded_by_single_unit(check_tokens: set, units: List[tuple], alia
     return False
 
 
+def _display_grounding_inputs(item: Dict) -> tuple:
+    """grounding 판정 입력(표시 기사 unit 목록, 문맥 alias map)을 한 번에 파생한다.
+
+    운영 게이트(enforce_display_source_grounding)와 진단(is_canonical_source_ungrounded)이
+    **같은 입력**을 봐야 진단이 거짓말을 하지 않는다. 두 곳에 같은 4줄이 복제돼 있었고,
+    표시 기사 파생(_displayed_articles)도 unit 계산과 alias 계산이 각각 한 번씩, 총 두 번
+    돌고 있었다 — 여기서 한 번만 파생해 둘 다에 쓴다(계약·인자·결과 동일).
+
+    반환: (units, alias_map). 표시 기사가 없으면 ([], {}).
+    """
+    articles = (item.get("news_meta") or {}).get("articles") or []
+    displayed = _displayed_articles(articles)
+    canonical = item.get("keyword", "")
+    display_for_alias = item.get("display_keyword") or canonical
+    # 문맥 alias(약칭↔정식명칭) — 표시 기사 묶음에서만 수렴 검증한다(_contextual_alias_forms).
+    # canonical/display 검증 토큰 전체를 후보로 넘겨, 약칭 canonical '삼성'이 기사 '삼성전자'로
+    # grounded 되게 한다(정상 이슈 과잉 drop 방지). 확장형이 충돌·부족하면 매핑에 안 들어가
+    # 기존 fail-closed 계약이 유지된다.
+    alias_tokens = _invariant_check_tokens(canonical) | _invariant_check_tokens(display_for_alias)
+    return _article_units(displayed), _contextual_alias_forms(alias_tokens, displayed)
+
+
 def is_canonical_source_ungrounded(item: Dict) -> bool:
     """이 item 이 canonical grounding fail-closed 로 drop 되는가(순수 관찰 — 진단 전용).
 
@@ -3096,18 +3119,12 @@ def is_canonical_source_ungrounded(item: Dict) -> bool:
 
     표시 기사가 없으면 grounding 은 fail-open(개입 안 함)이므로 여기서도 False.
     """
-    news_meta = item.get("news_meta") or {}
-    articles = news_meta.get("articles") or []
-    units = _displayed_article_units(articles)
+    units, alias_map = _display_grounding_inputs(item)
     if not units:
         return False
-    canonical = item.get("keyword", "")
-    canonical_check = _invariant_check_tokens(canonical)
+    canonical_check = _invariant_check_tokens(item.get("keyword", ""))
     if not canonical_check:
         return False
-    display_for_alias = item.get("display_keyword") or canonical
-    alias_tokens = canonical_check | _invariant_check_tokens(display_for_alias)
-    alias_map = _contextual_alias_forms(alias_tokens, _displayed_articles(articles))
     return not _display_grounded_by_single_unit(canonical_check, units, alias_map)
 
 
@@ -3152,19 +3169,11 @@ def enforce_display_source_grounding(items: List[Dict]) -> List[Dict]:
 
     result: List[Dict] = []
     for item in items:
-        news_meta = item.get("news_meta") or {}
-        units = _displayed_article_units(news_meta.get("articles") or [])
+        units, alias_map = _display_grounding_inputs(item)
         if not units:
             result.append(item)  # 근거 판정 불가 → fail-open
             continue
         canonical = item.get("keyword", "")
-        display_for_alias = item.get("display_keyword") or canonical
-        # 문맥 alias(약칭↔정식명칭) — 표시 기사 묶음에서만 수렴 검증한다(_contextual_alias_forms).
-        # canonical/display 검증 토큰 전체를 후보로 넘겨, 약칭 canonical '삼성'이 기사 '삼성전자'로
-        # grounded 되게 한다(정상 이슈 과잉 drop 방지). 확장형이 충돌·부족하면 매핑에 안 들어가
-        # 기존 fail-closed 계약이 유지된다.
-        alias_tokens = _invariant_check_tokens(canonical) | _invariant_check_tokens(display_for_alias)
-        alias_map = _contextual_alias_forms(alias_tokens, _displayed_articles(news_meta.get("articles") or []))
         # 0. canonical 자체 grounding — display 교정 이전에 canonical 오염을 원천 차단.
         #
         # 계약(ChatGPT P1, 2026-07-21): canonical의 invariant 토큰 조합 "전체"가 **동일
@@ -3254,8 +3263,8 @@ DISPLAY_ARTICLES_MIN = 2
 def exclude_insufficient_display_articles(items: List[Dict]) -> tuple:
     """display_articles(사용자 노출 전용)가 DISPLAY_ARTICLES_MIN 미만(<=1)인 후보를 제외.
 
-    canonical_evidence helper(candidates.py)로 builder와 완전 동일한 정제 기사 집합을 얻어
-    display 개수를 산출한다(F, 2026-07: drift 방지 단일 진실원).
+    _display_popup_articles로 builder와 완전 동일한 노출 기사 목록을 얻어 display 개수를
+    산출한다(F, 2026-07: drift 방지 단일 진실원).
 
     **select_top() 이전, 전체 merged 리스트에 적용한다(2026-07 변경, Codex 계획리뷰 P1-4)** —
     이전엔 select_top 이후 적용이라 Top10 통과분이 display 부족으로 빠지면 하위 backfill 없이
@@ -3263,17 +3272,15 @@ def exclude_insufficient_display_articles(items: List[Dict]) -> tuple:
     줄어도 filler는 넣지 않는다. articles 원본/ranking gate/quality·fresh·PR gate는 불변.
     반환: (kept, excluded_keywords).
     """
-    from news.candidates import build_display_articles, canonical_evidence
-
     kept: List[Dict] = []
     excluded: List[str] = []
     for item in items:
         news_meta = item.get("news_meta") or {}
         keyword = item.get("keyword", "")
-        articles, _, _ = canonical_evidence(news_meta, keyword)
         effective_keyword = item.get("display_keyword") or keyword
-        display = build_display_articles(
-            effective_keyword, articles, news_meta.get("representative_article")
+        display = _display_popup_articles(
+            effective_keyword, news_meta.get("articles"),
+            news_meta.get("representative_article"),
         )
         if len(display) < DISPLAY_ARTICLES_MIN:
             logger.warning(

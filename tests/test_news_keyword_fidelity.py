@@ -1240,3 +1240,127 @@ class TestComparisonEvidenceUrlDedup(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ── 표시 기사 파생 단일 진실원(2026-09 구조 정리) ──────────────────────────────
+class TestDisplayedArticleDerivationSingleSource(unittest.TestCase):
+    """"표시 기사"를 만드는 3단계(dedup → filter → [:MAX])와 그 위의 팝업 파생이
+    저장소 전체에서 **한 함수**로만 이뤄지는지 고정한다.
+
+    같은 3단계가 builder/candidates/ranker 6곳에 인라인으로 복제돼 있었고, 지점마다
+    "builder 와 같은 집합이어야 한다"는 리뷰 지적이 반복됐다. 한 곳만 갱신되면 노출
+    기사와 검증 대상이 조용히 갈라지므로, 파생 계약 자체를 여기서 잠근다.
+    """
+
+    def _articles(self, n, title_fn):
+        return [art(title_fn(i), f"h{i}.co.kr") for i in range(n)]
+
+    def test_displayed_articles_truncates_at_articles_max(self):
+        """ARTICLES_MAX 절단이 파생에 포함된다 — 노출 상한이 사라지면 검증 대상이 늘어난다."""
+        from news.builder import ARTICLES_MAX
+        meta = _news_meta_for("정책 발표", self._articles(
+            ARTICLES_MAX + 4, lambda i: f"정책 발표 {i}차 회의 결과 공개"))
+        self.assertGreater(len(meta.get("articles") or []), ARTICLES_MAX,
+                           "fixture 전제: 근거 기사가 노출 상한보다 많아야 절단을 관측한다")
+        self.assertEqual(len(ranker._displayed_articles(meta["articles"])), ARTICLES_MAX)
+
+    def test_displayed_article_units_applies_display_derivation(self):
+        """unit 은 원본 근거가 아니라 **노출 집합**에서 만든다."""
+        from news.builder import ARTICLES_MAX
+        meta = _news_meta_for("정책 발표", self._articles(
+            ARTICLES_MAX + 4, lambda i: f"정책 발표 {i}차 회의 결과 공개"))
+        units = ranker._displayed_article_units(meta["articles"])
+        self.assertEqual(len(units), len(ranker._displayed_articles(meta["articles"])))
+        self.assertLess(len(units), len(meta["articles"]))
+
+    def test_display_popup_articles_derives_from_displayed_set(self):
+        """팝업 목록은 원본이 아니라 노출 집합 위에서 anchor 재확인을 태운다."""
+        from news.builder import ARTICLES_MAX
+        meta = _news_meta_for("정책 발표", self._articles(
+            ARTICLES_MAX + 4, lambda i: f"정책 발표 {i}차 회의 결과 공개"))
+        popup = ranker._display_popup_articles(
+            "정책 발표", meta["articles"], meta.get("representative_article"))
+        self.assertLessEqual(len(popup), ARTICLES_MAX)
+        self.assertLess(len(popup), len(meta["articles"]))
+
+    def test_display_popup_articles_passes_representative_through(self):
+        """representative 는 anchor 재확인 기준이라 반드시 그대로 전달돼야 한다.
+
+        primary cluster 밖 기사는 "대표 기사 title 과 비-모호 토큰 2개 이상 공유"로도
+        살아남는다(_display_anchor_allowed). representative 를 흘리지 않으면 그 경로가
+        통째로 죽어 정상 기사가 팝업에서 사라진다.
+        """
+        def _a(title, url, primary):
+            return {"title": title, "url": url, "snippet": "", "clean_description": "",
+                    "is_primary_cluster": primary, "relevance_score": 0.9,
+                    "relevance_reason": "keyword_main_topic", "is_incidental": False}
+
+        rep = _a("지원 사업 공고 접수 시작", "https://a.co.kr/1", True)
+        # keyword 토큰(지원/사업)은 하나도 안 겹치지만 대표 title 과 '공고'·'접수'를 공유.
+        outsider = _a("공고 접수 절차 변경 안내", "https://b.co.kr/2", False)
+        articles = [rep, outsider]
+        with_rep = ranker._display_popup_articles("지원 사업", articles, rep)
+        without_rep = ranker._display_popup_articles("지원 사업", articles, None)
+        self.assertEqual([a["url"] for a in with_rep],
+                         ["https://a.co.kr/1", "https://b.co.kr/2"])
+        self.assertEqual([a["url"] for a in without_rep], ["https://a.co.kr/1"])
+
+    def test_grounding_inputs_units_come_from_displayed_set(self):
+        """grounding 판정 unit 도 노출 집합 기준이다(운영 게이트와 진단이 같은 입력)."""
+        from news.builder import ARTICLES_MAX
+        meta = _news_meta_for("정책 발표", self._articles(
+            ARTICLES_MAX + 4, lambda i: f"정책 발표 {i}차 회의 결과 공개"))
+        item = {"keyword": "정책 발표", "display_keyword": "정책 발표", "news_meta": meta}
+        units, _alias = ranker._display_grounding_inputs(item)
+        self.assertEqual(len(units), ARTICLES_MAX)
+
+    def test_grounding_inputs_alias_is_scoped_to_displayed_set(self):
+        """문맥 alias 는 **노출 집합**에서만 수렴 검증한다.
+
+        노출 상한 밖 기사까지 세면 화면에 없는 확장형으로 canonical 이 grounded 돼,
+        표시 기사와 어긋난 canonical 이 살아남는다.
+        """
+        from news.builder import ARTICLES_MAX
+        # 노출되는 8건 중 확장형('상원전자')은 1건뿐 → 최소 2건 요건 미달 → alias 없음.
+        articles = [art("상원전자 리콜 접수 창구 확대", "h0.co.kr")]
+        articles += [art(f"리콜 접수 창구 {i}차 안내 공지", f"h{i}.co.kr")
+                     for i in range(1, ARTICLES_MAX)]
+        # 상한 밖(9번째) 에 확장형 1건 추가 → 원본 기준이면 2건이 되어 alias 가 성립한다.
+        articles.append(art("상원전자 리콜 접수 창구 추가 개설", "h9.co.kr"))
+        meta = _news_meta_for("리콜", articles)
+        item = {"keyword": "상원 리콜", "display_keyword": "상원 리콜", "news_meta": meta}
+        displayed = ranker._displayed_articles(meta["articles"])
+        self.assertEqual(len(displayed), ARTICLES_MAX, "fixture 전제: 9번째가 잘려야 한다")
+        _units, alias = ranker._display_grounding_inputs(item)
+        self.assertEqual(
+            alias, ranker._contextual_alias_forms({"상원", "리콜"}, displayed),
+            "alias 는 노출 집합으로 산출돼야 한다")
+        self.assertNotEqual(
+            alias, ranker._contextual_alias_forms({"상원", "리콜"}, meta["articles"]),
+            "fixture 전제: 원본 기준과 결과가 달라야 범위를 검증할 수 있다")
+
+    def test_grounding_inputs_alias_tokens_include_display_keyword(self):
+        """alias 후보 토큰에 display_keyword 토큰도 포함된다(canonical 만으로는 부족)."""
+        articles = [art("상원전자 리콜 접수 창구 확대", "h0.co.kr"),
+                    art("상원전자 리콜 대상 모델 공개", "h1.co.kr"),
+                    art("상원전자 리콜 비용 부담 발표", "h2.co.kr")]
+        meta = _news_meta_for("리콜", articles)
+        item = {"keyword": "리콜", "display_keyword": "상원 리콜", "news_meta": meta}
+        _units, alias = ranker._display_grounding_inputs(item)
+        self.assertIn("상원", alias,
+                      "display 쪽 토큰('상원')의 확장형도 alias 후보여야 한다")
+
+    def test_builder_and_ranker_see_the_same_displayed_set(self):
+        """builder 노출 payload 와 ranker 검증 집합이 같은 함수에서 나온다."""
+        from news.builder import build_ranked_entry
+        from news.candidates import canonical_evidence, displayed_articles
+        from news.builder import ARTICLES_MAX
+        meta = _news_meta_for("정책 발표", self._articles(
+            ARTICLES_MAX + 4, lambda i: f"정책 발표 {i}차 회의 결과 공개"))
+        entry = build_ranked_entry(1, {"keyword": "정책 발표", "score": 0.5, "news_meta": meta})
+        expected = [a.get("url") for a in displayed_articles(meta["articles"])]
+        self.assertEqual([a.get("url") for a in entry["articles"]], expected)
+        self.assertEqual(
+            [a.get("url") for a in ranker._displayed_articles(meta["articles"])], expected)
+        self.assertEqual(
+            [a.get("url") for a in canonical_evidence(meta, "정책 발표")[0]], expected)
