@@ -3331,10 +3331,10 @@ def run_selection_stages(
 ) -> Dict:
     """뉴스 선정 게이트 시퀀스의 단일 진실원.
 
-    main._rank_and_select(운영)와 news.replay.replay_selection(재생)이 이 함수 하나를
-    호출한다 — 게이트 추가/순서 변경은 반드시 여기서만 일어나야 두 경로가 갈라지지
-    않는다(news/dryrun.py가 자체 복제본으로 2단계 누락 + 순서 역전으로 drift한 전례가
-    이 통합의 근거. dryrun 재동기는 별도 PR).
+    main._rank_and_select(운영)·news.replay.replay_selection(재생)·news.dryrun.run_ranking
+    (dry-run)이 이 함수 하나를 호출한다 — 게이트 추가/순서 변경은 반드시 여기서만
+    일어나야 세 경로가 갈라지지 않는다(dryrun이 자체 복제본으로 2단계 누락 + 순서
+    역전으로 drift했던 것이 이 통합의 근거이며, 2026-09-14 재동기를 마쳤다).
 
     observe(stage, excluded_keywords): 각 제외 단계 직후 호출되는 순수 관찰 hook.
     main이 기존과 동일한 시점(다음 stage의 내부 로그보다 앞)에 자기 logger로 집계
