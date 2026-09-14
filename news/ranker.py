@@ -235,6 +235,49 @@ def _quality_gate_reason(keyword: str, news_meta: Dict) -> Optional[str]:
     return None
 
 
+# gate 관측 payload 버전(2026-09). quality gate 가 **왜 통과/탈락했는지**를 과거 run
+# 하나만 보고 설명하기 위한 compact 근거다.
+GATE_TRACE_VERSION = 1
+
+
+def gate_trace(keyword: str, news_meta: Dict) -> Optional[Dict]:
+    """quality gate 판정 근거 compact dict(관측 전용, 랭킹 판정에 읽히지 않는다).
+
+    gate 로직을 여기서 다시 구현하지 않는다 — 판정은 _quality_gate_reason 을 그대로
+    호출하고, 그 함수가 소비하는 news_meta 값만 함께 남긴다. 진단이 판정과 어긋나는
+    것을 원천 차단하기 위해서다(main._diag_gate_reason_code 와 같은 계약).
+
+    저장하는 값은 전부 enum/count/bool 이다. 기사 제목/snippet/URL 은 담지 않는다.
+
+    키(짧게 — JSONB 는 행마다 키 문자열을 저장한다):
+      v    payload 버전
+      kind keyword_kind(entity|event|unknown)
+      hrc  high_relevance_count
+      qcs  quality_cluster_size
+      fhrc fresh_high_relevance_count
+      dom  has_dominant_event
+      burst same_event_burst
+      pass gate 통과 여부
+      why  탈락 사유(통과면 생략)
+    """
+    if not news_meta:
+        return None
+    reason = _quality_gate_reason(keyword, news_meta)
+    trace = {
+        "v": GATE_TRACE_VERSION,
+        "kind": news_meta.get("keyword_kind"),
+        "hrc": int(news_meta.get("high_relevance_count") or 0),
+        "qcs": int(news_meta.get("quality_cluster_size") or 0),
+        "fhrc": int(news_meta.get("fresh_high_relevance_count") or 0),
+        "dom": bool(news_meta.get("has_dominant_event")),
+        "burst": bool(news_meta.get("same_event_burst")),
+        "pass": reason is None,
+    }
+    if reason:
+        trace["why"] = reason
+    return trace
+
+
 def _rank_demand_norm(candidates: List[Dict], family: str) -> Dict[str, float]:
     """candidate.sources[family] rank → 역수 후 집합 min-max 정규화 map(search_demand용)."""
     raw = {}
@@ -404,6 +447,8 @@ def compute_scores(candidates: List[Dict], signals: Dict[str, Dict]) -> List[Dic
             "source_breakdown": breakdown,
             "score_trace": _score_trace(k, breakdown, renorm, news_atoms.get(k),
                                         news_map.get(k), penalty, score),
+            # gate 통과 근거(관측 전용). gate 를 통과한 후보만 여기 도달하므로 pass=True 다.
+            "gate_trace": gate_trace(k, news_map.get(k)),
             "rank_reason": _build_rank_reason(breakdown, available),
             "news_meta": news_map.get(k) or {},
             "used_signals": list(renorm.keys()),

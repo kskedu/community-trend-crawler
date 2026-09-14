@@ -559,6 +559,14 @@ def _diag_record_pass(diag, candidates, signals, ranked, pr_excluded, merged,
         # 복제하지 않고 정수 카운트만 덧붙인다.
         scored = scored_by_key.get(key)
         extra = {}
+        # gate 통과/탈락 근거(2026-09, 순수 관찰). 비선정 후보는 builder 를 타지 않아
+        # signals 가 비어 있었다 — 그래서 과거 run 만 보고는 "왜 gate 를 통과했나"를
+        # 설명할 수 없었다(2026-09-14 '신랑' 조사에서 실제로 막힌 지점).
+        # gate 로직을 복제하지 않고 ranker.gate_trace 가 _quality_gate_reason 을 그대로
+        # 호출한다. signals 는 기존 컬럼이라 DB/RPC 변경이 필요 없다.
+        gt = ranker.gate_trace(kw, (signals.get("news") or {}).get(kw))
+        if gt is not None:
+            extra["signals"] = {"gate_trace_v1": gt}
         if scored is not None:
             extra["score"] = scored.get("score")
             extra["pre_cut_rank"] = pre_cut_rank.get(key)

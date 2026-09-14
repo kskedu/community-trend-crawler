@@ -621,6 +621,52 @@ class BriefingPassFlowTest(unittest.TestCase):
                 self.assertNotIn(sentinel, saved, "폐기된 pass2 decisions가 혼입됐다")
             self.assertTrue(saved <= set(_BriefingHarness.PASS1))
 
+    def test_nonselected_rows_carry_gate_trace_end_to_end(self):
+        """gate 에 **탈락한** 후보의 decision 행에도 gate_trace_v1 이 실려야 한다.
+
+        이것이 이번 보강의 핵심이다 — 비선정 후보는 builder 를 타지 않아 signals 가
+        비어 있었고, 그래서 과거 run 만으로는 "왜 gate 를 통과/탈락했나"를 설명할 수
+        없었다(2026-09-14 '신랑' 조사에서 실제로 막힌 지점).
+
+        ⚠️ 기본 harness 는 전부 selected 라 비선정 경로를 지나지 않는다. gate 를 확실히
+        탈락하는 후보(고관련 0건)를 하나 섞어 **그 경로를 실제로 통과**시킨다.
+        """
+        fail_kw = "게이트탈락"
+        keywords = list(_BriefingHarness.PASS1) + [fail_kw]
+        sig = _signals(*_BriefingHarness.PASS1)["news"]
+        # 고관련 0건 + cluster 0 → _quality_gate_reason 이 low_quality_news 를 반환한다.
+        bad = _news_meta(keyword=fail_kw)
+        bad.update({"high_relevance_count": 0, "quality_cluster_size": 0,
+                    "fresh_high_relevance_count": 0})
+        sig[fail_kw] = bad
+
+        with _BriefingHarness(self), \
+             patch.object(main_module, "_collect_home_seeds",
+                          return_value=({"daum_home": keywords}, {"daum_home": "ok"})), \
+             patch.object(main_module, "_seed_sources_from",
+                          return_value={"daum_home": keywords}), \
+             patch.object(main_module.cand, "collect_candidates",
+                          return_value=_candidates(*keywords)), \
+             patch.object(main_module.cand, "build_news_signals", return_value=sig), \
+             patch.object(main_module, "upsert_news_issues", return_value=True), \
+             patch.object(main_module, "record_news_diagnostics", return_value=True) as rpc:
+            main_module.run_news_briefing()
+            _payload, decisions = rpc.call_args[0]
+
+        by_kw = {d["keyword"]: d for d in decisions}
+        self.assertIn(fail_kw, by_kw, "gate 탈락 후보가 decision 으로 기록되지 않았다")
+        row = by_kw[fail_kw]
+        self.assertEqual(row["result_status"], "not_selected")
+
+        self.assertIsInstance(row.get("signals"), dict,
+                              "비선정 행에 signals 가 실리지 않았다")
+        tr = row["signals"].get("gate_trace_v1")
+        self.assertIsNotNone(tr, "비선정 행에 gate_trace_v1 이 없다")
+        self.assertEqual(tr["v"], 1)
+        self.assertFalse(tr["pass"], "gate 탈락인데 pass=True 로 기록됐다")
+        self.assertEqual(tr["why"], "low_quality_news")
+        self.assertEqual(tr["hrc"], 0)
+
     def test_saved_decisions_match_published_payload_exactly(self):
         """저장된 selected의 keyword·rank·대표 여부가 실제 발행 payload와 1:1 일치한다.
 
@@ -1299,6 +1345,134 @@ class TestScoreBreakdownObservability(unittest.TestCase):
         # 기존 계약: 진단의 article_count 는 entry["articles"] 길이
         self.assertEqual(len(entry["articles"]), 6)
         self.assertIn("articles", entry)
+
+
+class TestGateTraceObservability(unittest.TestCase):
+    """gate_trace_v1 관측 계약(2026-09).
+
+    배경: 2026-09-14 '신랑' 사례(run 66699fab…, rank 6 / score 0.6185)에서 "왜 quality
+    gate 를 통과했나"를 과거 run 만으로 설명할 수 없었다. keyword_kind /
+    has_dominant_event / quality_cluster_size 가 어디에도 저장되지 않았기 때문이다.
+    비선정 후보는 builder 를 타지 않아 signals 자체가 비어 있었다.
+
+    이 클래스는 **관측 계약만** 고정한다 — 랭킹 판정은 이 값을 읽지 않는다(쓰기 전용).
+    """
+
+    def _nm(self, **over):
+        nm = {"keyword_kind": "entity", "high_relevance_count": 2,
+              "quality_cluster_size": 1, "fresh_high_relevance_count": 2,
+              "has_dominant_event": False, "same_event_burst": False}
+        nm.update(over)
+        return nm
+
+    def test_trace_matches_actual_gate_verdict(self):
+        """trace 의 pass/why 는 _quality_gate_reason 실행 결과와 **항상** 일치해야 한다.
+
+        진단이 판정 로직을 복제하면 조용히 어긋난다. 같은 함수를 호출하는지 확인한다.
+        """
+        from news import ranker
+        for nm in (self._nm(),
+                   self._nm(has_dominant_event=True),
+                   self._nm(same_event_burst=True),
+                   self._nm(keyword_kind="event"),
+                   self._nm(high_relevance_count=0, quality_cluster_size=0),
+                   self._nm(fresh_high_relevance_count=0)):
+            with self.subTest(nm=nm):
+                tr = ranker.gate_trace("테스트", nm)
+                reason = ranker._quality_gate_reason("테스트", nm)
+                self.assertEqual(tr["pass"], reason is None)
+                if reason:
+                    self.assertEqual(tr["why"], reason)
+                else:
+                    self.assertNotIn("why", tr)
+
+    def test_entity_without_dominant_event_is_explained(self):
+        """'신랑' 재현: entity 인데 dominant event/burst 가 없으면 그 사실이 남아야 한다."""
+        from news import ranker
+        tr = ranker.gate_trace("신랑", self._nm())
+        self.assertEqual(tr["kind"], "entity")
+        self.assertFalse(tr["dom"])
+        self.assertFalse(tr["burst"])
+        self.assertFalse(tr["pass"])
+        self.assertEqual(tr["why"], "low_quality_news")
+
+    def test_trace_is_none_without_news_meta(self):
+        """news 근거가 없으면 trace 를 만들지 않는다(빈 dict 로 오해 금지)."""
+        from news import ranker
+        self.assertIsNone(ranker.gate_trace("x", None))
+        self.assertIsNone(ranker.gate_trace("x", {}))
+
+    def test_trace_stores_no_text(self):
+        """enum/count/bool 만 저장한다 — 기사 제목/URL/본문 금지."""
+        import json as _json
+        from news import ranker
+        blob = _json.dumps(ranker.gate_trace("키워드", self._nm()), ensure_ascii=False)
+        self.assertNotIn("http", blob)
+        for v in _json.loads(blob).values():
+            self.assertIsInstance(v, (int, bool, str, type(None)))
+
+    def test_selected_entry_carries_nested_key_only(self):
+        """selected 경로: signals 최상위를 오염시키지 않고 중첩 키로만 들어간다."""
+        from news.builder import build_ranked_entry
+        from news import ranker
+        item = {
+            "keyword": "테스트", "score": 0.5, "source_breakdown": {"news": 0.5},
+            "rank_reason": "", "used_signals": ["news"], "sources": {"daum_home": 1},
+            "news_meta": {"articles": [
+                {"title": "테스트 사건 보도", "url": "https://a.example.com/1",
+                 "relevance_score": 0.9, "is_primary_cluster": True}]},
+            "gate_trace": ranker.gate_trace("테스트", self._nm(has_dominant_event=True)),
+        }
+        sig = build_ranked_entry(1, item)["signals"]
+        self.assertIn("gate_trace_v1", sig)
+        # 기존 boolean 7키 불변
+        for k in ("news", "trend", "daum", "google", "nate", "bing", "search_demand"):
+            self.assertIsInstance(sig[k], bool)
+        # trace 내부 키가 최상위로 새면 안 된다
+        for leaked in ("kind", "hrc", "qcs", "dom", "burst", "pass", "why"):
+            self.assertNotIn(leaked, sig)
+
+    def test_absent_trace_leaves_signals_shape_identical(self):
+        """trace 가 없으면 키 자체를 넣지 않는다(과거 행과 동일한 모양)."""
+        from news.builder import build_ranked_entry
+        item = {
+            "keyword": "테스트", "score": 0.5, "source_breakdown": {"news": 0.5},
+            "rank_reason": "", "used_signals": ["news"], "sources": {"daum_home": 1},
+            "news_meta": {"articles": [
+                {"title": "테스트 사건 보도", "url": "https://a.example.com/1",
+                 "relevance_score": 0.9, "is_primary_cluster": True}]},
+        }
+        sig = build_ranked_entry(1, item)["signals"]
+        self.assertNotIn("gate_trace_v1", sig)
+        self.assertEqual(sorted(sig),
+                         ["bing", "daum", "google", "nate", "news", "search_demand", "trend"])
+
+    def test_real_compute_scores_attaches_gate_trace(self):
+        """실제 compute_scores 가 gate_trace 를 실어야 한다(단위 helper 만 검증하면 부족)."""
+        from news import ranker
+
+        def arts(kw, n, sh=0):
+            return [{"title": f"{kw} 관련 상세 보도 기사 {i}",
+                     "url": f"https://d{i+sh}.example.com/a{i}", "press": f"p{i}",
+                     "relevance_score": 0.9, "is_primary_cluster": True,
+                     "snippet": f"{kw} 보도 {i}",
+                     "published_at": "2026-09-14T00:00:00+00:00"} for i in range(n)]
+
+        cands, sig = [], {}
+        for i, (kw, n) in enumerate([("알파 사건", 8), ("베타 발표", 6)]):
+            cands.append({"keyword": kw, "sources": {"daum_home": i + 1}})
+            sig[kw] = {"recent_count": n, "domain_diversity": n, "title_relevance": 0.9,
+                       "latest_age_hours": 2.0, "articles": arts(kw, n, i * 10),
+                       "high_relevance_count": n, "quality_cluster_size": n,
+                       "fresh_high_relevance_count": n, "fresh_quality_cluster_size": n,
+                       "latest_relevant_age_hours": 2.0, "has_dominant_event": True,
+                       "same_event_burst": True, "keyword_kind": "event",
+                       "issue_article_count": n}
+        ranked = ranker.compute_scores(cands, {"news": sig})
+        self.assertTrue(ranked)
+        for r in ranked:
+            self.assertIsNotNone(r.get("gate_trace"), f"{r['keyword']} gate_trace 누락")
+            self.assertTrue(r["gate_trace"]["pass"], "gate 를 통과한 후보만 ranked 에 있다")
 
 
 if __name__ == "__main__":

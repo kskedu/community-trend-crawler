@@ -143,6 +143,8 @@ def build_ranked_entry(
             # 값이 없으면 키 자체를 넣지 않는다(과거 행과 동일한 모양 유지).
             **({"score_breakdown_v1": ranked_item["score_trace"]}
                if ranked_item.get("score_trace") else {}),
+            **({"gate_trace_v1": ranked_item["gate_trace"]}
+               if ranked_item.get("gate_trace") else {}),
         },
         "trend": None,  # 기존 호환 (datalab 점수화 객체는 후속)
         "articles": articles,
