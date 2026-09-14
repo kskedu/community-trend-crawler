@@ -1699,6 +1699,62 @@ def _age_hours(published_at: Optional[str]) -> Optional[float]:
     return age if age >= 0 else None
 
 
+def _editorial_items_for_volume(articles: List[dict]) -> List[dict]:
+    """evidence volume 집계용 "editorial item" 목록 — 같은 매체가 한 취재 건을 사진만
+    갈아 끼워 여러 URL 로 낸 포토 batch 를 1건으로 접는다. 입력 순서 유지.
+
+    배경(2026-09-12 00:47 UTC 운영 run be3a3de2-81c1-45a4-bcd8-cb7e4a295e04):
+    '인터뷰하는 김지홍 대표변호사' 가 rank 8 / score 0.6195 로 Top10 에 올랐는데, 근거
+    8건이 전부 연합뉴스 한 곳·제목 2종·published_at 동일·URL 만 PYH…1800/2400/2500/…
+    로 연속된 사진 ID 였다. 한 인터뷰 촬영의 사진 여러 장인데 recent_count 가 8 로
+    집계돼 run 최대치와 동률이 됐고, news 축의 60% 를 차지하는 그 값이 후보를 Top10
+    까지 밀어 올렸다(domain_diversity 는 1 이지만 가중치 20% 라 상쇄되지 않는다).
+
+    접는 기준은 **(domain, 제목) 이 모두 같을 때만**이다 — 둘 중 하나라도 다르면 접지
+    않는다. 운영 14일 표본(667 run / 6,649 근거 보유 후보)에서 이 조합의 안전성을 확인했다:
+      - 같은 매체 + 제목 전부 다름(실제 후속 기사) 1,996건 → 접지 않음
+      - 제목 동일 + 매체 복수(전재/신디케이션)     141건 → 접지 않음
+      - 같은 매체 + 동일 제목(포토 batch)          381건 → 접음
+
+    ranker._is_near_duplicate_title 을 쓰지 않는 이유: 그 helper 는 짧은 제목의 우연
+    일치를 막으려 5토큰 하한을 두는데, 운영 표본의 동일 제목 묶음 381건 중 147건이 그
+    하한에 걸려 통과했다("이강철 감독 600승" 3토큰 등). **완전히 같은 제목**은 우연이
+    아니므로 여기서는 exact match 로만 접고, near-duplicate 병합은 도입하지 않는다
+    (제목이 조금이라도 다르면 별개 기사 — 기존 계약 유지).
+    """
+    by_key = {}
+    items = []
+    for a in articles or []:
+        url = a.get("url") or ""
+        try:
+            from urllib.parse import urlparse
+            host = urlparse(url).netloc.lower()
+        except Exception:
+            host = ""
+        title = (a.get("title") or "").strip()
+        # host 나 title 을 못 읽으면 접을 근거가 없으므로 각각 독립으로 센다(fail-open).
+        if not host or not title:
+            items.append(a)
+            continue
+        key = (host, title)
+        prev = by_key.get(key)
+        if prev is None:
+            by_key[key] = a
+            items.append(a)
+            continue
+        # 같은 batch 안에서는 **가장 최신** 기사를 대표로 남긴다. 접기는 "근거가 몇 건인가"
+        # 만 줄이는 보정이고 "언제 터진 이슈인가"(latest_age_hours → freshness 축)까지
+        # 깎으면 안 되기 때문이다. 입력 순서는 relevance 순이라 최신이 먼저라는 보장이
+        # 없어서, 대표를 그대로 두면 10시간 전 사진이 5분 전 사진을 가려 실제로 방금
+        # 터진 이슈가 freshness 를 잃는다.
+        prev_age = _age_hours(prev.get("published_at"))
+        cur_age = _age_hours(a.get("published_at"))
+        if cur_age is not None and (prev_age is None or cur_age < prev_age):
+            by_key[key] = a
+            items[items.index(prev)] = a
+    return items
+
+
 def compute_news_signal(keyword: str, raw_items: List[dict], require_all_tokens: bool = False) -> Optional[dict]:
     """키워드별 News 신호 산출(normalizer 파생). 유효 기사 없으면 None.
 
@@ -1842,10 +1898,15 @@ def compute_news_signal(keyword: str, raw_items: List[dict], require_all_tokens:
     #     news 축 0.78, 최종 0.8252, rank 4.)
     #    정제를 건너뛰는 event/unknown 키워드는 scored_articles == normalized 라 값이 그대로다
     #    (회귀 없음). 정제가 전부 non_subject 라 롤백된 경우도 동일하다.
+    #    포토 batch 보정(2026-09-12): 같은 매체가 같은 제목으로 사진만 갈아 끼워 낸
+    #    여러 URL 은 독립 근거가 아니라 1건의 editorial item 이다(_editorial_items_for_volume).
+    #    이 보정은 세는 모수에만 적용하고 articles 목록 자체는 건드리지 않는다 —
+    #    상세 팝업 노출/대표 선정/clustering 은 기존 계약 그대로 전체 기사를 본다.
+    volume_items = _editorial_items_for_volume(scored_articles)
     domains = set()
     recent_count = 0
     ages = []
-    for a in scored_articles:
+    for a in volume_items:
         url = a.get("url") or ""
         try:
             from urllib.parse import urlparse
