@@ -38,6 +38,22 @@ def _raw(title, host, minutes_ago, description=""):
     }
 
 
+def _raw_at(title, host, minutes_ago, slug, description=""):
+    """같은 제목이라도 URL 을 명시적으로 구분해야 하는 fixture 용.
+
+    _raw() 는 URL 을 hash(title) 로 만들기 때문에 제목이 같으면 URL 까지 같아져
+    상위 dedup(URL 기준)이 먼저 접어 버린다. 포토 batch 는 "제목은 같은데 URL 은
+    다르다"가 핵심이므로 slug 로 URL 만 갈라 준다.
+    """
+    return {
+        "title": title,
+        "originallink": f"https://{host}/view/{slug}",
+        "link": f"https://{host}/view/{slug}",
+        "pubDate": _ago(minutes_ago),
+        "description": description,
+    }
+
+
 class TestEvidenceVolumeMatchesRefinedSet(unittest.TestCase):
     """recent_count/domain_diversity 는 정제 후 evidence 집합으로 세야 한다."""
 
@@ -193,6 +209,140 @@ class TestEvidenceVolumeMatchesRefinedSet(unittest.TestCase):
                 n = len(sig["articles"])
                 self.assertLessEqual(sig["recent_count"], n)
                 self.assertLessEqual(sig["domain_diversity"], n)
+
+
+class TestSamePressPhotoBatchDoesNotInflateEvidence(unittest.TestCase):
+    """같은 매체가 한 취재 건에서 사진만 갈아 끼워 여러 URL 로 발행한 묶음(포토뉴스)은
+    ranking evidence 에서 1건의 editorial item 으로 센다.
+
+    배경(2026-09-12 00:47 UTC 운영 run be3a3de2-81c1-45a4-bcd8-cb7e4a295e04):
+    '인터뷰하는 김지홍 대표변호사' 가 rank 8 / score 0.6195 로 Top10 에 올랐다.
+    근거 8건이 전부 연합뉴스 한 곳, 제목은 단 2종, published_at 은 초 단위까지 동일,
+    URL 은 PYH2026090118{1800,2400,2500,2600,2700,2900,3100} 로 연속된 사진 ID 였다.
+    즉 독립 보도 8건이 아니라 한 인터뷰 촬영에서 나온 사진 여러 장이다.
+
+    그런데 recent_count 는 8 로 집계돼 run 최대치와 동률이 됐고, news 축의 60% 를
+    차지하는 이 값이 후보를 Top10 까지 밀어 올렸다(domain_diversity 는 1 이지만
+    가중치가 20% 라 상쇄되지 않는다).
+
+    계약: "같은 domain + 같은 제목" 묶음만 접는다. 매체가 다르면 접지 않고(독립 보도),
+    같은 매체라도 제목이 다르면 접지 않는다(실제 후속 기사).
+    """
+
+    def test_same_domain_identical_title_photo_batch_counts_once(self):
+        """운영 재현: 같은 매체·같은 제목·URL 만 다른 사진 8장 → evidence 1건."""
+        arts = [
+            _raw_at("연합뉴스와 인터뷰하는 김지홍 대표변호사", "www.yna.co.kr", 5,
+                    f"PYH2026090118{n}0013",
+                    "법무법인 지평 김지홍 대표변호사가 연합뉴스와 인터뷰를 하고 있다")
+            for n in ("24", "25", "26", "27", "29", "31", "18", "20")
+        ]
+        sig = cand.compute_news_signal("인터뷰하는 김지홍 대표변호사", arts)
+        self.assertEqual(sig["recent_count"], 1)
+        self.assertEqual(sig["domain_diversity"], 1)
+
+    def test_same_domain_different_titles_stay_independent(self):
+        """같은 매체라도 실제 내용이 다른 후속 기사는 각각 evidence 로 센다."""
+        arts = [
+            _raw_at("김지홍 대표변호사, 지평 신임 대표 선임", "www.yna.co.kr", 30, "A1",
+                    "법무법인 지평이 김지홍 변호사를 신임 대표로 선임했다"),
+            _raw_at("김지홍 \"기업 법무 시장 재편될 것\"", "www.yna.co.kr", 25, "A2",
+                    "김지홍 대표변호사가 기업 법무 시장 전망을 밝혔다"),
+            _raw_at("지평, 김지홍 체제로 조직 개편", "www.yna.co.kr", 20, "A3",
+                    "법무법인 지평이 조직 개편을 단행했다"),
+        ]
+        sig = cand.compute_news_signal("김지홍 대표변호사", arts)
+        self.assertEqual(sig["recent_count"], 3)
+        self.assertEqual(sig["domain_diversity"], 1)
+
+    def test_different_domains_same_title_stay_independent(self):
+        """서로 다른 매체가 같은 제목으로 보도한 것은 접지 않는다(전재/신디케이션 계약 불변).
+
+        이 경로를 접으면 cross-outlet 독립 보도가 깎여 source diversity 계약이 무너진다.
+        운영 14일 표본에서 '제목 동일 + domain 복수' 는 141건 관측됐고 전부 정상이다.
+        """
+        arts = [
+            _raw_at("이남철 고령군수 별세", "www.yna.co.kr", 10, "B1", "이남철 고령군수가 별세했다"),
+            _raw_at("이남철 고령군수 별세", "www.newsis.com", 12, "B2", "이남철 고령군수가 별세했다"),
+            _raw_at("이남철 고령군수 별세", "www.news1.kr", 14, "B3", "이남철 고령군수가 별세했다"),
+        ]
+        sig = cand.compute_news_signal("이남철 고령군수 별세", arts)
+        self.assertEqual(sig["recent_count"], 3)
+        self.assertEqual(sig["domain_diversity"], 3)
+
+    def test_photo_batch_mixed_with_independent_reports_keeps_the_independents(self):
+        """포토 batch 는 1건으로 접히되, 같은 사건을 다룬 다른 매체 보도는 그대로 남는다."""
+        arts = [
+            _raw_at("우즈베키스탄 대통령 공식 환영식", "www.yna.co.kr", 8, "P1", "환영식이 열렸다"),
+            _raw_at("우즈베키스탄 대통령 공식 환영식", "www.yna.co.kr", 8, "P2", "환영식이 열렸다"),
+            _raw_at("우즈베키스탄 대통령 공식 환영식", "www.yna.co.kr", 8, "P3", "환영식이 열렸다"),
+            _raw_at("우즈베키스탄 대통령 방한, 정상회담 개최", "www.newsis.com", 15, "Q1",
+                    "우즈베키스탄 대통령이 방한해 정상회담을 했다"),
+            _raw_at("한-우즈베크 정상, 경제협력 확대 합의", "www.news1.kr", 20, "R1",
+                    "두 정상이 경제협력 확대에 합의했다"),
+        ]
+        sig = cand.compute_news_signal("우즈베키스탄 대통령", arts)
+        # 포토 3건 → 1건, 독립 보도 2건 유지 = 3
+        self.assertEqual(sig["recent_count"], 3)
+        self.assertEqual(sig["domain_diversity"], 3)
+
+    def test_short_identical_titles_below_near_dup_floor_still_fold(self):
+        """제목 토큰이 near-dup 하한(5)보다 적어도 **완전히 같으면** 접는다.
+
+        _is_near_duplicate_title 은 짧은 제목의 우연 일치를 막으려고 5토큰 하한을 두는데,
+        완전 동일 제목은 우연이 아니다. 운영 표본에서 이 하한 때문에 접히지 않은 동일
+        제목·동일 매체 묶음이 147건 있었다.
+        """
+        arts = [
+            _raw_at("이강철 감독 600승", "www.yna.co.kr", 6, "S1", "이강철 감독이 600승을 달성했다"),
+            _raw_at("이강철 감독 600승", "www.yna.co.kr", 6, "S2", "이강철 감독이 600승을 달성했다"),
+            _raw_at("이강철 감독 600승", "www.yna.co.kr", 6, "S3", "이강철 감독이 600승을 달성했다"),
+        ]
+        sig = cand.compute_news_signal("이강철 감독 600승", arts)
+        self.assertEqual(sig["recent_count"], 1)
+
+    def test_unkeyable_articles_are_kept_not_dropped(self):
+        """접기 키(domain/제목)를 만들 수 없는 기사는 빼지 않고 각각 독립으로 센다(fail-open).
+
+        normalize_article 이 빈 제목/빈 URL 기사를 이미 걸러 내므로 compute_news_signal
+        경로로는 이 분기에 도달할 수 없다. 그래도 helper 계약은 고정해 둔다 — 키를 못
+        만든다고 evidence 에서 빼면 파싱 실패가 조용한 감점으로 바뀌기 때문이다.
+        (이 단정이 없으면 "키 없으면 drop" 변이가 전체 suite 에서 살아남는다.)
+        """
+        items = cand._editorial_items_for_volume([
+            {"url": "https://e1.example.com/view/N1", "title": "네팔 홍수 사망자 증가"},
+            {"url": "", "title": "네팔 홍수 피해 확산"},          # host 없음
+            {"url": "https://e2.example.com/view/N2", "title": ""},  # 제목 없음
+        ])
+        self.assertEqual(len(items), 3)
+
+    def test_fold_keeps_the_freshest_member_for_latest_age(self):
+        """batch 를 접어도 freshness 는 가장 최신 기사 기준이어야 한다.
+
+        접기는 "근거가 몇 건인가"만 줄이는 보정이다. 입력은 relevance 순이라 최신이
+        먼저라는 보장이 없어서, 먼저 온 기사를 그대로 대표로 남기면 10시간 전 사진이
+        5분 전 사진을 가려 방금 터진 이슈가 freshness 축을 잃는다.
+        """
+        arts = [
+            _raw_at("포즈 취하는 배우", "www.yna.co.kr", 600, "F1", "배우가 포즈를 취하고 있다"),
+            _raw_at("포즈 취하는 배우", "www.yna.co.kr", 5, "F2", "배우가 포즈를 취하고 있다"),
+        ]
+        sig = cand.compute_news_signal("포즈 취하는 배우", arts)
+        self.assertEqual(sig["recent_count"], 1)
+        # 10시간(600분)이 아니라 5분 쪽이 반영돼야 한다.
+        self.assertLess(sig["latest_age_hours"], 1.0)
+
+    def test_folded_batch_never_exceeds_article_list(self):
+        """불변식 유지: 접은 뒤에도 recent_count/domain_diversity <= articles 길이."""
+        arts = [
+            _raw_at("포즈 취하는 배우", "www.yna.co.kr", 5, f"T{i}", "배우가 포즈를 취하고 있다")
+            for i in range(8)
+        ]
+        sig = cand.compute_news_signal("포즈 취하는 배우", arts)
+        n = len(sig["articles"])
+        self.assertLessEqual(sig["recent_count"], n)
+        self.assertLessEqual(sig["domain_diversity"], n)
+        self.assertEqual(sig["recent_count"], 1)
 
 
 if __name__ == "__main__":
