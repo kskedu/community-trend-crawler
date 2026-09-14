@@ -75,15 +75,29 @@ UNION ALL SELECT '6. signals 키 목록', COALESCE((SELECT v FROM sig_keys), '(�
 UNION ALL SELECT '7. signals 크기',    COALESCE((SELECT v FROM sizes), '(없음)')
 UNION ALL SELECT '8. read RPC 앵커 d.article_count 출현수', (SELECT v::text FROM anchor)
 UNION ALL SELECT '9. read RPC 권한',   COALESCE((SELECT v FROM perms), '(없음)')
+-- 10/11: 단순 문자열 포함(position)으로 판정하면 주석·다른 식별자에도 걸려 **위양성**이
+-- 난다. `jsonb_to_recordset(...) AS d(...)` 의 **컬럼 타입 선언**과 INSERT 대상 목록
+-- 양쪽에 있어야 실제로 값이 저장되므로, 타입까지 붙여 정확히 확인한다.
 UNION ALL SELECT '10. write RPC 가 evidence_article_count 를 선언하는가',
-       (SELECT CASE WHEN position('evidence_article_count' in v) > 0
-                    THEN 'YES — 값이 저장된다'
-                    ELSE 'NO  — 값이 조용히 버려진다(적재 실패는 아님). 07 참조' END
+       (SELECT CASE
+          WHEN position('evidence_article_count integer' in v) > 0
+           AND position('d.evidence_article_count' in v) > 0
+          THEN 'YES — recordset 선언 + INSERT 목록 모두 있음(값이 저장된다)'
+          WHEN position('evidence_article_count' in v) > 0
+          THEN 'PARTIAL — 문자열은 있으나 선언/목록 중 하나가 없다. 13번 정의를 직접 확인할 것'
+          ELSE 'NO  — 값이 조용히 버려진다(적재 실패는 아님). 07 참조' END
         FROM writefn)
 UNION ALL SELECT '11. write RPC 가 signals 를 선언하는가',
-       (SELECT CASE WHEN position('signals' in v) > 0
-                    THEN 'YES — 값이 저장된다'
-                    ELSE 'NO  — 값이 조용히 버려진다(적재 실패는 아님). 07 참조' END
+       (SELECT CASE
+          WHEN position('signals jsonb' in v) > 0
+           AND position('d.signals' in v) > 0
+          THEN 'YES — recordset 선언 + INSERT 목록 모두 있음(값이 저장된다)'
+          WHEN position('signals' in v) > 0
+          THEN 'PARTIAL — 문자열은 있으나 선언/목록 중 하나가 없다. 13번 정의를 직접 확인할 것'
+          ELSE 'NO  — 값이 조용히 버려진다(적재 실패는 아님). 07 참조' END
         FROM writefn)
+UNION ALL SELECT '11b. write RPC 가 살아 있는가(정의 존재)',
+       (SELECT CASE WHEN v IS NULL THEN 'NO — news_diag_record_run 이 없다(중대)'
+                    ELSE 'YES' END FROM writefn)
 UNION ALL SELECT '12. read RPC 정의(롤백용 원본)', (SELECT v FROM readfn)
 UNION ALL SELECT '13. write RPC 정의(10/11 이 NO 일 때만 필요)', (SELECT v FROM writefn);
