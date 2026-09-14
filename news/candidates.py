@@ -1310,6 +1310,35 @@ def aggregate_crime_attribution(keyword: str, high_articles: List[Dict]) -> Dict
     }
 
 
+def display_adds_unsafe_crime_attribution(
+    display: str, canonical: str, articles: List[Dict]
+) -> bool:
+    """merge 조합 표기가 canonical 에 없던 **형사 처분 주장**을 새로 만드는가(2026-09-10).
+
+    candidate 게이트는 merge 이전 키워드에만 걸린다. 그래서 각자는 안전한 후보
+    (`"<이름> 사기"` — 처분어 없음 / `"징역 10개월"` — 이름 anchor 없음)가 merge 되면
+    _build_display_keyword 가 `"<이름> 사기 징역 10개월"`을 만들어, 후보 단계에서
+    차단한 오귀속이 표기 단계에서 되살아난다.
+
+    판정은 aggregate_crime_attribution **그대로** 쓴다 — display 전용 범죄 규칙을 새로
+    만들지 않는다. 조합 표기의 선두가 처분어라 이름 anchor 가 잡히지 않는 배열
+    (`"징역 10개월 <이름>"`)은, canonical 엔티티가 그 처분을 주장받는 형태로 세워
+    같은 판정기에 넘긴다.
+
+    반환 True 면 호출부가 canonical 로 되돌린다(canonical 은 candidate 게이트를 이미
+    통과한 표기라 항상 안전한 대안이다 — 사건을 잃지 않는다).
+    """
+    disp = (display or "").strip()
+    canon = (canonical or "").strip()
+    if not disp or disp == canon:
+        return False
+    added = [t for t in _DISPOSITION_TOKENS if t in disp and t not in canon]
+    if not added:
+        return False  # canonical 이 이미 담고 있던 처분 주장 → 새로 만든 위험이 아니다.
+    probe = disp if _kw_name_anchor(disp) else f"{canon} {' '.join(added)}"
+    return aggregate_crime_attribution(probe, articles or [])["has_unsafe_crime_attribution"]
+
+
 # === entity cohesion 신호(E) — dominant event / same-event burst ===
 # BURST_HOURS: 서로 다른 언론사의 "같은 속보" 인정 시간창(published_at 간격 상한).
 BURST_HOURS = 6.0

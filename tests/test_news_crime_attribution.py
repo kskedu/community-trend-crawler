@@ -427,6 +427,120 @@ class TestFamilyRelationAttribution(unittest.TestCase):
         self.assertNotEqual(cand.classify_crime_subject_role("한유명", art), "subject")
 
 
+class TestMergeDisplayCrimeAttribution(unittest.TestCase):
+    """merge 표기 단계 우회 차단(PR #40 known risk 1 후속).
+
+    candidate 게이트는 merge **이전** 키워드에만 걸린다. 그래서 각자는 안전한 후보가
+    합쳐지면 _build_display_keyword 가 위험한 조합을 새로 만들 수 있다:
+      · `"<이름> 사기"`  — 처분어가 없어 트리거 안 됨
+      · `"징역 10개월"`   — 선두가 처분어라 이름 anchor 가 없어 트리거 안 됨
+      → merge display `"<이름> 사기 징역 10개월"`
+    실제로 재현됐고(운영 기사 8건 = 모친 사건), 조합 표기가 canonical 에 없던 형사
+    처분 주장을 새로 만들면 canonical 로 되돌린다.
+    """
+
+    def _display(self, keywords, arts):
+        r = replay_selection({
+            "keywords": keywords,
+            "articles_by_keyword": {k: arts for k in keywords},
+            "sources_by_keyword": {k: {"nate_home": i + 1} for i, k in enumerate(keywords)},
+        })
+        return [(s["keyword"], s["display_keyword"]) for s in r["selected"]]
+
+    def test_both_candidates_safe_but_merge_would_be_unsafe(self):
+        # 전제: 두 후보 모두 candidate 게이트를 통과한다(= 우회 경로가 실재).
+        for kw in ("한유명 사기", "징역 10개월"):
+            self.assertFalse(cand.crime_keyword_requires_check(kw), kw)
+        selected = self._display(["한유명 사기", "징역 10개월"], MOTHER_SENTENCED_ARTS)
+        self.assertTrue(selected, "정상 후보가 통째로 사라지면 안 된다")
+        for _, disp in selected:
+            # 형을 받은 사람은 모친이다 → 이름 + 처분어 조합이 만들어지면 안 된다.
+            self.assertNotIn("징역", disp, disp)
+            self.assertFalse(cand.crime_keyword_requires_check(disp), disp)
+
+    def test_disposition_leading_arrangement_also_blocked(self):
+        # 조합 표기의 선두가 처분어면 이름 anchor 가 안 잡힌다("징역 10개월 한유명").
+        # canonical 엔티티가 그 처분을 주장받는 형태로 세워 같은 판정기에 넘긴다.
+        selected = self._display(["한유명", "징역 10개월"], MOTHER_SENTENCED_ARTS)
+        self.assertTrue(selected)
+        for _, disp in selected:
+            self.assertNotIn("징역", disp, disp)
+
+    def test_relation_labeled_display_is_preserved(self):
+        # 관계를 표기에 드러낸 canonical 은 처분어를 붙여도 안전 → 그대로 유지한다
+        # (관계어를 무조건 붙이지도, 무조건 떼지도 않는다).
+        selected = self._display(["한유명 모친 사기", "징역 10개월"], MOTHER_SENTENCED_ARTS)
+        self.assertIn(("한유명 모친 사기", "한유명 모친 사기 징역 10개월"), selected)
+
+    def test_real_defendant_merge_keeps_disposition(self):
+        # 본인이 실제 피고인이면 merge 표기가 처분어를 담아도 그대로 둔다(과잉차단 금지).
+        selected = self._display(["한유명 사기", "징역 10개월"], SELF_SENTENCED_ARTS)
+        self.assertTrue(selected)
+        self.assertTrue(any("징역" in disp for _, disp in selected),
+                        f"본인 사건인데 처분어가 사라졌다: {selected}")
+
+    # --- 판정 함수 단위 계약 ---
+
+    def test_guard_only_fires_on_newly_added_disposition(self):
+        """이 guard 는 merge 가 **새로 더한** 형사 처분 주장에만 개입한다(범위 한정)."""
+        mother = [{"title": t, "snippet": ""} for t in
+                  ("한유명 모친, 1심서 징역 10개월", "한유명 母, 사기 혐의 징역 10개월")]
+        # (a) 처분어를 새로 더하지 않으면 판정 대상이 아니다 — 기사가 모친 사건이어도.
+        self.assertFalse(cand.display_adds_unsafe_crime_attribution(
+            "한유명 사기 투자", "한유명 사기", mother))
+        # (b) display == canonical 이면 판정 대상이 아니다.
+        self.assertFalse(cand.display_adds_unsafe_crime_attribution(
+            "한유명 사기", "한유명 사기", mother))
+        # (c) 처분어를 새로 더했고 그 주장이 기사로 뒷받침되지 않으면 True.
+        self.assertTrue(cand.display_adds_unsafe_crime_attribution(
+            "한유명 사기 징역 10개월", "한유명 사기", mother))
+
+    def test_guard_allows_added_disposition_when_person_is_subject(self):
+        # 본인이 실제 피고인이면 처분어를 새로 더해도 되돌리지 않는다.
+        self_arts = [{"title": a["title"], "snippet": ""} for a in SELF_SENTENCED_ARTS]
+        self.assertFalse(cand.display_adds_unsafe_crime_attribution(
+            "한유명 사기 징역 10개월", "한유명 사기", self_arts))
+
+    def test_covers_others_path_is_guarded(self):
+        """best 가 다른 member 를 문자로 포함해 그대로 display 가 되는 경로도 막는다.
+
+        `"징역 10개월 <이름>"` 은 선두가 처분어라 candidate 게이트를 통과하고, 그 문자열이
+        canonical `"<이름>"` 을 포함하므로 조합 없이 곧장 display 가 된다.
+        """
+        arts = [{"title": t, "snippet": "", "url": f"https://x/{i}", "press": "p",
+                 "relevance_score": 0.9, "is_incidental": False, "is_primary_cluster": True}
+                for i, t in enumerate(a["title"] for a in MOTHER_SENTENCED_ARTS)]
+        kws = ["한유명", "징역 10개월 한유명"]
+        for k in kws:
+            self.assertFalse(cand.crime_keyword_requires_check(k), k)
+        members = [{"keyword": k, "score": 1.0 - i * 0.1,
+                    "news_meta": {"articles": arts}, "sources": {"nate_home": i + 1}}
+                   for i, k in enumerate(kws)]
+        self.assertEqual(ranker._build_display_keyword(members), "한유명")
+
+    def test_guard_does_not_fire_without_new_disposition_claim(self):
+        """처분 주장을 새로 더하지 않으면 개입하지 않는다 — 되돌리면 오히려 나빠진다.
+
+        운영 관측(2026-09): canonical `"여고생 살해 사형"`(피해자가 선고받은 것처럼 읽힘)보다
+        조합 표기 `"검찰 사형 구형 <피고인>"` 이 정확하다. 범위를 한정하지 않으면 정확한
+        표기를 더 나쁜 canonical 로 되돌린다.
+        """
+        arts = [{"title": t, "snippet": ""} for t in (
+            "'여고생 살해' 김유명에 사형 구형… \"영원히 격리해야\"",
+            "검찰, 여고생 살해범 김유명에 사형 구형",
+            "'여고생 살해범' 김유명 사형 구형…재범 위험 커",
+            "여고생 살해 김유명 사형 구형")]
+        self.assertFalse(cand.display_adds_unsafe_crime_attribution(
+            "검찰 사형 구형 김유명", "여고생 살해 사형", arts))
+
+    def test_guard_does_not_touch_non_crime_display(self):
+        # 비범죄 조합 표기는 판정 대상 자체가 아니다(회귀 0).
+        arts = [{"title": "한유명, 신곡 발표", "snippet": ""},
+                {"title": "한유명 콘서트 매진", "snippet": ""}]
+        self.assertFalse(cand.display_adds_unsafe_crime_attribution(
+            "한유명 신곡 콘서트", "한유명", arts))
+
+
 class TestNonCrimeRegression(unittest.TestCase):
     """비범죄·본인 사건 회귀: crime gate 가 기존 신호를 훼손하지 않는다."""
 

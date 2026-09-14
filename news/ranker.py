@@ -1950,7 +1950,7 @@ def _build_display_keyword(members: List[Dict]) -> str:
         (not set(k) - best_toks) or k == best for k in keywords if k != best
     )
     if covers_others and len(members_sorted) > 1:
-        return best[:DISPLAY_KEYWORD_MAX_LEN]
+        return _crime_safe_display(best[:DISPLAY_KEYWORD_MAX_LEN], canonical, group_articles)
 
     # 조합 대상 second 후보 선택. 두 경로 모두 coverage 낮은 지엽 엔티티(상대국/기업명
     # 등)는 second로 붙이지 않는다(Codex diff 재리뷰 P2: 공통토큰 보완 경로에도 동일
@@ -1996,7 +1996,7 @@ def _build_display_keyword(members: List[Dict]) -> str:
             second = m["keyword"]
             break
     if second is None:
-        return _display_or_canonical(best, canonical)
+        return _display_or_canonical(best, canonical, group_articles)
 
     # ── 중복 제거 재설계 v2(ChatGPT P1 사전검토, 2026-07-21): entity/일반명사 구분(person
     #    판정)을 없애고, "best와 겹치는 second 토큰 제거 + 최종 조합의 단일-기사 공존 근거 검증"
@@ -2035,23 +2035,54 @@ def _build_display_keyword(members: List[Dict]) -> str:
 
     residual = [t for t in _tokens(second) if not _is_repeat_of_best(t)]
     if not residual:
-        return _display_or_canonical(best, canonical)
+        return _display_or_canonical(best, canonical, group_articles)
 
     candidate = f"{best} {' '.join(residual)}"
     if len(candidate) <= DISPLAY_KEYWORD_MAX_LEN:
         cand_check = _invariant_check_tokens(candidate)
         if cand_check and _combo_span_grounded(cand_check, group_articles):
-            return _display_or_canonical(candidate, canonical)
-    return _display_or_canonical(best, canonical)
+            return _display_or_canonical(candidate, canonical, group_articles)
+    return _display_or_canonical(best, canonical, group_articles)
 
 
-def _display_or_canonical(display: str, canonical: str) -> str:
+def _crime_safe_display(display: str, canonical: str, group_articles: List[Dict]) -> str:
+    """조합 표기가 canonical 에 없던 범죄 주체 오귀속을 새로 만들면 canonical 로 되돌린다.
+
+    candidate 게이트는 merge 이전 키워드에만 걸려서, 각자는 안전한 후보가 merge 되면
+    표기 단계에서 오귀속이 되살아난다(PR #40 known risk). 판정은 candidates 의
+    display_adds_unsafe_crime_attribution → aggregate_crime_attribution 을 그대로
+    호출한다 — ranker 에 범죄 판정 규칙을 복제하지 않는다.
+
+    fallback 대상인 canonical 은 candidate 게이트가 이미 판정한 표기라, 되돌려도 게이트가
+    보지 않은 새 주장이 생기지 않는다. 그래서 이 경로는 후보를 떨어뜨리지 않는다
+    (사건 보존) — fail-closed drop 은 불필요하다.
+
+    단 canonical 이 조합 표기보다 **더 나은** 표기라는 뜻은 아니다(운영 관측: canonical
+    "여고생 살해 사형" < 조합 "검찰 사형 구형 <피고인>"). 그래서 되돌리는 범위를
+    "조합이 처분 주장을 **새로 더한** 경우"로 한정한다 — 판정 범위는
+    display_adds_unsafe_crime_attribution 이 갖는다.
+    """
+    from news.candidates import display_adds_unsafe_crime_attribution
+
+    if display_adds_unsafe_crime_attribution(display, canonical, group_articles):
+        return canonical[:DISPLAY_KEYWORD_MAX_LEN]
+    return display
+
+
+def _display_or_canonical(
+    display: str, canonical: str, group_articles: Optional[List[Dict]] = None
+) -> str:
     """최종 display 후보가 generic-only(신임/임명 등)거나 검색의도 suffix(뜻/의미 등)로
     끝나면 canonical로 대체한다. canonical 자체가 같은 문제를 가진 극단 케이스에는
     그대로 canonical을 쓴다(그 이상 나은 선택지가 없음). DISPLAY_KEYWORD_MAX_LEN 상한 적용.
+
+    group_articles가 주어지면 범죄 주체 오귀속 조합도 같은 방식으로 canonical 로 되돌린다
+    (_crime_safe_display).
     """
     if _is_generic_only_display(display) or _ends_with_search_intent_suffix(display):
         return canonical[:DISPLAY_KEYWORD_MAX_LEN]
+    if group_articles is not None:
+        display = _crime_safe_display(display, canonical, group_articles)
     return display[:DISPLAY_KEYWORD_MAX_LEN]
 
 
