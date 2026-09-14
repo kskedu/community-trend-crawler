@@ -291,27 +291,110 @@ class TestDryrunUsesSelectionSingleSource(unittest.TestCase):
         self.assertEqual([k["keyword"] for k in dry["keywords"]], [sentinel_kw])
 
 
-class TestDryrunShippedFixtures(unittest.TestCase):
-    """저장소에 들어 있는 fixture 로도 dry-run == production."""
+# 저장소 fixture 가 보장해야 하는 구성 — 한쪽만 있으면 dry-run 으로 "무엇이 선정되고
+# 무엇이 왜 제외됐는지"를 함께 볼 수 없다. 개수(>=1)가 아니라 **어떤 keyword 인지**를
+# 고정한다(개수만 보면 fixture 가 엉뚱하게 바뀌어도 통과한다).
+FIXTURE_SELECTED = ["강변터널 화재", "시내버스 노선 개편"]
+FIXTURE_GATE_DROPPED = {           # quality gate 에서 탈락(= 사유 문자열까지 고정)
+    "노트북 추천": "low_quality_news",
+    "에어컨 세일": "low_quality_news",
+}
+FIXTURE_NO_SIGNAL = ["신작 게임 출시"]   # 기사 0건 → news 신호 자체가 없다
+FIXTURE_NO_REP_DROPPED = ["환율 급등", "월드컵 예선"]   # gate 는 통과, 대표 사건 없음
 
-    def test_shipped_fixture_ranking_matches_production(self):
-        """운영 진실원이 전부 탈락시키는 후보를 dry-run 도 내보내지 않는다.
 
-        수정 전에는 여기서 dry-run 이 `환율 급등`/`월드컵 예선`(둘 다 summary 가 빈
-        no_representative)을 Top 으로 내보냈다 — 저장소 fixture 만으로 재현되던 drift다.
-        """
+def _normalized(issues):
+    """두 번 실행해도 같아야 하는 부분만 남긴다(실행 시각 파생 필드 제거)."""
+    out = copy.deepcopy(issues)
+    out.pop("generated_at", None)
+    for k in out.get("keywords", []):
+        for a in (k.get("articles") or []) + (k.get("display_articles") or []):
+            a.pop("published_at", None)
+        if k.get("representative_article"):
+            k["representative_article"].pop("published_at", None)
+    return out
+
+
+class TestShippedFixtureCoverage(unittest.TestCase):
+    """저장소 fixture 가 selected 와 단계별 제외를 **둘 다** 보여준다.
+
+    2026-09-14 이전에는 fixture 후보가 production 기준 전부 탈락해 dry-run 결과가
+    0건이었다. 로직 문제가 아니라 fixture 품질 문제였고, 빈 결과는 "도구가 고장났다"로
+    오해돼 게이트를 임의로 줄이는 drift 를 유발하기 쉽다.
+    """
+
+    def test_selected_keywords_and_order_are_pinned(self):
+        dry = dryrun.run_ranking(verbose=False)
+        self.assertEqual([k["keyword"] for k in dry["keywords"]], FIXTURE_SELECTED)
+        self.assertEqual([k["rank"] for k in dry["keywords"]],
+                         list(range(1, len(FIXTURE_SELECTED) + 1)))
+
+    def test_selected_entries_satisfy_display_contract(self):
+        """선정된 항목은 대표 사건과 표시 기사 하한을 실제로 만족한다."""
+        for k in dryrun.run_ranking(verbose=False)["keywords"]:
+            with self.subTest(keyword=k["keyword"]):
+                self.assertNotEqual(k["summary_type"], "no_representative")
+                self.assertTrue(k["summary"])
+                self.assertTrue(k["representative_title"])
+                self.assertGreaterEqual(len(k["display_articles"]),
+                                        ranker.DISPLAY_ARTICLES_MIN)
+                self.assertTrue(k["signals"]["news"])
+
+    def test_payload_matches_production_on_shipped_fixture(self):
+        """selected / 순서 / score / representative / display articles 전부 동일."""
         inputs = dryrun.ranking_inputs()
         stages = ranker.run_selection_stages(
             copy.deepcopy(inputs["candidates"]), copy.deepcopy(inputs["signals"]))
-        dropped = stages["no_rep_excluded"]
-        self.assertTrue(stages["gate_passed"],
-                        "fixture 전제: quality gate 를 통과하는 후보가 있어야 한다")
-        self.assertTrue(dropped,
-                        "fixture 전제: no_representative 로 탈락하는 후보가 있어야 한다")
-        dry_kws = [k["keyword"] for k in dryrun.run_ranking(verbose=False)["keywords"]]
-        self.assertEqual(dry_kws, [t["keyword"] for t in stages["top"]])
-        for kw in dropped:
-            self.assertNotIn(kw, dry_kws)
+        cmap = {c["keyword"]: c for c in inputs["candidates"]}
+        prod = build_ranked_issues(
+            stages["top"], cmap,
+            dryrun._data_sources(inputs["candidates"], inputs["datalab_signals"]))
+        self.assertEqual([t["keyword"] for t in stages["top"]], FIXTURE_SELECTED)
+        self.assertEqual(_normalized(dryrun.run_ranking(verbose=False)), _normalized(prod))
+
+    def test_intended_drops_keep_their_stage_and_reason(self):
+        """의도된 탈락 사례가 **원래 단계·원래 사유** 그대로 남아 있다."""
+        inputs = dryrun.ranking_inputs()
+        news = inputs["signals"]["news"]
+        stages = ranker.run_selection_stages(
+            copy.deepcopy(inputs["candidates"]), copy.deepcopy(inputs["signals"]))
+        candidate_kws = {c["keyword"] for c in inputs["candidates"]}
+
+        for kw, reason in FIXTURE_GATE_DROPPED.items():
+            with self.subTest(keyword=kw):
+                self.assertIn(kw, candidate_kws)
+                self.assertEqual(ranker._quality_gate_reason(kw, news[kw]), reason)
+                self.assertNotIn(kw, stages["gate_passed"])
+
+        for kw in FIXTURE_NO_SIGNAL:
+            with self.subTest(keyword=kw):
+                self.assertIn(kw, candidate_kws)
+                self.assertNotIn(kw, news, "기사 0건이면 news 신호 자체가 없어야 한다")
+                self.assertNotIn(kw, stages["gate_passed"])
+
+        for kw in FIXTURE_NO_REP_DROPPED:
+            with self.subTest(keyword=kw):
+                self.assertIn(kw, stages["gate_passed"],
+                              "quality gate 는 통과해야 no_representative 단계에 닿는다")
+                self.assertIn(kw, stages["no_rep_excluded"])
+
+    def test_fixture_shows_both_sides(self):
+        """선정과 제외가 동시에 관측된다 — 한쪽만 있으면 dry-run 의 의미가 반감된다."""
+        inputs = dryrun.ranking_inputs()
+        stages = ranker.run_selection_stages(
+            copy.deepcopy(inputs["candidates"]), copy.deepcopy(inputs["signals"]))
+        self.assertTrue(stages["top"], "정상 selected 사례가 있어야 한다")
+        self.assertTrue(stages["no_rep_excluded"], "정상 탈락 사례가 있어야 한다")
+        self.assertLess(len(stages["gate_passed"]), len(inputs["candidates"]),
+                        "quality gate 탈락 사례도 있어야 한다")
+
+    def test_ranked_order_differs_from_seed_order(self):
+        """뉴스 근거 기반 순위가 포털 노출 순서를 그대로 따르지 않는다(이 도구의 원래 합격 기준)."""
+        inputs = dryrun.ranking_inputs()
+        seed_order = [i["keyword"] for i in inputs["daum_ranked"]]
+        ranked_order = [k["keyword"] for k in dryrun.run_ranking(verbose=False)["keywords"]]
+        self.assertTrue(ranked_order)
+        self.assertNotEqual(seed_order[:len(ranked_order)], ranked_order)
 
     def test_ranking_inputs_contains_no_selection_gate(self):
         """입력 adapter 는 후보/신호만 만든다 — 선정 결과를 담지 않는다."""

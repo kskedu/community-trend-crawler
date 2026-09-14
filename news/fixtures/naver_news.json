@@ -1,5 +1,62 @@
 {
-  "_comment": "키워드별 네이버 뉴스 검색 mock 응답. dry-run/test 전용. items[].title/originallink/link/description/pubDate. XSS/악성 URL/빈 케이스 포함. pubDate는 dry-run에서 '최근'으로 재주입될 수 있음(_inject_recent).",
+  "_comment": "키워드별 네이버 뉴스 검색 mock 응답. dry-run/test 전용. items[].title/originallink/link/description/pubDate. 구성 의도: (1) production gate 를 전부 통과해 selected 되는 정상 사건 2건, (2) 각 gate 에서 의도적으로 탈락하는 사례(no_representative / low_quality_news / no_news_evidence)와 XSS·악성 URL 드롭 케이스. 한쪽만 있으면 dry-run 으로 '무엇이 선정되고 무엇이 왜 제외됐는지'를 함께 볼 수 없다. pubDate는 dry-run에서 '최근'으로 재주입될 수 있음(_inject_recent).",
+  "강변터널 화재": {
+    "items": [
+      {
+        "title": "강변터널 화재 진화 완료…통행 재개",
+        "originallink": "https://www.yna.co.kr/view/AKR20260914fire1",
+        "link": "https://n.news.naver.com/mnews/article/001/0014000001",
+        "description": "소방당국이 강변터널 화재를 진화했다고 밝혔다. 통행은 3시간 만에 재개됐다.",
+        "pubDate": "Mon, 14 Sep 2026 09:10:00 +0900"
+      },
+      {
+        "title": "소방당국 강변터널 화재 진화…인명피해 없어",
+        "originallink": "https://www.hani.co.kr/arti/area/20260914fire",
+        "link": "https://n.news.naver.com/mnews/article/028/0002700001",
+        "description": "강변터널 화재 진화 작업이 마무리됐다. 소방당국은 인명피해가 없다고 설명했다.",
+        "pubDate": "Mon, 14 Sep 2026 09:05:00 +0900"
+      },
+      {
+        "title": "강변터널 화재로 통행 전면 통제…진화 작업 계속",
+        "originallink": "https://www.khan.co.kr/article/20260914fire",
+        "link": "https://n.news.naver.com/mnews/article/032/0003200001",
+        "description": "강변터널 화재로 양방향 통행이 통제됐다. 소방당국이 진화 작업을 벌였다.",
+        "pubDate": "Mon, 14 Sep 2026 08:40:00 +0900"
+      },
+      {
+        "title": "강변터널 화재 원인 조사 착수…통행 재개",
+        "originallink": "https://www.seoul.co.kr/news/20260914fire",
+        "link": "https://n.news.naver.com/mnews/article/081/0008100001",
+        "description": "소방당국은 강변터널 화재 진화 뒤 원인 조사에 착수했다. 통행은 재개됐다.",
+        "pubDate": "Mon, 14 Sep 2026 08:20:00 +0900"
+      }
+    ]
+  },
+  "시내버스 노선 개편": {
+    "items": [
+      {
+        "title": "시내버스 노선 개편 확정…내달 시행",
+        "originallink": "https://www.yna.co.kr/view/AKR20260914bus1",
+        "link": "https://n.news.naver.com/mnews/article/001/0014000002",
+        "description": "시내버스 노선 개편이 확정됐다. 내달부터 시행되며 배차 간격이 조정된다.",
+        "pubDate": "Mon, 14 Sep 2026 08:00:00 +0900"
+      },
+      {
+        "title": "시내버스 노선 개편 내달 시행…배차 간격 단축",
+        "originallink": "https://www.mk.co.kr/news/economy/20260914bus",
+        "link": "https://n.news.naver.com/mnews/article/009/0000900002",
+        "description": "시내버스 노선 개편으로 내달부터 배차 간격이 단축된다. 시행 노선은 12개다.",
+        "pubDate": "Mon, 14 Sep 2026 07:40:00 +0900"
+      },
+      {
+        "title": "시내버스 노선 개편 공청회…내달 시행 앞두고 의견 수렴",
+        "originallink": "https://www.hankookilbo.com/News/Read/20260914bus",
+        "link": "https://n.news.naver.com/mnews/article/469/0000469002",
+        "description": "시내버스 노선 개편 시행을 앞두고 공청회가 열렸다. 내달 시행 전 배차 조정 의견이 나왔다.",
+        "pubDate": "Mon, 14 Sep 2026 07:20:00 +0900"
+      }
+    ]
+  },
   "월드컵 예선": {
     "items": [
       {

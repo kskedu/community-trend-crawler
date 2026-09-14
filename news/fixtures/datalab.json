@@ -1,5 +1,7 @@
 {
   "_comment": "DataLab recent_delta mock (dry-run/test 전용). 키워드별 최근 상승률. 실제 API 미호출.",
+  "강변터널 화재": { "recent_delta": 0.72 },
+  "시내버스 노선 개편": { "recent_delta": 0.21 },
   "환율 급등": { "recent_delta": 0.85 },
   "월드컵 예선": { "recent_delta": 0.30 },
   "노트북 추천": { "recent_delta": 0.05 }
