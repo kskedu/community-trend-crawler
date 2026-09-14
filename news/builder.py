@@ -137,6 +137,12 @@ def build_ranked_entry(
             "nate": sources.get("nate_home") is not None,
             "bing": sources.get("bing_home") is not None,
             "search_demand": breakdown.get("search_demand", 0) > 0,
+            # 기존 boolean 키(news/trend/daum/google/nate/bing/search_demand)는 의미·형태
+            # 그대로 유지한다. 아래는 **중첩 키 추가**일 뿐이라 기존 consumer 는 영향이
+            # 없다(전수 확인: 모두 특정 키로만 접근, 키 집합을 단정하는 소비자 없음).
+            # 값이 없으면 키 자체를 넣지 않는다(과거 행과 동일한 모양 유지).
+            **({"score_breakdown_v1": ranked_item["score_trace"]}
+               if ranked_item.get("score_trace") else {}),
         },
         "trend": None,  # 기존 호환 (datalab 점수화 객체는 후속)
         "articles": articles,
@@ -153,6 +159,10 @@ def build_ranked_entry(
         "representative_title": representative_title,
         "representative_summary": representative_summary,
         "representative_article": None if no_representative else news_meta.get("representative_article"),
+        # ranking evidence 수(정제 후 news_meta.articles). 진단이 selected 행에도
+        # "랭킹이 실제로 쓴 근거 수"를 남길 수 있게 **개수만** 실어 보낸다 — news_meta
+        # 자체(기사 제목/URL 전문)를 발행 payload 에 넣지 않기 위한 선택이다.
+        "evidence_article_count": len(raw_articles),
         "primary_cluster_size": news_meta.get("primary_cluster_size"),
         "topic_coherence": news_meta.get("topic_coherence"),
     }

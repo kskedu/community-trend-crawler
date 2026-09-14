@@ -73,6 +73,9 @@ COMPACT_FIELDS = (
     "pre_cut_rank", "independent_family_count", "unique_url_count",
     "unique_domain_count", "merge_mode", "shared_evidence_count",
     "residual_support_winner", "residual_support_self",
+    # 2026-09: ranking evidence 수. 컬럼은 배포 스키마에 이미 존재하지만(NULL 로 방치),
+    # 읽기 RPC projection 에는 없다 — SQL APPLY 전에는 보내지 않는다(기존 안전 계약 동일).
+    "evidence_article_count",
 )
 
 
@@ -172,6 +175,11 @@ def evidence_summary(item):
             domains.add(host.lower())
     return {
         "article_count": len(articles),
+        # ranking evidence 수(정제 후 news_meta.articles). article_count 와 같은 값이지만
+        # **의미가 고정된 별도 컬럼**이다 — article_count 는 selected 행에서
+        # finalize_selected 가 builder articles 로 덮어써 의미가 갈리는 반면,
+        # evidence_article_count 는 selected/비선정 양쪽 모두 ranking evidence 를 뜻한다.
+        "evidence_article_count": len(articles),
         "unique_url_count": len(urls),
         "unique_domain_count": len(domains),
         "independent_family_count": _independent_family_count(item),
@@ -308,7 +316,15 @@ class PassSnapshot:
             row["representative_url"] = rep.get("url") if isinstance(rep, dict) else None
             row["signals"] = entry.get("signals")
             row["rank_delta"] = entry.get("rank_delta")
+            # article_count 는 기존 의미(builder articles)를 **그대로 유지**한다 —
+            # 과거 행과의 호환을 위해 조용히 바꾸지 않는다(사용자 확정).
             row["article_count"] = len(entry.get("articles") or [])
+            # ranking evidence 수는 별도 컬럼에 남긴다. record() 시점에 이미 채워져 있으면
+            # (비선정 경로) 그대로 두고, selected 경로는 여기서 처음 채운다.
+            if row.get("evidence_article_count") is None:
+                ev = entry.get("evidence_article_count")
+                if isinstance(ev, int):
+                    row["evidence_article_count"] = ev
             display = entry.get("display_articles") or []
             row["display_article_count"] = len(display)
             row["articles"] = [_safe_article(a) for a in display]

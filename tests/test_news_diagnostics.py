@@ -1109,6 +1109,198 @@ class FreshnessGuardBriefingTest(unittest.TestCase):
         # (29) B(previous)는 upsert 가 호출되지 않았으므로 그대로 유지됨(덮이지 않음).
 
 
+class TestScoreBreakdownObservability(unittest.TestCase):
+    """score_breakdown_v1 / evidence_article_count 관측 계약(2026-09).
+
+    배경: 과거 run 만으로 "왜 이 점수·순위였나"를 되짚을 수 없었다. source_breakdown 은
+    어디에도 저장되지 않았고, article_count 는 result_status 에 따라 의미가 갈렸다
+    (selected=builder articles, 비선정=ranking evidence). 운영 14일 실측에서 selected 행의
+    92.2% 가 article_count == display_article_count 라 사실상 display 수 중복이었다.
+
+    이 파일은 **관측 계약만** 고정한다 — 랭킹 판정은 이 값을 읽지 않는다(쓰기 전용).
+    """
+
+    def _ranked(self, keyword="테스트", score=0.5, n_articles=6):
+        from news import ranker
+        arts = [
+            {"title": f"{keyword} 기사 {i}", "url": f"https://d{i}.example.com/a",
+             "relevance_score": 0.9, "is_primary_cluster": True}
+            for i in range(n_articles)
+        ]
+        breakdown = {"news": 0.8, "search_demand": 0.5,
+                     "source_consensus": 0.5, "freshness": 0.25}
+        renorm = dict(ranker.WEIGHTS)
+        atom = {"recent_count": n_articles, "domain_diversity": n_articles,
+                "title_relevance": 0.9}
+        news = {"latest_age_hours": 3.0}
+        trace = ranker._score_trace(keyword, breakdown, renorm, atom, news, 0.0, score)
+        return {
+            "keyword": keyword, "score": score, "source_breakdown": breakdown,
+            "rank_reason": "", "news_meta": {"articles": arts},
+            "used_signals": list(renorm), "sources": {"daum_home": 1},
+            "score_trace": trace,
+        }
+
+    # ---- backward compatibility ----------------------------------------
+
+    def test_existing_signals_boolean_keys_unchanged(self):
+        """기존 boolean 키는 이름·개수·값이 그대로여야 한다(중첩 키 추가만 허용)."""
+        from news.builder import build_ranked_entry
+        entry = build_ranked_entry(1, self._ranked())
+        sig = entry["signals"]
+        for k in ("news", "trend", "daum", "google", "nate", "bing", "search_demand"):
+            self.assertIn(k, sig, f"기존 boolean 키 {k} 가 사라졌다")
+            self.assertIsInstance(sig[k], bool, f"{k} 가 boolean 이 아니다")
+        self.assertTrue(sig["news"])
+        self.assertTrue(sig["daum"])
+
+    def test_score_breakdown_is_nested_not_flattened(self):
+        """새 숫자는 signals 최상위를 오염시키지 않고 중첩 키 아래에만 들어간다."""
+        from news.builder import build_ranked_entry
+        sig = build_ranked_entry(1, self._ranked())["signals"]
+        self.assertIn("score_breakdown_v1", sig)
+        # 축 이름이 최상위로 새어 기존 boolean 과 충돌하면 안 된다.
+        self.assertIsInstance(sig["news"], bool)
+        for leaked in ("ax", "penalty", "raw", "age_h", "score"):
+            self.assertNotIn(leaked, sig, f"{leaked} 가 signals 최상위로 샜다")
+
+    def test_absent_trace_leaves_signals_shape_identical(self):
+        """score_trace 가 없으면 키 자체를 넣지 않는다(과거 행과 동일한 모양)."""
+        from news.builder import build_ranked_entry
+        item = self._ranked()
+        item.pop("score_trace")
+        sig = build_ranked_entry(1, item)["signals"]
+        self.assertNotIn("score_breakdown_v1", sig)
+        self.assertEqual(
+            sorted(sig), ["bing", "daum", "google", "nate", "news", "search_demand", "trend"]
+        )
+
+    # ---- score 검산 ------------------------------------------------------
+
+    def test_contributions_plus_penalty_reconstruct_final_score(self):
+        """저장된 contribution 합 - penalty = 최종 score (검산 가능해야 한다)."""
+        from news import ranker
+        breakdown = {"news": 0.8, "search_demand": 0.5,
+                     "source_consensus": 0.5, "freshness": 0.25}
+        renorm = dict(ranker.WEIGHTS)
+        raw = sum(renorm[a] * breakdown[a] for a in breakdown)
+        penalty = ranker.LOW_RELEVANCE_PENALTY
+        final = max(0.0, raw - penalty)
+        tr = ranker._score_trace("k", breakdown, renorm, None, None, penalty, final)
+        recon = sum(n * w for n, w in tr["ax"].values()) - tr["penalty"]
+        self.assertAlmostEqual(recon, tr["score"], places=4)
+
+    def test_penalty_is_recorded_so_score_is_not_unexplained(self):
+        """penalty 는 breakdown 바깥에서 차감되므로 반드시 별도로 남겨야 한다.
+
+        이 값이 없으면 sum(contrib) != score 가 되어 "왜 이 점수인지"가 설명되지 않는다.
+        """
+        from news import ranker
+        breakdown = {"news": 1.0}
+        renorm = {"news": 1.0}
+        tr = ranker._score_trace("k", breakdown, renorm, None, None, 0.15, 0.85)
+        self.assertEqual(tr["penalty"], 0.15)
+        recon = sum(n * w for n, w in tr["ax"].values()) - tr["penalty"]
+        self.assertAlmostEqual(recon, tr["score"], places=4)
+
+    def test_trace_records_weight_so_old_runs_need_no_recompute(self):
+        """당시 weight 를 함께 저장한다 — 나중에 WEIGHTS 가 바뀌어도 과거 의미가 유지된다."""
+        from news import ranker
+        renorm = {"news": 0.45, "search_demand": 0.30}
+        tr = ranker._score_trace("k", {"news": 1.0, "search_demand": 0.0},
+                                 renorm, None, None, 0.0, 0.45)
+        self.assertEqual(tr["ax"]["n"][1], 0.45, "그때의 weight 가 저장돼야 한다")
+        self.assertEqual(tr["v"], ranker.SCORE_TRACE_VERSION)
+        self.assertEqual(ranker.AXIS_KEYS["n"], "news", "축약 키 해석표가 권위여야 한다")
+
+    def test_trace_keeps_raw_news_signals(self):
+        """정규화 cohort 를 몰라도 "근거가 몇 건이었나"는 알 수 있어야 한다."""
+        from news import ranker
+        atom = {"recent_count": 7, "domain_diversity": 5, "title_relevance": 0.88}
+        tr = ranker._score_trace("k", {"news": 1.0}, {"news": 1.0}, atom,
+                                 {"latest_age_hours": 2.5}, 0.0, 0.45)
+        self.assertEqual(tr["raw"][0], 7, "recent_count")
+        self.assertEqual(tr["raw"][1], 5, "domain_diversity")
+        self.assertEqual(tr["age_h"], 2.5)
+
+    def test_trace_stores_no_article_text_or_urls(self):
+        """기사 제목/URL/본문을 저장하지 않는다(정수·실수만)."""
+        import json as _json
+        from news import ranker
+        atom = {"recent_count": 6, "domain_diversity": 6, "title_relevance": 0.9}
+        tr = ranker._score_trace("키워드", {"news": 1.0}, {"news": 1.0}, atom,
+                                 {"latest_age_hours": 1.0}, 0.0, 0.45)
+        blob = _json.dumps(tr, ensure_ascii=False)
+        self.assertNotIn("http", blob)
+        self.assertNotIn("기사", blob)
+
+    # ---- evidence_article_count -----------------------------------------
+
+    def test_real_compute_scores_reconcile_exactly(self):
+        """실제 compute_scores 결과에서도 검산이 성립해야 한다(합성 fixture 가 아니라).
+
+        단위 helper 만 검증하면 "ranker 가 실제로 넣는 값"이 어긋나도 통과한다.
+        """
+        from news import ranker
+
+        def arts(kw, n, sh=0):
+            return [{"title": f"{kw} 관련 상세 보도 기사 {i}",
+                     "url": f"https://d{i+sh}.example.com/a{i}", "press": f"p{i}",
+                     "relevance_score": 0.9, "is_primary_cluster": True,
+                     "snippet": f"{kw} 에 대한 보도 내용 {i}",
+                     "published_at": "2026-09-14T00:00:00+00:00"} for i in range(n)]
+
+        cands, sig = [], {}
+        for i, (kw, n) in enumerate([("알파 사건", 8), ("베타 발표", 6), ("감마 회담", 5)]):
+            cands.append({"keyword": kw, "sources": {"daum_home": i + 1, "bing_home": i + 2}})
+            sig[kw] = {"recent_count": n, "domain_diversity": n, "title_relevance": 0.9,
+                       "latest_age_hours": 2.0 + i, "articles": arts(kw, n, i * 10),
+                       "high_relevance_count": n, "quality_cluster_size": n,
+                       "fresh_high_relevance_count": n, "fresh_quality_cluster_size": n,
+                       "latest_relevant_age_hours": 2.0 + i, "has_dominant_event": True,
+                       "same_event_burst": True, "keyword_kind": "event",
+                       "issue_article_count": n}
+        ranked = ranker.compute_scores(cands, {"news": sig})
+        self.assertTrue(ranked, "fixture 가 게이트를 통과해야 의미 있는 검증이다")
+        for r in ranked:
+            tr = r["score_trace"]
+            recon = max(0.0, sum(n * w for n, w in tr["ax"].values()) - tr["penalty"])
+            self.assertAlmostEqual(recon, r["score"], places=4,
+                                   msg=f"{r['keyword']} 검산 불일치")
+
+    def test_evidence_article_count_is_ranking_evidence_not_display(self):
+        """selected 행의 evidence_article_count 는 display 수가 아니라 ranking evidence.
+
+        두 값이 **실제로 갈리는** fixture 로 고정해야 한다(운영 실측: selected 의 7.8%
+        에서 display < evidence). 개수가 같은 fixture 로는 "display 수를 넣는" 변이를
+        구분할 수 없다.
+        """
+        from news.builder import build_ranked_entry
+        item = self._ranked(n_articles=6)
+        # 6건 중 3건을 display 에서 떨어뜨린다: primary 도 아니고 display_keyword 와
+        # 공통 토큰도 없어 _display_anchor_allowed 를 통과하지 못하는 기사.
+        arts = item["news_meta"]["articles"]
+        for a in arts[3:]:
+            a["is_primary_cluster"] = False
+            a["title"] = "전혀 무관한 다른 사건 보도"
+        item["display_keyword"] = "테스트"
+        entry = build_ranked_entry(1, item)
+        self.assertEqual(entry["evidence_article_count"], 6, "ranking evidence 는 6건")
+        self.assertLess(len(entry["display_articles"]), 6, "display 는 줄어야 한다")
+        self.assertNotEqual(
+            entry["evidence_article_count"], len(entry["display_articles"]),
+            "두 값이 갈리는 fixture 여야 변이를 잡는다",
+        )
+
+    def test_article_count_meaning_is_not_silently_changed(self):
+        """기존 article_count(= builder articles) 의미는 그대로 둔다(호환)."""
+        from news.builder import build_ranked_entry
+        entry = build_ranked_entry(1, self._ranked(n_articles=6))
+        # 기존 계약: 진단의 article_count 는 entry["articles"] 길이
+        self.assertEqual(len(entry["articles"]), 6)
+        self.assertIn("articles", entry)
+
+
 if __name__ == "__main__":
     unittest.main()
 
