@@ -1445,15 +1445,18 @@ def _display_anchor_allowed(effective_keyword: str, article: Dict, representativ
     return False
 
 
-def canonical_evidence(news_meta: Dict, keyword: str, max_articles: Optional[int] = None) -> tuple:
-    """canonical evidence set 단일 진실원(F, 2026-07). builder·B2·display-min gate가 모두
-    이 helper를 호출해 "동일한 정제 후 기사 집합 + summary_type"을 얻는다.
+def displayed_articles(articles: Optional[List[Dict]], max_articles: Optional[int] = None) -> List[Dict]:
+    """랭킹 근거 기사 → **실제 화면에 노출되는 기사 집합**(dedup → filter → [:max]).
 
-    반환: (articles, summary, summary_type).
-    - articles = dedup_articles(news_meta.articles) → filter_articles_for_display(min=ARTICLES_MIN)
-      → [:max_articles]. (builder.build_ranked_entry:92-93와 동일 파이프)
-    - summarize(**canonical keyword**, articles) — display_keyword가 아니라 keyword.
-      builder(builder.py:94)가 keyword로 summarize하므로, drift 방지를 위해 여기서도 keyword.
+    저장소 전체에서 이 파생을 수행하는 유일한 지점이다. builder(노출 payload 생성),
+    canonical_evidence(요약/게이트), ranker(display invariant·grounding·관찰 진단)가
+    모두 이 함수를 호출한다.
+
+    단일 진실원인 이유(2026-09 구조 감사): 같은 3단계가 코드 6곳에 각자 인라인으로
+    적혀 있었고, "builder와 동일 집합이어야 한다"는 리뷰 지적이 지점마다 반복해서
+    나왔다(ranker의 §0-4 보강·broad category 관찰·homonym 관찰 각각 Codex diff P1/P2).
+    한 곳이라도 빠뜨리면 "표시 기사"의 의미가 조용히 갈라지므로 파생 자체를 한 곳으로
+    모은다 — 단계·인자·순서는 종전과 글자 그대로 동일하다(동작 변경 없음).
 
     ARTICLES_MIN/ARTICLES_MAX는 builder에서 import(순환 회피 위해 함수 내부 지역 import).
     """
@@ -1461,8 +1464,21 @@ def canonical_evidence(news_meta: Dict, keyword: str, max_articles: Optional[int
     from news.builder import ARTICLES_MIN, ARTICLES_MAX
     if max_articles is None:
         max_articles = ARTICLES_MAX
-    deduped = dedup_articles(news_meta.get("articles") or [])
-    articles = filter_articles_for_display(deduped, min_count=ARTICLES_MIN)[:max_articles]
+    deduped = dedup_articles(articles or [])
+    return filter_articles_for_display(deduped, min_count=ARTICLES_MIN)[:max_articles]
+
+
+def canonical_evidence(news_meta: Dict, keyword: str, max_articles: Optional[int] = None) -> tuple:
+    """canonical evidence set 단일 진실원(F, 2026-07). builder·B2·display-min gate가 모두
+    이 helper를 호출해 "동일한 정제 후 기사 집합 + summary_type"을 얻는다.
+
+    반환: (articles, summary, summary_type).
+    - articles = displayed_articles(news_meta.articles, max_articles) — 표시 기사 파생
+      단일 진실원(builder.build_ranked_entry와 같은 함수).
+    - summarize(**canonical keyword**, articles) — display_keyword가 아니라 keyword.
+      builder(builder.py:94)가 keyword로 summarize하므로, drift 방지를 위해 여기서도 keyword.
+    """
+    articles = displayed_articles(news_meta.get("articles"), max_articles)
     summary, summary_type = summarize(keyword, articles)
     return articles, summary, summary_type
 
