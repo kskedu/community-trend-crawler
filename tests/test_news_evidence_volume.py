@@ -332,6 +332,29 @@ class TestSamePressPhotoBatchDoesNotInflateEvidence(unittest.TestCase):
         # 10시간(600분)이 아니라 5분 쪽이 반영돼야 한다.
         self.assertLess(sig["latest_age_hours"], 1.0)
 
+    def test_recurring_same_title_column_is_folded_known_limitation(self):
+        """알려진 한계: 같은 매체가 **같은 제목으로 매일 내는 정기 코너**도 접힌다.
+
+        운영 14일 표본에서 fold 대상 그룹 381건 중 발행 간격이 6시간을 넘는 것은 6건
+        (고유 제목 2종)뿐이었다:
+          - '금시세(금값) 혼조'(kjdaily, 23시간 간격 — 매일 시세 코너)
+          - '독감 환자, 지난해의 4배…유행주의보 발령'(KBS, 2.5시간 간격 — 재발행)
+        둘 다 접힌 뒤에도 독립 근거가 4~6건 남아 rank 영향이 1계단 이내였다.
+
+        시간 창 조건을 추가하면 이 1.6% 를 살릴 수 있지만, 임계값을 새로 도입해야 하고
+        89.5% 를 차지하는 10분 이내 batch 의 판정은 그대로다. 현재는 접는 쪽을
+        유지하고 이 테스트로 **동작을 명시적으로 고정**한다 — 나중에 시간 창을 넣기로
+        하면 이 테스트가 먼저 실패해서 계약 변경임을 알려 준다.
+        """
+        arts = [
+            _raw_at("금시세(금값) 혼조", "www.kjdaily.com", 60, "G1", "금시세가 혼조세를 보였다"),
+            _raw_at("금시세(금값) 혼조", "www.kjdaily.com", 60 + 23 * 60, "G2", "금시세가 혼조세를 보였다"),
+            _raw_at("금값 1돈 소매가 상승", "www.example.com", 50, "G3", "금값 1돈 소매가가 올랐다"),
+        ]
+        sig = cand.compute_news_signal("금값 1 돈 가격", arts)
+        # 23시간 떨어진 정기 코너 2건이 1건으로 접힌다(현재 계약).
+        self.assertEqual(sig["recent_count"], 2)
+
     def test_folded_batch_never_exceeds_article_list(self):
         """불변식 유지: 접은 뒤에도 recent_count/domain_diversity <= articles 길이."""
         arts = [
