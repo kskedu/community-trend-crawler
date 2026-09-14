@@ -17,7 +17,11 @@ DO $apply$
 DECLARE
   v_def    text;
   v_new    text;
-  v_anchor text := 'd.article_count';
+  -- ⚠️ 앵커는 live 정의 실측으로 확정했다(2026-09-14 PRECHECK).
+  --    read RPC 의 projection 은 CTE alias 가 `n.` 이다(`d.` 아님) — 초안이 'd.article_count'
+  --    를 찾다가 0곳으로 중단됐다. key 이름까지 포함한 **완전한 key-value 쌍**을 앵커로
+  --    써서 부분 일치("display_article_count" 안의 "article_count")를 배제한다.
+  v_anchor text := '''article_count'', n.article_count';
   v_hits   int;
 BEGIN
   SELECT pg_get_functiondef(p.oid) INTO v_def
@@ -43,12 +47,13 @@ BEGIN
   END IF;
 
   -- projection 에 두 필드만 덧붙인다. 기존 키는 그대로 둔다.
+  -- alias 는 live 정의와 동일하게 n. 을 쓴다.
   v_new := replace(
     v_def,
     v_anchor,
     v_anchor || ','
-      || E'\n        ''evidence_article_count'', d.evidence_article_count,'
-      || E'\n        ''signals'', d.signals'
+      || E'\n          ''evidence_article_count'', n.evidence_article_count,'
+      || E'\n          ''signals'', n.signals'
   );
 
   IF v_new = v_def THEN

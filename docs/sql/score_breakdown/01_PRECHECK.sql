@@ -7,8 +7,8 @@
 --       를 실측한다.
 --
 -- ⚠️ Supabase SQL Editor 는 **마지막 결과셋만** 표시하므로 UNION ALL 로 합친다.
--- ⚠️ 02_APPLY 는 12번 정의 안에서 read RPC 의 SELECT 목록에
---    'd.article_count' 가 **정확히 1곳** 존재함을 전제로 한다.
+-- ⚠️ 02_APPLY 는 12번 정의 안에서 read RPC 의 projection 에
+--    `'article_count', n.article_count` 가 **정확히 1곳** 존재함을 전제로 한다(8번).
 --
 -- ⚠️ 배포된 RPC 는 저장소의 baseline SQL 보다 최신이다(실측: baseline recordset 에
 --    없는 pre_cut_rank/merge_mode/shared_evidence_count 등이 live 에 저장돼 있다).
@@ -58,8 +58,11 @@ readfn AS (
   WHERE n.nspname = 'public' AND p.proname = 'news_diag_list_decisions'
 ),
 anchor AS (
-  SELECT (length(v) - length(replace(v, 'd.article_count', ''))) / length('d.article_count')
-         AS v FROM readfn
+  -- 앵커는 02_APPLY 와 **글자 그대로 동일**해야 한다. read RPC projection 의 alias 는
+  -- `n.` 이고(초안의 `d.` 는 0곳이었다), key 이름까지 포함한 완전한 key-value 쌍을 써서
+  -- 'display_article_count' 안의 부분 일치를 배제한다.
+  SELECT (length(v) - length(replace(v, '''article_count'', n.article_count', '')))
+         / length('''article_count'', n.article_count') AS v FROM readfn
 ),
 perms AS (
   SELECT string_agg(grantee || ':' || privilege_type, ', ' ORDER BY grantee) AS v
