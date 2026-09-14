@@ -387,16 +387,23 @@ def compute_scores(candidates: List[Dict], signals: Dict[str, Dict]) -> List[Dic
         # penalty (별도 차감)
         a = news_atoms.get(k)
         title_rel = a["title_relevance"] if a else 0.0
+        penalty = 0.0
         if "news" in available and title_rel < LOW_RELEVANCE_THRESHOLD:
-            score -= LOW_RELEVANCE_PENALTY
+            penalty += LOW_RELEVANCE_PENALTY
         if _is_noise(k):
-            score -= NOISE_PENALTY
-        score = max(0.0, score)
+            penalty += NOISE_PENALTY
+        score = max(0.0, score - penalty)
 
+        # 관측 전용(2026-09): 과거 run 의 "왜 이 점수였나"를 나중에 재계산 없이 되짚기
+        # 위한 compact 근거. penalty 와 clamp 가 breakdown 바깥에서 적용되므로, 축
+        # contribution 만으로는 최종 score 가 복원되지 않는다 — penalty 를 함께 남긴다.
+        # 이 dict 는 랭킹 판정에 **읽히지 않는다**(쓰기 전용, 순수 관찰).
         ranked.append({
             "keyword": k,
             "score": round(score, 4),
             "source_breakdown": breakdown,
+            "score_trace": _score_trace(k, breakdown, renorm, news_atoms.get(k),
+                                        news_map.get(k), penalty, score),
             "rank_reason": _build_rank_reason(breakdown, available),
             "news_meta": news_map.get(k) or {},
             "used_signals": list(renorm.keys()),
@@ -408,6 +415,62 @@ def compute_scores(candidates: List[Dict], signals: Dict[str, Dict]) -> List[Dic
     # score 내림차순, 동점 시 news breakdown 우선
     ranked.sort(key=lambda r: (r["score"], r["source_breakdown"]["news"]), reverse=True)
     return ranked
+
+
+# score 재구성 payload 버전(2026-09). weight 가 바뀌면 이 숫자로 과거 run 을 재계산하면
+# 안 되므로, **그 당시의 contribution 을 그대로** 저장하고 버전으로 의미를 고정한다.
+SCORE_TRACE_VERSION = 1
+
+# 축 이름 축약(JSONB 저장 비용 절감). 이 매핑이 payload 해석의 권위다 — 버전 v 와 함께
+# 읽어야 한다. 값은 [norm, weight] 2원소 배열이고 contribution = norm * weight.
+_AXIS_SHORT = {
+    "news": "n",
+    "search_demand": "d",
+    "source_consensus": "c",
+    "freshness": "f",
+}
+AXIS_KEYS = {v: k for k, v in _AXIS_SHORT.items()}
+
+
+def _score_trace(keyword, breakdown, renorm, atom, news, penalty, final_score):
+    """관측 전용 compact score 근거. 랭킹 판정에 읽히지 않는다(쓰기 전용).
+
+    저장 원칙:
+    - 원시 신호(raw)와 축 정규화값(norm), 그리고 **그때 적용된 weight** 와 최종
+      contribution 을 함께 남긴다. 나중에 WEIGHTS 가 바뀌어도 과거 run 의 의미가
+      흔들리지 않게 하려는 것이다(재계산 불필요).
+    - penalty 와 clamp 는 breakdown 바깥에서 적용되므로 함께 남긴다. 이것이 없으면
+      sum(contribution) != score 가 되어 검산이 불가능하다.
+    - 기사 제목/URL/본문은 저장하지 않는다(정수·실수만).
+
+    반환 dict 는 builder 가 signals["score_breakdown_v1"] 로 실어 나른다.
+    """
+    # 축 키는 고정 순서의 짧은 이름으로 줄인다(JSONB 는 행마다 키 문자열을 저장하므로
+    # 긴 이름이 그대로 저장 비용이 된다). 의미는 아래 AXIS_KEYS 가 권위.
+    trace = {
+        "v": SCORE_TRACE_VERSION,
+        # 축별 [정규화값, 그때 weight] — contribution 은 두 값의 곱이라 저장하지 않는다
+        # (중복 저장 금지). 검산은 sum(norm*weight) - penalty == score 로 한다.
+        "ax": {
+            _AXIS_SHORT[a]: [round(breakdown.get(a, 0.0), 4), round(renorm.get(a, 0.0), 4)]
+            for a in breakdown if a in _AXIS_SHORT
+        },
+        "penalty": round(penalty, 4),
+        "score": round(final_score, 4),
+    }
+    # news 축 원시 신호(정규화 cohort 를 몰라도 "근거가 몇 건이었나"는 알 수 있게).
+    if atom:
+        # news 축 원시 신호 [recent_count, domain_diversity, title_relevance].
+        # 정규화 cohort 를 몰라도 "근거가 몇 건이었나"를 알 수 있게 하는 값이다.
+        trace["raw"] = [
+            int(atom.get("recent_count") or 0),
+            int(atom.get("domain_diversity") or 0),
+            round(float(atom.get("title_relevance") or 0.0), 3),
+        ]
+    if news and news.get("latest_age_hours") is not None:
+        # freshness 의 원시 근거(시간). freshness norm 이 무엇으로부터 나왔는지 남긴다.
+        trace["age_h"] = round(float(news["latest_age_hours"]), 2)
+    return trace
 
 
 def _build_rank_reason(breakdown: Dict[str, float], available: Dict) -> str:
