@@ -21,6 +21,7 @@ import json
 import logging
 import sys
 from pathlib import Path
+from typing import List
 
 from news.builder import build_issues, build_ranked_issues
 from news.seed import fetch_daum_seed, seed_from_fixture, ranked_seed_from_fixture
@@ -100,11 +101,14 @@ def _inject_recent(items):
     return out
 
 
-def run_ranking(verbose: bool = True) -> dict:
-    """통합 랭킹 dry-run (fixture 전용, 실호출/DB write 0).
+def ranking_inputs() -> dict:
+    """fixture → 랭킹 입력(candidates / signals / daum 순서). **dry-run 고유 adapter**.
 
-    multi-source fixture로 후보 수집 → 신호 → ranker → Top10 → issues 조립.
-    Daum 순서와 다른 Top10이 나오는지 확인하는 게 핵심 합격 기준.
+    선정 게이트는 이 함수에 없다 — 게이트 시퀀스는 ranker.run_selection_stages 단일
+    진실원이 전부 담당한다. dry-run 이 맡는 것은 "무엇을 입력으로 넣을지"와 "결과를
+    어떻게 보여줄지"뿐이다.
+
+    반환: {candidates, signals, datalab_signals, daum_ranked}
     """
     seed_fx = _load_fixture("seed.json")
     danawa_fx = _load_fixture("danawa_seed.json")
@@ -127,37 +131,71 @@ def run_ranking(verbose: bool = True) -> dict:
     kw_list = [c["keyword"] for c in candidates]
     datalab_signals = datalab_adapter.fetch_from_fixture(datalab_fx, kw_list)
 
-    signals = {
-        "news": news_signals,
-        "datalab": datalab_signals,
-        "google": {},  # provider 기본 비활성
+    return {
+        "candidates": candidates,
+        "signals": {
+            "news": news_signals,
+            "datalab": datalab_signals,
+            "google": {},  # provider 기본 비활성
+        },
+        "datalab_signals": datalab_signals,
+        "daum_ranked": daum_ranked,
     }
-    # production(_rank_and_select)과 동일 시퀀스로 랭킹을 산출한다 — dry-run 검증 경로가
-    # 실제 파이프라인과 어긋나지 않도록(Codex diff 리뷰 P2). PR hard exclude → dedupe/merge →
-    # display/articles invariant → generic singleton 제외 → Top10.
-    ranked = ranker.compute_scores(candidates, signals)
-    ranked, _pr_excluded = ranker.exclude_pr_clusters(ranked)
-    merged = ranker.dedupe_and_merge(ranked)
-    merged = ranker.resolve_singleton_displays(merged)
-    merged = ranker.enforce_display_article_consistency(merged)
-    kept, _generic_excluded = ranker.exclude_generic_singletons(merged)
-    top = ranker.select_top(kept)
-    # 운영 _rank_and_select와 동일하게 display_articles <= 1 후보 제외(2026-07-05).
-    top, _display_excluded = ranker.exclude_insufficient_display_articles(top)
-    candidate_map = {c["keyword"]: c for c in candidates}
-    data_sources = ["naver_news"]
+
+
+def _data_sources(candidates: List[dict], datalab_signals: dict) -> List[str]:
+    """issues payload 에 실을 data_sources 목록(표시 전용)."""
+    out = ["naver_news"]
     if datalab_signals:
-        data_sources.append("datalab")
+        out.append("datalab")
     participating = set()
     for c in candidates:
         participating |= set(c["sources"].keys()) & cand._INDEPENDENT_SEARCH_FAMILIES
-    data_sources.extend(sorted(participating))
-    issues = build_ranked_issues(top, candidate_map, data_sources)
+    out.extend(sorted(participating))
+    return out
+
+
+def run_ranking(verbose: bool = True) -> dict:
+    """통합 랭킹 dry-run (fixture 전용, 실호출/DB write 0).
+
+    multi-source fixture로 후보 수집 → 신호 → **ranker.run_selection_stages** → issues 조립.
+
+    ⚠️ 선정 게이트 시퀀스를 여기에 다시 적지 않는다. 2026-07~09 동안 이 자리에 시퀀스
+    사본이 있었고 조용히 drift했다 — enforce_display_source_grounding 과
+    exclude_no_representative 두 단계가 누락됐고, exclude_insufficient_display_articles
+    가 select_top **뒤**에서 돌아(운영은 앞) 하위 정상후보 backfill 도 일어나지 않았다.
+    그 결과 shipped fixture 에서 dry-run 이 production 이라면 전부 탈락시켰을 후보
+    2건(summary 가 빈 no_representative)을 Top 으로 내보내고 있었다(2026-09-14 교정).
+    게이트 추가/순서 변경은 run_selection_stages 에서만 일어나며 dry-run 은 자동으로 따른다.
+    """
+    inputs = ranking_inputs()
+    candidates = inputs["candidates"]
+    daum_ranked = inputs["daum_ranked"]
+
+    stages = ranker.run_selection_stages(candidates, inputs["signals"])
+    top = stages["top"]
+
+    candidate_map = {c["keyword"]: c for c in candidates}
+    issues = build_ranked_issues(
+        top, candidate_map, _data_sources(candidates, inputs["datalab_signals"])
+    )
 
     if verbose:
         print("===== DRY-RUN ranked issues (NO DB WRITE) =====")
         print(json.dumps(issues, ensure_ascii=False, indent=2))
         print("===== END =====")
+        # 단계별 제외를 함께 남긴다 — Top 이 비거나 짧을 때 "고장"과 "게이트가 제 역할을
+        # 한 것"을 구분할 수 있어야, 사람이 시퀀스를 임의로 줄여 다시 drift 시키지 않는다.
+        logger.info(
+            "[dry-run] gate통과=%d PR제외=%d merge후=%d generic제외=%d "
+            "display부족제외=%d no_rep제외=%d final=%d",
+            len(stages["gate_passed"]), len(stages["pr_excluded"]), len(stages["merged"]),
+            len(stages["generic_excluded"]), len(stages["display_excluded"]),
+            len(stages["no_rep_excluded"]), len(top),
+        )
+        for stage in ("pr_excluded", "generic_excluded", "display_excluded", "no_rep_excluded"):
+            if stages[stage]:
+                logger.info("[dry-run] %s: %s", stage, stages[stage])
         daum_order = [i["keyword"] for i in daum_ranked]
         ranked_order = [k["keyword"] for k in issues["keywords"]]
         logger.info("daum 순서: %s", daum_order)
