@@ -919,8 +919,21 @@ def classify_entity_role(keyword: str, article: Dict) -> tuple:
 # ============================================================================
 
 # 처분·수사어(법적 처리 신호). 이 토큰 없이 범죄어만 있으면 사건성이 약해 트리거하지 않는다.
+#
+# 단계 구성(운영 재현 2026-09-10 보강): 원래는 체포·기소 단계 어휘만 있고 "확정 판결"
+# 단계가 통째로 빠져 있었다(`실형` 하나뿐). 그래서 "장윤정 징역 10개월"처럼 **가장 무거운
+# 형사 사실**을 담은 키워드가 has_disp=False 로 게이트를 아예 트리거하지 못했다 — 실제
+# 기사 8건은 전부 "장윤정 母/모친, 1심서 징역 10개월"이었다. 선고 단계 어휘를 추가한다.
+#
+# 추가하지 않은 어휘와 그 근거(14일 운영 실측, 동음이의어로 정상 이슈를 오차단함):
+#   · "금고"(금고형) — 9행 중 7행이 "새마을금고"(금융기관)였다.
+#   · "구형"(求刑)   — 舊型(구형 모델)과 동음이의. 관측된 15개 고유 키워드는 모두
+#                      "사형 구형"/"징역 N년 구형" 처럼 다른 선고 어휘를 함께 담고 있어
+#                      이 토큰 없이도 전부 트리거된다.
 _DISPOSITION_TOKENS = (
     "구속", "송치", "기소", "체포", "구인", "입건", "구속영장", "압수수색", "피의자", "실형",
+    # 선고·판결 단계(2026-09-10). 체포 단계보다 오귀속 피해가 크다.
+    "징역", "집행유예", "벌금", "선고", "유죄", "사형",
 )
 # 범죄어(혐의 종류).
 _CRIME_TOKENS = (
@@ -936,7 +949,50 @@ _RELATION_PERSON_MARKERS = (
     "남편", "아내", "부인", "전 남친", "전 여친", "前 남친", "前 여친", "전 남자친구",
     "전 여자친구", "내연남", "내연녀", "측근", "동업자", "투자자", "운전기사", "경호원",
     "팬", "유튜버", "연인", "교제 상대", "일당",
+    # 직계·인척 관계어(2026-09-10). 기존엔 "부모"/"가족"/"딸"/"아들"만 있어 한국 기사가
+    # 실제로 쓰는 표기("장윤정 모친"/"장윤정 母")를 하나도 못 잡았다. 관계를 표기에
+    # 드러낸 키워드는 안전명이고(트리거 억제), 기사에서 이름 직후에 오면 그 관계인이
+    # 실제 주체라는 신호다(classify_crime_subject_role).
+    "모친", "어머니", "母", "부친", "아버지", "父", "친모", "친부",
+    "장모", "장인", "시모", "시부", "며느리", "사위", "형수", "제수",
+    "조카", "처남", "손자", "손녀", "이모", "고모", "삼촌", "외삼촌",
 )
+# 관계명사가 "어절 경계"로 등장하는지 볼 때 허용하는 뒤따름(조사·구두점·어절 끝).
+_RELATION_TRAILING = (
+    "", "이", "가", "은", "는", "의", "을", "를", "과", "와", "도", "만",
+    "에", "에게", "께", "께서", "부터", "까지", ",", ".", "·",
+)
+
+
+def _relation_marker_at_word_boundary(text: str) -> bool:
+    """관계명사가 text 안에 **어절 경계**로 등장하는가(부분일치 금지).
+
+    부분일치는 이 게이트의 판정을 양방향으로 뒤집었다 — 관계명사 "형"(오빠)이 처분어
+    "실형"/"사형" 안에서 매칭돼(운영 재현 2026-09-10):
+    - 트리거 억제 경로: 이름+"실형" 키워드가 전부 안전명으로 오인돼 게이트를 우회했다.
+    - role 판정 경로: "…에 사형 구형"의 실제 피고인이 bystander 로 뒤집혀, 정상 사건이
+      verified_self 를 못 얻고 통째로 차단됐다.
+    그래서 관계명사 매칭이 판정을 바꾸는 자리에는 전부 이 함수를 쓴다.
+    """
+    t = text or ""
+    for marker in _RELATION_PERSON_MARKERS:
+        for start, end in _find_all(marker, t):
+            if start > 0 and "가" <= t[start - 1] <= "힣":
+                continue  # 앞 음절이 붙어 있음 → 다른 낱말의 일부("실형"의 "형")
+            if t[end:].split(" ", 1)[0] in _RELATION_TRAILING:
+                return True
+    return False
+
+
+def _starts_with_relation_marker(text: str) -> bool:
+    """text 가 관계명사로 시작하는가(뒤쪽도 어절 경계여야 함)."""
+    t = text or ""
+    for marker in _RELATION_PERSON_MARKERS:
+        if t.startswith(marker) and t[len(marker):].split(" ", 1)[0] in _RELATION_TRAILING:
+            return True
+    return False
+
+
 # 익명 주체(이름과 별개로 등장하는 실제 범죄 주체). "이유명 협박한 40대 남성 구속" → 남성.
 _CRIME_SUBJECT_GENERIC = (
     "남성", "여성", "남자", "여자", "40대", "30대", "20대", "50대", "60대", "10대",
@@ -1002,6 +1058,11 @@ _COMMON_NONNAME_TOKENS = (
     "필로폰", "대마", "코카인", "케타민", "엑스터시", "마약류", "상습", "판매", "유통",
     "밀반입", "구매", "복용", "흡입", "구입", "성범죄", "촬영물", "동영상", "불법", "혐의점",
     "구속기소", "불구속", "재범", "초범", "가담", "모의", "은닉", "도주", "잠적",
+    # 선고 단계 일반어(2026-09-10). "무기"는 무기징역의 앞 음절인데 2자 순수 한글이라
+    # 다른 인물명 후보로 잡혀, "<이름> 무기징역 확정"처럼 이름이 형량과 바로 붙은 정상
+    # 본인 사건까지 주체 확정이 보류됐다. 징역/벌금/선고/유죄/실형은 _DISPOSITION_TOKENS
+    # 에 있어 _known 으로 이미 배제되므로 여기 다시 적지 않는다.
+    "무기", "무죄", "항소", "상고",
 )
 
 
@@ -1097,7 +1158,8 @@ def crime_keyword_requires_check(keyword: str) -> bool:
     # 위치 이후 부분 문자열에서만 관계명사를 찾는다.
     anchor_pos = kw.find(anchor)
     after_anchor = kw[anchor_pos + len(anchor):] if anchor_pos >= 0 else ""
-    if any(m in after_anchor for m in _RELATION_PERSON_MARKERS):
+    # 어절 경계로만 인정한다 — 부분일치는 "실형" 속 "형"에 걸려 게이트를 스스로 껐다.
+    if _relation_marker_at_word_boundary(after_anchor):
         return False
     # 안전 맥락(관형형 victim 표현: 협박한/상대로/법적공방 등) → 검증 불필요.
     # bare 범죄어("협박"/"고소")는 여기에 포함하지 않는다(P1-A): "박나래 협박 구속"처럼
@@ -1151,9 +1213,10 @@ def classify_crime_subject_role(keyword: str, article: Dict) -> str:
     # (2) 이름 직후 근접(≤6자)에 관계명사 → 종속 제3자가 주체.
     tail = title[anchor_end:anchor_end + 14] if anchor_end <= len(title) else ""
     tail_stripped = tail.lstrip(" 의,·")
-    for rel in _RELATION_PERSON_MARKERS:
-        if tail_stripped.startswith(rel) or rel in tail[:8]:
-            return "victim_or_bystander"
+    # 어절 경계로만 인정한다(2026-09-10). 부분일치면 관계명사 "형"(오빠)이 처분어
+    # "사형" 안에서 매칭돼, 실제 피고인("장윤기에 사형 구형")이 bystander 로 뒤집혔다.
+    if _starts_with_relation_marker(tail_stripped) or _relation_marker_at_word_boundary(tail[:8]):
+        return "victim_or_bystander"
 
     # (3) 이름과 별개로 익명 주체 + 범죄·처분어 결합 → 익명 주체가 실제 주체.
     #     이름 뒤 구간에 익명 주체가 등장하고 그 뒤/근처에 처분어가 있으면 victim.
@@ -1189,7 +1252,7 @@ def classify_crime_subject_role(keyword: str, article: Dict) -> str:
         # 대상일 수 있어 본인 확정을 보류한다(Codex P1-C: "김건희 특검 윤석열 구속영장").
         if (len(between) <= 16
                 and not any(b in between for b in _TITLE_CLAUSE_BREAKS)
-                and not any(rel in between for rel in _RELATION_PERSON_MARKERS)
+                and not _relation_marker_at_word_boundary(between)
                 and not any(g in between for g in _CRIME_SUBJECT_GENERIC)
                 and not _has_other_name_candidate(between, lead)):
             name_bound_to_disp = True
@@ -1197,7 +1260,7 @@ def classify_crime_subject_role(keyword: str, article: Dict) -> str:
     # 본인 확정 보류. 처분어 이후는 "청구/발부" 등 절차어라 주체 판단에 무의미하므로 제외.
     head = title[:nearest_disp] if nearest_disp is not None else title
     other_subject_present = (
-        any(rel in title for rel in _RELATION_PERSON_MARKERS)
+        _relation_marker_at_word_boundary(title)
         or any(g in after for g in _CRIME_SUBJECT_GENERIC)
         or _has_other_name_candidate(head[anchor_end:], lead)
     )
@@ -1245,6 +1308,35 @@ def aggregate_crime_attribution(keyword: str, high_articles: List[Dict]) -> Dict
         "crime_attribution_verified_self": verified_self,
         "has_unsafe_crime_attribution": not verified_self,
     }
+
+
+def display_adds_unsafe_crime_attribution(
+    display: str, canonical: str, articles: List[Dict]
+) -> bool:
+    """merge 조합 표기가 canonical 에 없던 **형사 처분 주장**을 새로 만드는가(2026-09-10).
+
+    candidate 게이트는 merge 이전 키워드에만 걸린다. 그래서 각자는 안전한 후보
+    (`"<이름> 사기"` — 처분어 없음 / `"징역 10개월"` — 이름 anchor 없음)가 merge 되면
+    _build_display_keyword 가 `"<이름> 사기 징역 10개월"`을 만들어, 후보 단계에서
+    차단한 오귀속이 표기 단계에서 되살아난다.
+
+    판정은 aggregate_crime_attribution **그대로** 쓴다 — display 전용 범죄 규칙을 새로
+    만들지 않는다. 조합 표기의 선두가 처분어라 이름 anchor 가 잡히지 않는 배열
+    (`"징역 10개월 <이름>"`)은, canonical 엔티티가 그 처분을 주장받는 형태로 세워
+    같은 판정기에 넘긴다.
+
+    반환 True 면 호출부가 canonical 로 되돌린다(canonical 은 candidate 게이트를 이미
+    통과한 표기라 항상 안전한 대안이다 — 사건을 잃지 않는다).
+    """
+    disp = (display or "").strip()
+    canon = (canonical or "").strip()
+    if not disp or disp == canon:
+        return False
+    added = [t for t in _DISPOSITION_TOKENS if t in disp and t not in canon]
+    if not added:
+        return False  # canonical 이 이미 담고 있던 처분 주장 → 새로 만든 위험이 아니다.
+    probe = disp if _kw_name_anchor(disp) else f"{canon} {' '.join(added)}"
+    return aggregate_crime_attribution(probe, articles or [])["has_unsafe_crime_attribution"]
 
 
 # === entity cohesion 신호(E) — dominant event / same-event burst ===
