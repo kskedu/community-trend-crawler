@@ -241,6 +241,78 @@ class TestExtractMultiOg(unittest.TestCase):
         self.assertEqual(T.extract_thumbnail(html, "https://news.com/1"), "https://cdn.example.com/good.jpg")
 
 
+class TestEntityDecode(unittest.TestCase):
+    """og:image/twitter:image 속성값의 HTML 엔티티 디코딩(2026-09-15).
+
+    운영 실측: 쿼리 파라미터가 여러 개인 이미지 URL 이 "&amp;" 를 그대로 담은 채
+    저장돼 <img> 가 로드에 실패했다. 특정 언론사 도메인에 매이지 않는 결함이라
+    도메인을 하드코딩하지 않고 형태로만 검증한다.
+    """
+
+    def test_amp_entity_decoded(self):
+        html = ('<meta property="og:image" '
+                'content="https://cdn.example.com/img.php?idx=5&amp;simg=a.jpg">')
+        got = T.extract_thumbnail(html, "https://news.com/1")
+        self.assertEqual(got, "https://cdn.example.com/img.php?idx=5&simg=a.jpg")
+        self.assertNotIn("&amp;", got)
+
+    def test_numeric_entity_decoded(self):
+        html = ('<meta property="og:image" '
+                'content="https://cdn.example.com/img.php?a=1&#38;b=2">')
+        self.assertEqual(
+            T.extract_thumbnail(html, "https://news.com/1"),
+            "https://cdn.example.com/img.php?a=1&b=2",
+        )
+
+    def test_twitter_image_also_decoded(self):
+        # og 가 없을 때 타는 경로도 같은 디코딩을 거쳐야 한다.
+        html = ('<meta name="twitter:image" '
+                'content="https://cdn.example.com/t.php?x=1&amp;y=2">')
+        self.assertEqual(
+            T.extract_thumbnail(html, "https://news.com/1"),
+            "https://cdn.example.com/t.php?x=1&y=2",
+        )
+
+    def test_plain_url_unchanged(self):
+        # 엔티티가 없는 정상 URL 은 한 글자도 바뀌지 않는다(과확장 방지).
+        url = "https://cdn.example.com/a/b_c-d.jpg?v=1"
+        html = f'<meta property="og:image" content="{url}">'
+        self.assertEqual(T.extract_thumbnail(html, "https://news.com/1"), url)
+
+    def test_relative_url_with_entity_still_resolved(self):
+        # 디코딩이 상대경로 → 절대경로 변환보다 앞서도 base 결합은 그대로 동작한다.
+        html = '<meta property="og:image" content="/img.php?a=1&amp;b=2">'
+        self.assertEqual(
+            T.extract_thumbnail(html, "https://news.com/article/1"),
+            "https://news.com/img.php?a=1&b=2",
+        )
+
+    def test_entity_encoded_javascript_scheme_still_rejected(self):
+        # fail-closed 회귀: 디코딩을 안전 검사보다 먼저 하므로, 엔티티로 가린
+        # javascript: 도 scheme 검사에 걸려 거부돼야 한다(디코딩이 우회 통로가 되면 안 됨).
+        html = '<meta property="og:image" content="&#106;avascript:alert(1)">'
+        self.assertIsNone(T.extract_thumbnail(html, "https://news.com/1"))
+
+    def test_entity_encoded_data_uri_still_rejected(self):
+        html = ('<meta property="og:image" '
+                'content="&#100;ata:image/png;base64,AAAA">')
+        self.assertIsNone(T.extract_thumbnail(html, "https://news.com/1"))
+
+    def test_entity_encoded_http_still_rejected(self):
+        # https 전용 계약 유지(mixed content 방지).
+        html = '<meta property="og:image" content="http://cdn.example.com/a.jpg?x=1&amp;y=2">'
+        self.assertIsNone(T.extract_thumbnail(html, "https://news.com/1"))
+
+    def test_entity_only_content_is_skipped(self):
+        # 디코딩 결과가 빈 문자열이면 채택하지 않는다(malformed fail-safe).
+        html = ('<meta property="og:image" content="&#32;">'
+                '<meta property="og:image" content="https://cdn.example.com/ok.jpg">')
+        self.assertEqual(
+            T.extract_thumbnail(html, "https://news.com/1"),
+            "https://cdn.example.com/ok.jpg",
+        )
+
+
 class TestRedirect(unittest.TestCase):
     def test_redirect_not_followed(self):
         # 공개 host 의 302 응답은 추적하지 않고 None (SSRF 리다이렉트 우회 방지).
