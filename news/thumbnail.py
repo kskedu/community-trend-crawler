@@ -7,6 +7,7 @@
 - 수집 우선순위: og:image → twitter:image.
 - 저장 거부: http(https 만 허용, mixed content 방지) / data: / base64 / 과도하게 긴 URL.
 - 상대경로 이미지 URL 은 기사 URL 기준 절대경로로 변환한다.
+- HTML 속성값 엔티티는 디코딩한다(`&amp;` → `&`). 안전 검사보다 먼저 수행한다.
 - 캐시 우선: 이전 news_top row 의 같은 article URL thumbnail 을 재사용하고,
   캐시에 없는 URL 만 신규 GET 한다(같은 run 내 URL memoization 포함).
 - 실패/timeout/차단은 조용히 None(thumbnail 생략). upsert 를 막지 않는다.
@@ -17,6 +18,8 @@ import logging
 import re
 import socket
 import time
+# 이 모듈의 함수 인자명이 `html` 이라 모듈을 그대로 import 하면 가려진다 → 함수만 가져온다.
+from html import unescape
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional
 from urllib.parse import urljoin, urlparse
@@ -83,7 +86,11 @@ def extract_thumbnail(html: str, base_url: str) -> Optional[str]:
             c = _CONTENT.search(m.group(0))
             if not c:
                 continue
-            raw = c.group(1).strip()
+            # HTML 속성값은 엔티티로 인코딩돼 있다("...?idx=5&amp;simg=..." 운영 실측).
+            # 디코딩하지 않으면 쿼리 구분자가 "&amp;" 인 URL 이 그대로 저장돼 <img> 로드가
+            # 실패한다. 안전 검사(is_acceptable_thumbnail)보다 **먼저** 디코딩해야
+            # "&#106;avascript:" 같은 엔티티 우회가 scheme 검사를 통과하지 못한다.
+            raw = unescape(c.group(1)).strip()
             if not raw:
                 continue
             # 상대경로 → 절대경로 (base_url 기준). 이미 절대면 그대로.
