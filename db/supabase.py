@@ -117,6 +117,28 @@ def upsert_news_issues(issues: Dict, source: str = "news_top") -> bool:
         return False
 
 
+def upsert_generic_snapshot(source: str, payload: Dict) -> bool:
+    """news_issue_cache 테이블에 임의 payload를 upsert하는 범용 snapshot 저장.
+
+    upsert_news_issues와 달리 "keywords" 필드를 강제하지 않는다 — news_top 브리핑
+    계약과 무관한 다른 source(예: naver_press_popular)가 같은 테이블을 재사용할 때 쓴다.
+    on_conflict='source'(PK)로 단일 행 운영. payload는 issues 컬럼(jsonb)에 그대로 저장.
+    """
+    if not source or not isinstance(payload, dict) or not payload:
+        return False
+    client = get_client()
+    try:
+        client.table("news_issue_cache").upsert({
+            "source": source,
+            "issues": payload,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }, on_conflict="source").execute()
+        return True
+    except Exception as e:
+        logger.error(f"[{source}] generic snapshot upsert 실패: {e}")
+        return False
+
+
 def record_news_diagnostics(run: Dict, decisions: list) -> bool:
     """뉴스 키워드 진단 이력을 RPC 1회로 원자 적재한다.
 
