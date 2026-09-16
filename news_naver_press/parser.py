@@ -10,9 +10,15 @@
   경우가 대다수다(운영 실측: src만 보면 83개 중 12개만 채택됨). src 우선, 없으면
   data-src로 폴백한다.
 - 랭킹 페이지의 list 썸네일 URL은 `?type=nf70_70`(70x70 고정)이 붙어 있어 실제로
-  70x70px 저해상도다(운영 실측). 같은 origin 경로에 `?type=w800` 같은 더 큰 프리셋을
-  요청하면 동일 이미지를 고해상도로 받을 수 있음을 확인(1200x696 원본 존재, 2026-09-16).
-  카드형 UI에서 확대 표시할 때 흐려지지 않도록 `type` 파라미터를 w800으로 치환한다.
+  70x70px 저해상도다(운영 실측). 같은 origin 경로에 더 큰 프리셋을 요청하면 동일
+  이미지를 고해상도로 받을 수 있음을 확인(1200x696 원본 존재, 2026-09-16). 카드형
+  UI에서 확대 표시할 때 흐려지지 않도록 `type` 파라미터를 치환한다.
+  사이즈는 w640 고정(2026-09-16 결정): StartHub 실제 leftPanel 폭(~1000px,
+  rightPanel 360px 고정 제외) 기준 Phase 3-A 디자인 시안 3종(A/B/C) 중 가장 큰
+  카드(C안 리드 카드, ~321px 표시)가 Retina 2x에서 요구하는 폭이 ~642px. 네이버
+  CDN이 실제로 인식하는 프리셋은 w300/w640/w647/w800 뿐이고(그 외 값은 매칭 실패로
+  1200x696 원본을 그대로 반환해 오히려 무거움, 실측 확인) 이 중 필요량에 가장
+  가깝고 낭비 없는 값이 w640이다(w800 대비 파일 크기 ~15% 절감).
 """
 import logging
 import re
@@ -37,8 +43,10 @@ _PRESS_ID_RE = re.compile(r"/press/(\d+)/ranking")
 # 랭킹 페이지 list 썸네일의 저해상도 프리셋(70x70). 카드 UI 확대 표시에 흐려지므로
 # 더 큰 프리셋으로 치환한다. mimgnews.pstatic.net 원본 경로가 아니면(다른 CDN/HTML 구조
 # 변경) 건드리지 않는다 — 모르는 도메인의 쿼리 문자열을 임의로 바꾸면 안전하지 않다.
+# w640 선정 근거는 모듈 docstring 참조 — 실사용 카드 최대 표시폭(Retina 2x) 대비
+# 낭비 없는 최소 유효 프리셋.
 _THUMBNAIL_HOST = "mimgnews.pstatic.net"
-_THUMBNAIL_SIZE_TYPE = "w800"
+_THUMBNAIL_SIZE_TYPE = "w640"
 
 
 def _upscale_thumbnail(url: Optional[str]) -> Optional[str]:
