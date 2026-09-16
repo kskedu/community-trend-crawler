@@ -1,0 +1,31 @@
+name: Naver Press Popular News (Phase 1)
+
+# Phase 1: 실험 단계. schedule은 절대 추가하지 않는다 — 안정성이 검증되기 전에는
+# workflow_dispatch(수동)로만 실행한다. 기존 crawl.yml/healthcheck.yml과 완전히
+# 분리된 독립 workflow — 이 workflow의 실패는 기존 뉴스/커뮤니티 크롤러에 영향을 주지 않는다.
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Naver press popular collector
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python -m news_naver_press

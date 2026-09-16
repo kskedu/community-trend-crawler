@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body>
+<div class="rankingnews_box_wrap">
+
+<!-- 정상 -->
+<div class="_officeCard _officeCard0">
+<div class="rankingnews_box">
+<a class="rankingnews_box_head" href="https://media.naver.com/press/015/ranking?type=popular">
+<strong class="rankingnews_name">정상언론사</strong>
+</a>
+<ul class="rankingnews_list">
+<li>
+<em class="list_ranking_num">1<span class="blind">위</span></em>
+<div class="list_content">
+<a class="list_title" data-nlog-params='{"rank":1,"article_id":"0009999901"}' href="https://n.news.naver.com/article/015/0009999901?ntype=RANKING">[정상 기사 제목]</a>
+<span class="list_time">5시간전</span>
+</div>
+<a aria-hidden="true" class="list_img" href="https://n.news.naver.com/article/015/0009999901?ntype=RANKING" tabindex="-1">
+<img alt="" src="https://mimgnews.pstatic.net/image/origin/015/2026/09/16/9999901.jpg?type=nf70_70" width="70"/>
+</a>
+</li>
+</ul>
+</div>
+</div>
+
+<!-- press_name 없음 -> box 자체 skip -->
+<div class="_officeCard _officeCard1">
+<div class="rankingnews_box">
+<a class="rankingnews_box_head" href="https://media.naver.com/press/999/ranking?type=popular">
+</a>
+<ul class="rankingnews_list">
+<li>
+<em class="list_ranking_num">1<span class="blind">위</span></em>
+<div class="list_content">
+<a class="list_title" href="https://n.news.naver.com/article/999/0000000001?ntype=RANKING">[press_name 없는 box]</a>
+<span class="list_time">1시간전</span>
+</div>
+</li>
+</ul>
+</div>
+</div>
+
+<!-- rank1 없음(rank2부터 시작) -> box skip -->
+<div class="_officeCard _officeCard2">
+<div class="rankingnews_box">
+<a class="rankingnews_box_head" href="https://media.naver.com/press/018/ranking?type=popular">
+<strong class="rankingnews_name">rank1없음언론사</strong>
+</a>
+<ul class="rankingnews_list">
+<li>
+<em class="list_ranking_num">2<span class="blind">위</span></em>
+<div class="list_content">
+<a class="list_title" href="https://n.news.naver.com/article/018/0000000002?ntype=RANKING">[rank2만 있는 기사]</a>
+<span class="list_time">2시간전</span>
+</div>
+</li>
+</ul>
+</div>
+</div>
+
+<!-- title 없음 -> box skip -->
+<div class="_officeCard _officeCard3">
+<div class="rankingnews_box">
+<a class="rankingnews_box_head" href="https://media.naver.com/press/020/ranking?type=popular">
+<strong class="rankingnews_name">title없음언론사</strong>
+</a>
+<ul class="rankingnews_list">
+<li>
+<em class="list_ranking_num">1<span class="blind">위</span></em>
+<div class="list_content">
+<a class="list_title" href="https://n.news.naver.com/article/020/0000000003?ntype=RANKING"></a>
+<span class="list_time">3시간전</span>
+</div>
+</li>
+</ul>
+</div>
+</div>
+
+<!-- article_url 없음(list_title 자체 없음) -> box skip -->
+<div class="_officeCard _officeCard4">
+<div class="rankingnews_box">
+<a class="rankingnews_box_head" href="https://media.naver.com/press/021/ranking?type=popular">
+<strong class="rankingnews_name">URL없음언론사</strong>
+</a>
+<ul class="rankingnews_list">
+<li>
+<em class="list_ranking_num">1<span class="blind">위</span></em>
+<div class="list_content">
+<span class="list_time">4시간전</span>
+</div>
+</li>
+</ul>
+</div>
+</div>
+
+<!-- article_url이 naver news 형태가 아님 -> box skip -->
+<div class="_officeCard _officeCard5">
+<div class="rankingnews_box">
+<a class="rankingnews_box_head" href="https://media.naver.com/press/022/ranking?type=popular">
+<strong class="rankingnews_name">이상URL언론사</strong>
+</a>
+<ul class="rankingnews_list">
+<li>
+<em class="list_ranking_num">1<span class="blind">위</span></em>
+<div class="list_content">
+<a class="list_title" href="https://evil.example.com/phish?x=1">[이상한 외부 URL 기사]</a>
+<span class="list_time">1시간전</span>
+</div>
+</li>
+</ul>
+</div>
+</div>
+
+<!-- press_id 중복(015 재사용) -> 두번째 box skip, 첫 유효본 유지 -->
+<div class="_officeCard _officeCard6">
+<div class="rankingnews_box">
+<a class="rankingnews_box_head" href="https://media.naver.com/press/015/ranking?type=popular">
+<strong class="rankingnews_name">정상언론사중복</strong>
+</a>
+<ul class="rankingnews_list">
+<li>
+<em class="list_ranking_num">1<span class="blind">위</span></em>
+<div class="list_content">
+<a class="list_title" href="https://n.news.naver.com/article/015/0009999999?ntype=RANKING">[중복 press_id 기사]</a>
+<span class="list_time">6시간전</span>
+</div>
+</li>
+</ul>
+</div>
+</div>
+
+<!-- article_url 중복(다른 press_id, 동일 URL) -->
+<div class="_officeCard _officeCard7">
+<div class="rankingnews_box">
+<a class="rankingnews_box_head" href="https://media.naver.com/press/030/ranking?type=popular">
+<strong class="rankingnews_name">중복기사URL언론사</strong>
+</a>
+<ul class="rankingnews_list">
+<li>
+<em class="list_ranking_num">1<span class="blind">위</span></em>
+<div class="list_content">
+<a class="list_title" href="https://n.news.naver.com/article/015/0009999901?ntype=RANKING">[정상 기사 제목 재사용]</a>
+<span class="list_time">5시간전</span>
+</div>
+</li>
+</ul>
+</div>
+</div>
+
+</div>
+</body>
+</html>
