@@ -83,9 +83,10 @@ class TestNormalPage(unittest.TestCase):
 
     def test_thumbnail_upscaled_from_list_preset(self):
         # box0 원본 fixture는 ?type=nf70_70(70x70 list 썸네일) — 카드 UI 확대 시
-        # 흐려지므로 w800으로 치환돼야 한다(2026-09-16 실측: 원본 1200x696 확인).
+        # 흐려지므로 w640으로 치환돼야 한다(2026-09-16 실측/결정: 실사용 카드 최대
+        # 표시폭 기준 낭비 없는 최소 유효 프리셋, 원본 1200x696 확인).
         item = self.P._parse_box(self.boxes[0])
-        self.assertIn("type=w800", item.thumbnail)
+        self.assertIn("type=w640", item.thumbnail)
         self.assertNotIn("nf70_70", item.thumbnail)
 
     def test_thumbnail_data_src_fallback(self):
@@ -93,7 +94,7 @@ class TestNormalPage(unittest.TestCase):
         item = self.P._parse_box(self.boxes[1])
         self.assertEqual(
             item.thumbnail,
-            "https://mimgnews.pstatic.net/image/origin/008/2026/09/16/2222221.jpg?type=w800",
+            "https://mimgnews.pstatic.net/image/origin/008/2026/09/16/2222221.jpg?type=w640",
         )
 
     def test_press_logo_data_src_fallback(self):
@@ -219,13 +220,13 @@ class TestUpscaleThumbnail(unittest.TestCase):
         out = self.P._upscale_thumbnail(url)
         self.assertEqual(
             out,
-            "https://mimgnews.pstatic.net/image/origin/011/2026/09/16/4662431.jpg?type=w800",
+            "https://mimgnews.pstatic.net/image/origin/011/2026/09/16/4662431.jpg?type=w640",
         )
 
     def test_preserves_other_query_params(self):
         url = "https://mimgnews.pstatic.net/image/origin/011/x.jpg?type=nf70_70&extra=1"
         out = self.P._upscale_thumbnail(url)
-        self.assertIn("type=w800", out)
+        self.assertIn("type=w640", out)
         self.assertIn("extra=1", out)
 
     def test_no_type_param_left_unchanged(self):
