@@ -81,12 +81,19 @@ class TestNormalPage(unittest.TestCase):
         item = self.P._parse_box(self.boxes[0])
         self.assertTrue(item.thumbnail.startswith("https://mimgnews.pstatic.net/"))
 
+    def test_thumbnail_upscaled_from_list_preset(self):
+        # box0 원본 fixture는 ?type=nf70_70(70x70 list 썸네일) — 카드 UI 확대 시
+        # 흐려지므로 w800으로 치환돼야 한다(2026-09-16 실측: 원본 1200x696 확인).
+        item = self.P._parse_box(self.boxes[0])
+        self.assertIn("type=w800", item.thumbnail)
+        self.assertNotIn("nf70_70", item.thumbnail)
+
     def test_thumbnail_data_src_fallback(self):
-        # box1: rank1 img가 src 없이 data-src만 보유(lazy-load) → 폴백 채택
+        # box1: rank1 img가 src 없이 data-src만 보유(lazy-load) → 폴백 채택 + 업스케일
         item = self.P._parse_box(self.boxes[1])
         self.assertEqual(
             item.thumbnail,
-            "https://mimgnews.pstatic.net/image/origin/008/2026/09/16/2222221.jpg?type=nf70_70",
+            "https://mimgnews.pstatic.net/image/origin/008/2026/09/16/2222221.jpg?type=w800",
         )
 
     def test_press_logo_data_src_fallback(self):
@@ -200,6 +207,41 @@ class TestStructureChanged(unittest.TestCase):
         self.assertEqual(result.reason, "STRUCTURE_CHANGED_OR_BLOCKED")
         self.assertEqual(result.box_count, 3)
         self.assertLess(result.box_count, MIN_VALID_BOX_COUNT)
+
+
+class TestUpscaleThumbnail(unittest.TestCase):
+    def setUp(self):
+        from news_naver_press import parser as P
+        self.P = P
+
+    def test_replaces_type_param(self):
+        url = "https://mimgnews.pstatic.net/image/origin/011/2026/09/16/4662431.jpg?type=nf70_70"
+        out = self.P._upscale_thumbnail(url)
+        self.assertEqual(
+            out,
+            "https://mimgnews.pstatic.net/image/origin/011/2026/09/16/4662431.jpg?type=w800",
+        )
+
+    def test_preserves_other_query_params(self):
+        url = "https://mimgnews.pstatic.net/image/origin/011/x.jpg?type=nf70_70&extra=1"
+        out = self.P._upscale_thumbnail(url)
+        self.assertIn("type=w800", out)
+        self.assertIn("extra=1", out)
+
+    def test_no_type_param_left_unchanged(self):
+        url = "https://mimgnews.pstatic.net/image/origin/011/x.jpg"
+        self.assertEqual(self.P._upscale_thumbnail(url), url)
+
+    def test_other_host_left_unchanged(self):
+        # 알 수 없는 CDN의 쿼리 문자열을 임의로 바꾸지 않는다(안전 범위 한정).
+        url = "https://cdn.example.com/img.jpg?type=nf70_70"
+        self.assertEqual(self.P._upscale_thumbnail(url), url)
+
+    def test_none_passthrough(self):
+        self.assertIsNone(self.P._upscale_thumbnail(None))
+
+    def test_empty_string_passthrough(self):
+        self.assertEqual(self.P._upscale_thumbnail(""), "")
 
 
 if __name__ == "__main__":

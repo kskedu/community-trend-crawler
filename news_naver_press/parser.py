@@ -9,12 +9,16 @@
 - Naver 랭킹 페이지는 lazy-load라 <img src>가 비어 있고 실제 URL이 data-src에 있는
   경우가 대다수다(운영 실측: src만 보면 83개 중 12개만 채택됨). src 우선, 없으면
   data-src로 폴백한다.
+- 랭킹 페이지의 list 썸네일 URL은 `?type=nf70_70`(70x70 고정)이 붙어 있어 실제로
+  70x70px 저해상도다(운영 실측). 같은 origin 경로에 `?type=w800` 같은 더 큰 프리셋을
+  요청하면 동일 이미지를 고해상도로 받을 수 있음을 확인(1200x696 원본 존재, 2026-09-16).
+  카드형 UI에서 확대 표시할 때 흐려지지 않도록 `type` 파라미터를 w800으로 치환한다.
 """
 import logging
 import re
 from dataclasses import dataclass, field
 from typing import List, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 from bs4 import BeautifulSoup
 
@@ -29,6 +33,32 @@ _ARTICLE_URL_RE = re.compile(
     r"^https://n\.news\.naver\.com/(?:mnews/)?article/\d+/\d+"
 )
 _PRESS_ID_RE = re.compile(r"/press/(\d+)/ranking")
+
+# 랭킹 페이지 list 썸네일의 저해상도 프리셋(70x70). 카드 UI 확대 표시에 흐려지므로
+# 더 큰 프리셋으로 치환한다. mimgnews.pstatic.net 원본 경로가 아니면(다른 CDN/HTML 구조
+# 변경) 건드리지 않는다 — 모르는 도메인의 쿼리 문자열을 임의로 바꾸면 안전하지 않다.
+_THUMBNAIL_HOST = "mimgnews.pstatic.net"
+_THUMBNAIL_SIZE_TYPE = "w800"
+
+
+def _upscale_thumbnail(url: Optional[str]) -> Optional[str]:
+    """mimgnews.pstatic.net 썸네일 URL의 `type` 쿼리를 더 큰 프리셋으로 치환.
+
+    다른 host면 원본 그대로 반환(안전한 범위로 한정).
+    """
+    if not url:
+        return url
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return url
+    if parsed.netloc != _THUMBNAIL_HOST:
+        return url
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    if "type" not in query:
+        return url
+    query["type"] = _THUMBNAIL_SIZE_TYPE
+    return urlunparse(parsed._replace(query=urlencode(query)))
 
 
 @dataclass
@@ -136,7 +166,7 @@ def _parse_box(box) -> Optional[PressTopItem]:
     if not _is_valid_article_url(article_url):
         return None
 
-    thumbnail = _img_url(rank1_li.select_one(".list_img img"))
+    thumbnail = _upscale_thumbnail(_img_url(rank1_li.select_one(".list_img img")))
     time_el = rank1_li.select_one(".list_time")
     time_label = time_el.get_text(strip=True) if time_el else None
 
