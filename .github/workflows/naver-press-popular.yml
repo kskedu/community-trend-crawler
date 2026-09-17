@@ -1,10 +1,22 @@
 name: Naver Press Popular News (Phase 1)
 
-# Phase 1: 실험 단계. schedule은 절대 추가하지 않는다 — 안정성이 검증되기 전에는
-# workflow_dispatch(수동)로만 실행한다. 기존 crawl.yml/healthcheck.yml과 완전히
-# 분리된 독립 workflow — 이 workflow의 실패는 기존 뉴스/커뮤니티 크롤러에 영향을 주지 않는다.
+# Phase 2(2026-09): 수동 검증을 마치고 정기 수집을 켰다. 기존 crawl.yml/healthcheck.yml과
+# 완전히 분리된 독립 workflow — 이 workflow의 실패는 기존 뉴스/커뮤니티 크롤러에 영향을 주지 않는다.
+#
+# 분(minute) 선정 근거 — 기존에 점유된 시각을 피한다(실측):
+#   :17, :47  cron-job.org → crawl.yml(뉴스 키워드, full / news_top_only)
+#   :23       healthcheck.yml
+# 위 셋 어디에서도 8분 이상 떨어진 :08/:38을 쓴다. 정각/30분 같은 GitHub 혼잡 시점도 피한다.
+# cron은 UTC 기준이지만 KST는 UTC+9(정시 오프셋)라 분 값은 :08/:38로 동일하다.
+# 수집 자체는 ~32초로 끝나므로 다른 workflow와 겹칠 여지가 사실상 없다.
+#
+# 수집기 계약은 그대로다: Naver HTML 1회 요청 / 403·429·challenge 즉시 fail-closed /
+# 우회·프록시·CAPTCHA 대응 없음 / parser validation 실패 시 기존 cache 보존 /
+# 성공할 때만 source='naver_press_popular' snapshot overwrite.
 on:
-  workflow_dispatch: {}
+  schedule:
+    - cron: "8,38 * * * *"   # 매시 :08, :38 (UTC=KST 분 동일)
+  workflow_dispatch: {}      # 비상·검증용 수동 진입점은 유지한다
 
 permissions:
   contents: read
