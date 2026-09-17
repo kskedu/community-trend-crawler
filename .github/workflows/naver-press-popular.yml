@@ -1,22 +1,27 @@
 name: Naver Press Popular News (Phase 1)
 
-# Phase 2(2026-09): 수동 검증을 마치고 정기 수집을 켰다. 기존 crawl.yml/healthcheck.yml과
-# 완전히 분리된 독립 workflow — 이 workflow의 실패는 기존 뉴스/커뮤니티 크롤러에 영향을 주지 않는다.
+# Phase 2(2026-09): 정기 수집 ON. 단 **정기 실행원은 cron-job.org(외부)의
+# workflow_dispatch 하나로 단일화한다** — crawl.yml 과 같은 방식이다.
 #
-# 분(minute) 선정 근거 — 기존에 점유된 시각을 피한다(실측):
+# GitHub 자체 schedule cron 은 쓰지 않는다(2026-09 제거). 이 저장소에서 실측한 결과
+# GitHub schedule 은 트리거를 대량 누락한다: healthcheck.yml 의 cron 은 "매시 :23"
+# 인데 실제 발화는 2.5~6.3시간 간격이었고(07:46 / 01:30 / 23:00 / 20:13 …),
+# 하루 기대 24회 중 2회만 실행됐다. 30분 주기 수집을 GitHub cron 으로 보장할 수 없다.
+# crawl.yml 이 2026-07 에 같은 이유로 이미 외부 dispatch 로 전환한 선례를 따른다.
+#
+# cron-job.org 계약: 매시 :08 / :38 에 이 workflow 를 ref=main 으로 dispatch.
 #   :17, :47  cron-job.org → crawl.yml(뉴스 키워드, full / news_top_only)
-#   :23       healthcheck.yml
-# 위 셋 어디에서도 8분 이상 떨어진 :08/:38을 쓴다. 정각/30분 같은 GitHub 혼잡 시점도 피한다.
-# cron은 UTC 기준이지만 KST는 UTC+9(정시 오프셋)라 분 값은 :08/:38로 동일하다.
-# 수집 자체는 ~32초로 끝나므로 다른 workflow와 겹칠 여지가 사실상 없다.
+#   :23       healthcheck.yml(GitHub schedule, 불규칙)
+# 위 점유 시각에서 8분 이상 떨어뜨렸다. 수집은 ~32초로 끝나 겹칠 여지가 사실상 없다.
+#
+# 이 workflow 는 기존 crawl.yml/healthcheck.yml 과 완전히 분리돼 있어, 실패해도
+# 기존 뉴스/커뮤니티 크롤러에 영향을 주지 않는다.
 #
 # 수집기 계약은 그대로다: Naver HTML 1회 요청 / 403·429·challenge 즉시 fail-closed /
 # 우회·프록시·CAPTCHA 대응 없음 / parser validation 실패 시 기존 cache 보존 /
 # 성공할 때만 source='naver_press_popular' snapshot overwrite.
 on:
-  schedule:
-    - cron: "8,38 * * * *"   # 매시 :08, :38 (UTC=KST 분 동일)
-  workflow_dispatch: {}      # 비상·검증용 수동 진입점은 유지한다
+  workflow_dispatch: {}      # cron-job.org(정기 :08/:38) + 수동(비상·검증) 공용 진입점
 
 permissions:
   contents: read
