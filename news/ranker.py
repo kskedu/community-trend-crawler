@@ -1779,7 +1779,9 @@ def _seed_priority(member: Dict) -> int:
     return 1  # naver_news_aux/phrase 등 파생
 
 
-def _keyword_coverage(member: Dict, group_articles: List[Dict]) -> float:
+def _keyword_coverage(
+    member: Dict, group_articles: List[Dict], *, surface_variants: bool = False
+) -> float:
     """keyword의 (문자열 부분일치 기준) 기사 분포율 — keyword가 그룹 전체 기사 중
     몇 개에 실제로 등장하는가. 다어절 지역/상대국/기업명이 일부 기사에만 나오면
     낮게 나와 representative_score에서 감점된다(사용자 확정 2026-07-02).
@@ -1803,6 +1805,20 @@ def _keyword_coverage(member: Dict, group_articles: List[Dict]) -> float:
     과대평가하는 오탐(더 위험)보다 낫다. 핵심어가 조사 때문에 부당 감점되더라도 그
     후보가 canonical keyword(movement 비교용)로는 그대로 유지되므로 데이터 안정성에는
     영향이 없다. 형태소 기반 정밀화는 별도 과제로 남긴다.
+
+    surface_variants=True 는 같은 정의를 **display 경로의 기존 표기 변형 계약**
+    (_word_contains_token: 조사·어미 결합 / 명시 alias / 붙여쓰기 복합의 exact
+    composition)으로 재는 판본이다. 기본값은 False 라 기존 호출부의 결과는 불변이다.
+    두 판본은 단조 관계다 — _word_contains_token 2번 규칙이 _josa_surface_fold 보다
+    넓으므로(base 형 동반 관측을 요구하지 않음) surface_variants 쪽이 항상 크거나 같다.
+
+    쓰는 곳을 한 군데로 좁힌 이유(2026-09-21): 같은 함수가 _representative_score 의
+    coverage 감점축도 좌우하는데, 그쪽까지 복합 표기를 인정하면 대표(best) 선택 자체가
+    뒤집혀 14일 실측 14건 중 "미 10년물 금리 돌파"→"美 국채 금리", "북한 탄도미사일
+    발사"→"탄도 미사일" 같은 **악화**가 생긴다. 대표 선택은 틀리면 display 전체가
+    바뀌므로 과소계산(보수)이 안전하지만, second 허용 판정은 이미 존재하는 후보의
+    잔여 토큰을 붙일지만 정하고 그 결과를 _combo_span_grounded 가 한 번 더 검증한다 —
+    위험이 비대칭이라 엄격도도 비대칭으로 둔다.
     """
     from news.summarizer import _tokens
 
@@ -1812,15 +1828,62 @@ def _keyword_coverage(member: Dict, group_articles: List[Dict]) -> float:
     if not kw_toks:
         return 0.0
     per_article = [
-        set(_tokens(f"{a.get('title', '')} {a.get('snippet', '')}")) for a in group_articles
+        _tokens(f"{a.get('title', '')} {a.get('snippet', '')}") for a in group_articles
     ]
-    fold = _josa_surface_fold(per_article)
+    if surface_variants:
+        hits = sum(
+            1
+            for art_toks in per_article
+            if all(any(_word_contains_token(w, t, kw_toks) for w in art_toks) for t in kw_toks)
+        )
+        return hits / len(group_articles)
+    per_article_sets = [set(toks) for toks in per_article]
+    fold = _josa_surface_fold(per_article_sets)
     hits = 0
-    for art_toks in per_article:
+    for art_toks in per_article_sets:
         # 원 표면형과 접힌 base 형을 모두 인정한다(접기가 근거를 줄이지 않도록 합집합).
         if kw_toks <= (art_toks | {fold.get(t, t) for t in art_toks}):
             hits += 1
     return hits / len(group_articles)
+
+
+def _second_completes_best(best: str, keyword: str) -> bool:
+    """second 후보가 best 의 토큰을 **전부 담고 그 위에 실질 토큰을 더하는** 표기인지.
+
+    _second_allowed 의 "새 정보 없음" 배제(`k in best or best in k`)는 두 방향을 한
+    조건에 묶는다. `k ⊂ best` 방향은 옳다 — k 는 best 가 이미 담은 말뿐이다. 그러나
+    `best ⊂ k` 방향은 정반대다: k 는 best 가 놓친 토큰을 정확히 얹은 **더 완결된
+    후보**이고, 그 토큰은 새로 합성한 말이 아니라 이미 후보 keyword 로 존재했다.
+    그래서 이 방향만 배제에서 떼어낸다.
+
+    운영 근거(2026-09-21 14:19 KST, run c828a376 rank 2): merge group 이
+    ["심수봉", "심수봉 김다현 공개 저격", "심수봉 김다현 공개"] 였는데 display 는
+    "심수봉 김다현 공개" 로 나갔다. 기사 7건 중 6건이 이 사건을 "공개 저격"/"공개
+    비판" 으로 서술하는데도, 사건 서술어가 통째로 빠지고 그 수식어("공개", 이미
+    _GENERIC_EVENT_PREDICATE_WORDS 에 들어 있는 일반어)만 남았다. 사건어를 가진
+    후보는 그룹 안에 있었지만 `best in k` 가 "새 정보 없음"으로 분류해 버렸다.
+
+    적용 범위는 **기존 조건이 실제로 배제하던 pair 하나**로 못박는다. 판정에
+    `best in k`(원문 부분 문자열)를 그대로 다시 요구하므로, 기존 조건이 애초에
+    막지 않던 pair 의 동작은 이 함수와 무관하게 불변이다. 토큰 기준만 쓰면
+    _tokens 가 불용어를 버리는 탓에 범위가 샌다 — "류화영 오늘 결혼"의 토큰은
+    {류화영, 결혼}이라 "류화영 결혼 사업가"가 토큰상 superset 이 되지만, 실제로는
+    서로를 포함하지 않는 별개 표기라 조합하면 원문에 없던 "류화영 오늘 결혼 사업가"
+    가 만들어진다(14일 실측에서 이 한 건이 잡혔다).
+
+    실질 토큰 요건(잔여가 전부 일반어면 False): 이것까지 없으면 "류화영 결혼 사업가"
+    류에 "오늘" 같은 일반어만 더 붙는 조합이 생긴다. 잔여 판정은 새 어휘를 만들지
+    않고 기존 _is_generic_only_display 계약을 그대로 쓴다.
+    """
+    from news.summarizer import _tokens
+
+    if not best or not keyword or best not in keyword:
+        return False
+    best_toks = set(_tokens(best))
+    kw_toks = set(_tokens(keyword))
+    if not best_toks or not (best_toks < kw_toks):
+        return False
+    return not _is_generic_only_display(" ".join(sorted(kw_toks - best_toks)))
 
 
 def _representative_score(member: Dict, common_tokens: set, group_articles: List[Dict]) -> tuple:
@@ -1996,7 +2059,10 @@ def _build_display_keyword(members: List[Dict]) -> str:
 
     def _second_allowed(m: Dict) -> bool:
         k = m["keyword"]
-        if k in best or best in k:
+        # best 의 토큰을 전부 담고 실질 토큰을 더 얹는 후보는 "새 정보 없음"이 아니다
+        # (_second_completes_best) — 사건 서술어가 빠진 display 를 그 후보가 완성한다.
+        completes_best = _second_completes_best(best, k)
+        if (k in best or best in k) and not completes_best:
             return False
         # generic-only 후보(신임/임명 등)는 보완 표기로도 붙이지 않는다(hotfix 2026-07-03).
         if _is_generic_only_display(k):
@@ -2004,8 +2070,16 @@ def _build_display_keyword(members: List[Dict]) -> str:
         # 검색의도 suffix 후보(뜻/의미/누구 등)도 보완 표기로 붙이지 않는다(2026-07).
         if _ends_with_search_intent_suffix(k):
             return False
-        if not low_coverage_group and _keyword_coverage(m, group_articles) < DISPLAY_TOKEN_MIN_COVERAGE:
-            return False
+        if not low_coverage_group:
+            # 완결 후보는 best 와 **같은 사건을 더 길게 쓴** 표기라, 매체별 표기 변형
+            # (붙여쓰기 복합 "공개저격", 조사 결합)이 통짜 토큰 일치를 깨뜨려 coverage 가
+            # 부당하게 떨어진다. 임계(DISPLAY_TOKEN_MIN_COVERAGE)는 그대로 두고, display
+            # 경로가 이미 쓰는 표기 변형 계약으로만 다시 잰다.
+            coverage = _keyword_coverage(
+                m, group_articles, surface_variants=completes_best
+            )
+            if coverage < DISPLAY_TOKEN_MIN_COVERAGE:
+                return False
         return True
 
     best_word_toks = set(_tokens(best))
