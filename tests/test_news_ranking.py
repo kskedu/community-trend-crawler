@@ -3971,6 +3971,189 @@ class TestDisplayKeywordRepresentative(unittest.TestCase):
         self.assertEqual(out["keywords"][0]["movement"], "up")
 
 
+class TestEventCompleteDisplayCompletion(unittest.TestCase):
+    """merge group 안에 **display 보다 사건어를 더 담은 후보**가 있는데도 그 사건어가
+    빠지는 문제(2026-09-21 14:19 KST 운영 run c828a376 rank 2).
+
+    운영 관측: group 이 ["심수봉", "심수봉 김다현 공개 저격", "심수봉 김다현 공개"]
+    였는데 display 는 "심수봉 김다현 공개" 로 나갔다. 남은 "공개"는 그 자체로 사건이
+    아니라 "공개 저격"/"공개 비판"의 수식어였고(_GENERIC_EVENT_PREDICATE_WORDS 에도
+    이미 들어 있다), 정작 사건 서술어를 담은 후보는 `best in k`(= "새 정보 없음")로
+    분류돼 보완 후보에서 배제됐다.
+
+    아래 fixture 는 **운영 구조를 본뜬 synthetic** 이다(인명·매체 가공). 운영 run 의
+    수치 관계 — 사건어의 통짜 coverage 3/7=0.429, 붙여쓰기 복합("공개저격") 1건을
+    표기 변형으로 인정하면 4/7=0.571 — 를 그대로 재현하도록 구성했다.
+    """
+
+    def _rk(self, kw, score, articles, sources=None):
+        return {
+            "keyword": kw, "score": score,
+            "source_breakdown": {"news": score}, "rank_reason": "",
+            "news_meta": {"articles": articles}, "used_signals": ["news"],
+            "sources": sources if sources is not None else {"daum": 1},
+        }
+
+    def _rel(self, title, url, snippet=""):
+        a = _article(title, url, snippet)
+        a["relevance_reason"] = "keyword_main_topic"
+        return a
+
+    def _critique_articles(self):
+        # 7건 중 6건이 사건을 "공개 저격"/"공개 비판"으로 서술한다. 표기는 매체마다
+        # 갈린다: 띄어쓴 "공개 저격"(3건) · 조사 결합 "저격은"(1건) · 붙여쓴
+        # "공개저격"(1건) · 다른 서술어 "공개 비판"(2건).
+        return [
+            self._rel('한별, 18세 다온 공개 저격…"노래 몰라"', "https://c.com/1"),
+            self._rel("한별, 다온 공개 비판 논란", "https://c.com/2"),
+            self._rel("원로가수 한별, 후배 다온 공개 저격", "https://c.com/3"),
+            self._rel('"공개 저격은 잘못" 한별 다온 저격 논란', "https://c.com/4"),
+            self._rel('한별, 다온 향해 "인생 몰라"', "https://c.com/5"),
+            self._rel("가수 한별, 후배 다온 향해 공개 비판", "https://c.com/6"),
+            self._rel("한별, 다온에 공개저격 후폭풍", "https://c.com/7"),
+        ]
+
+    def test_event_predicate_member_completes_modifier_only_display(self):
+        # 대표(best)는 운영과 동일하게 "한별 다온 공개"가 된다(사건어를 담은 후보는
+        # 통짜 coverage 0.429 로 감점). 그 후보가 보완 표기로 붙어 사건어가 살아나야
+        # 한다. canonical(movement 기준)은 불변.
+        arts = self._critique_articles()
+        merged = ranker.dedupe_and_merge([
+            self._rk("한별", 0.78, arts),
+            self._rk("한별 다온 공개 저격", 0.71, arts),
+            self._rk("한별 다온 공개", 0.60, arts),
+        ])
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["keyword"], "한별")          # canonical 불변
+        self.assertEqual(merged[0]["display_keyword"], "한별 다온 공개 저격")
+
+    def test_completed_display_survives_top10_with_enough_articles(self):
+        # 보완 표기는 표시 기사 집합을 좁힌다 — 좁힌 결과가 하한 미만이면 후보가
+        # Top10 에서 통째로 빠져 underfill 이 된다. 완성된 display 로도 후보가 남고
+        # 표시 기사가 하한 이상인지 끝까지(build_ranked_issues) 확인한다.
+        arts = self._critique_articles()
+        merged = ranker.dedupe_and_merge([
+            self._rk("한별", 0.78, arts),
+            self._rk("한별 다온 공개 저격", 0.71, arts),
+            self._rk("한별 다온 공개", 0.60, arts),
+        ])
+        issues = build_ranked_issues(ranker.select_top(merged), {}, ["naver_news"])
+        self.assertEqual(len(issues["keywords"]), 1)
+        entry = issues["keywords"][0]
+        self.assertEqual(entry["keyword"], "한별")
+        self.assertEqual(entry["display_keyword"], "한별 다온 공개 저격")
+        self.assertGreaterEqual(len(entry.get("articles") or []), ranker.DISPLAY_ARTICLES_MIN)
+
+    def test_completion_member_must_be_a_superset_of_best(self):
+        # 계약의 축: 보완이 허용되는 것은 best 의 토큰을 **전부 담고 더 얹은** 후보뿐이다.
+        self.assertTrue(ranker._second_completes_best("한별 다온 공개", "한별 다온 공개 저격"))
+        # 반대 방향(짧은 후보)은 여전히 "새 정보 없음" — 붙이면 안 된다.
+        self.assertFalse(ranker._second_completes_best("한별 다온 공개 저격", "한별 다온 공개"))
+        # 원문이 서로를 포함하지 않으면 기존 조건이 애초에 막지 않던 pair 라 대상 아님.
+        # (_tokens 가 불용어 "오늘"을 버려 토큰상으로는 superset 이 되는 함정)
+        self.assertFalse(ranker._second_completes_best("류화영 오늘 결혼", "류화영 결혼 사업가"))
+        # 원문 포함만으로는 부족하다 — 토큰이 실제로 늘어야 한다. "공개"가 뒤 토큰과
+        # 붙어 다른 토큰("공개저격")이 되는 경우 잔여는 새 정보가 아니라 **복합어의
+        # 조각**이라, 붙이면 "한별 공개 공개저격"처럼 같은 말이 두 번 나온다.
+        self.assertFalse(ranker._second_completes_best("한별 공개", "한별 공개저격"))
+
+    def test_generic_only_residual_is_not_appended(self):
+        # 더 얹는 토큰이 전부 일반 서술어면 사용자에게 새 정보가 없다 → 붙이지 않는다.
+        self.assertFalse(ranker._second_completes_best("한별 다온", "한별 다온 발표"))
+
+    def test_disclosure_is_the_event_display_kept_intact(self):
+        # "공개"가 수식어가 아니라 **사건 자체**인 경우(명단 공개)에는 아무것도 붙지
+        # 않아야 한다. 그룹에 superset 후보("... 발표")가 있어 이 계약의 관문을 실제로
+        # 지나지만, 더 얹는 토큰이 일반 서술어뿐이라 배제된다.
+        arts = [
+            self._rel("국방부, 병역 명단 공개", "https://d.com/1"),
+            self._rel("국방부 병역 명단 공개 파장", "https://d.com/2"),
+            self._rel("병역 명단 공개에 국방부 해명", "https://d.com/3"),
+            self._rel("국방부, 병역 명단 공개 결정", "https://d.com/4"),
+        ]
+        members = [
+            self._rk("국방부 명단 공개", 0.8, arts),
+            self._rk("국방부 명단 공개 발표", 0.6, arts),
+        ]
+        # 관문에 실제로 도달하는지 고정(공허한 통과 방지).
+        self.assertFalse(
+            ranker._second_completes_best("국방부 명단 공개", "국방부 명단 공개 발표")
+        )
+        merged = ranker.dedupe_and_merge(members)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["display_keyword"], "국방부 명단 공개")
+
+    def test_completion_without_repeated_grounding_is_not_appended(self):
+        # 사건어를 담은 후보가 있어도 기사 근거가 얕으면(절반 미만) 붙이지 않는다.
+        # 임계(DISPLAY_TOKEN_MIN_COVERAGE)는 그대로다 — 표기 변형만 인정할 뿐이다.
+        arts = [
+            self._rel("한별, 18세 다온 공개 저격", "https://e.com/1"),
+            self._rel("한별, 다온 공개 언급", "https://e.com/2"),
+            self._rel("한별, 다온 공개 발언 논란", "https://e.com/3"),
+            self._rel("한별, 다온 공개 소감", "https://e.com/4"),
+            self._rel("한별, 다온 공개 심경", "https://e.com/5"),
+            self._rel("한별, 다온 공개 방송", "https://e.com/6"),
+        ]
+        merged = ranker.dedupe_and_merge([
+            self._rk("한별", 0.78, arts),
+            self._rk("한별 다온 공개 저격", 0.71, arts),
+            self._rk("한별 다온 공개", 0.60, arts),
+        ])
+        self.assertEqual(len(merged), 1)
+        self.assertNotIn("저격", merged[0]["display_keyword"])
+
+    def test_surface_variant_coverage_is_opt_in_only(self):
+        # _keyword_coverage 기본 판정은 불변이어야 한다(기존 호출부 보호). 붙여쓰기
+        # 복합 표기는 surface_variants=True 일 때만 근거로 센다.
+        arts = self._critique_articles()
+        ga = ranker._display_group_articles([self._rk("한별", 0.7, arts)])
+        member = self._rk("한별 다온 공개 저격", 0.7, arts)
+        self.assertLess(ranker._keyword_coverage(member, ga), ranker.DISPLAY_TOKEN_MIN_COVERAGE)
+        self.assertGreaterEqual(
+            ranker._keyword_coverage(member, ga, surface_variants=True),
+            ranker.DISPLAY_TOKEN_MIN_COVERAGE,
+        )
+
+    def test_surface_variant_coverage_does_not_leak_to_non_completion_pairs(self):
+        # 표기 변형 완화는 **완결 후보 판정에만** 적용돼야 한다. 여기서는 두 후보가
+        # 서로를 포함하지 않아(= 기존 조건이 애초에 막지 않던 pair) 완화 대상이 아니다.
+        # 완화가 새어 나가면 통짜 coverage 0.000 인 "연화영 결혼 사업가"가 보완 후보로
+        # 허용돼 원문에 없는 "연화영 오늘 결혼 사업가"가 만들어진다(2026-09-12 운영
+        # 구조를 본뜬 fixture — 기사 전부가 "사업가와"로만 써서 통짜 일치가 깨진다).
+        titles = [
+            "걸그룹 출신 연화영, 오늘 결혼…3세 연상 사업가와 백년가약",
+            "걸그룹 출신 연화영, 오늘 품절녀 합류…3세 연상 사업가와 화촉",
+            "걸그룹 출신 연화영, 오늘 결실… 3세 연상 사업가와 결혼",
+            "평범한 날들을 특별하게…걸그룹 출신 연화영, 오늘 백년가약",
+            "걸그룹 출신 연화영, 오늘 결혼… 예비 신랑은 비연예인",
+            "연화영, 3살 연상 사업가와 오늘 결혼…아빠 같은 남자",
+            "연화영, 걸그룹 떠난 지 14년…결혼으로 인생 2막",
+            "연화영, 오늘 3살 연상 사업가와 결혼…멋지게 입장해보겠다",
+        ]
+        arts = [self._rel(t, f"https://g.com/{i}") for i, t in enumerate(titles)]
+        member = self._rk("연화영 결혼 사업가", 0.91, arts)
+        ga = ranker._display_group_articles([member])
+        # 선행조건: 이 후보는 통짜로는 임계 미달이고 표기 변형을 인정하면 임계를 넘는다.
+        self.assertLess(ranker._keyword_coverage(member, ga), ranker.DISPLAY_TOKEN_MIN_COVERAGE)
+        self.assertGreaterEqual(
+            ranker._keyword_coverage(member, ga, surface_variants=True),
+            ranker.DISPLAY_TOKEN_MIN_COVERAGE,
+        )
+        merged = ranker.dedupe_and_merge([member, self._rk("연화영 오늘 결혼", 0.63, arts)])
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["display_keyword"], "연화영 결혼 사업가")
+
+    def test_singleton_display_passthrough_unchanged(self):
+        # merge 가 아예 없는 단독 후보는 이 경로를 타지 않는다(display = keyword).
+        arts = [
+            self._rel("한별 단독 콘서트 개최", "https://f.com/1"),
+            self._rel("한별 단독 콘서트 매진", "https://f.com/2"),
+        ]
+        merged = ranker.dedupe_and_merge([self._rk("한별 단독 콘서트", 0.8, arts)])
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["display_keyword"], "한별 단독 콘서트")
+
+
 class TestGenericSingletonGuard(unittest.TestCase):
     """generic singleton 방어(2026-07-03 운영 관찰: canonical=display="수사" 단독 노출).
 
