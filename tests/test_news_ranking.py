@@ -1140,6 +1140,12 @@ class TestSameIssueMerge(unittest.TestCase):
         ]
         A = self._ranked_with_articles("인물A 기업X 매수", 0.8, deal1)
         B = self._ranked_with_articles("기관C 자사주 처분", 0.7, deal2)
+        # 원래 방어(공유 DF 토큰이 '기업X' 하나뿐 → 임계 미달)를 직접 고정한다.
+        # _is_same_issue 는 앞단 교차 근거 가드에서도 막히므로, 단정이 그 가드에만
+        # 의존하면 DF 게이트가 조용히 미검증이 된다.
+        ev_a = ranker._evidence_articles_of(A)
+        ev_b = ranker._evidence_articles_of(B)
+        self.assertFalse(ranker._same_issue_evidence_signals(A, B, ev_a, ev_b))
         self.assertFalse(ranker._is_same_issue(A, B))
         self.assertEqual(len(ranker.dedupe_and_merge([A, B])), 2)
 
@@ -1631,8 +1637,9 @@ class TestSameIssueMerge(unittest.TestCase):
     def test_cross_evidence_guard_needs_only_one_side_corroborated(self):
         # 교차 근거는 **한쪽만** 복수여도 통과한다(max 규칙). 같은 사건이라도 주력
         # 키워드의 보도에는 부속 각도 이름이 한 번만 나오는 비대칭이 흔해서, 양쪽 모두
-        # (min 규칙) 요구하면 정상 pair 를 끊는다. roundup bridge 는 양쪽 다 1건이라
+        # 복수(min >= 2)를 요구하면 정상 pair 를 끊는다. roundup bridge 는 양쪽 다 1건이라
         # 이 완화로도 여전히 차단된다.
+        # 방향 조건(min >= 1)은 이 계약을 건드리지 않는다 — 약한 쪽이 1 이라 통과한다.
         big = self._ranked_with_articles("정몽규 경찰 조사", 0.9, [
             _article("정몽규 전 회장, 12시간 동안 경찰 조사받았다", "https://j.example.com/j1"),
             _article("조사 마친 정몽규…12시간 만에 귀가", "https://j.example.com/j2"),
@@ -1650,6 +1657,135 @@ class TestSameIssueMerge(unittest.TestCase):
         # max 규칙이므로 가드는 통과시킨다(min 규칙이면 여기서 끊긴다).
         self.assertTrue(
             ranker._has_multi_article_cross_evidence(big, small, ev_big, ev_small)
+        )
+
+    def test_one_directional_cross_evidence_does_not_bridge(self):
+        """한 방향 지지만 있는 pair 는 공유 근거가 없으면 merge 하지 않는다.
+
+        운영 재현(2026-09-21 12:19, run 917dd122): 청와대 대변인 임명 보도군은 같은 날
+        대통령 일정을 함께 언급하는 브리핑성 기사를 여러 건 갖는다. 그래서 상대 사건의
+        anchor 가 **내 기사 여러 건**에 등장해 support_a >= 2 가 되지만, 상대(농구) 보도는
+        청와대/대변인을 **단 한 번도** 언급하지 않아 support_b == 0 이다. max 규칙만으로는
+        이 한 방향 지지가 merge 를 성립시켰다.
+        """
+        briefing = self._ranked_with_articles("청와대 대변인 임명", 0.90, [
+            _article("靑 신임 대변인에 시사평론가 임명…\"겸허한 자세로 소통\"",
+                     "https://a.example.com/1"),
+            _article("청와대 대변인단 3인 체제 복원, 5개월 만에 공석 채워",
+                     "https://b.example.com/2"),
+            _article("대통령, 대변인 임명장 수여…남자농구 금메달 축하 메시지도",
+                     "https://c.example.com/3"),
+            _article("청와대 브리핑, 남자농구 금메달 격려와 순방 일정 함께 설명",
+                     "https://d.example.com/4"),
+        ])
+        basketball = self._ranked_with_articles("남자농구 금메달", 0.78, [
+            _article("남자농구, 결승서 일본 꺾고 금메달", "https://e.example.com/5"),
+            _article("남자농구 대표팀 금메달…12년 만의 정상", "https://f.example.com/6"),
+            _article("금메달 확정 순간, 남자농구 벤치가 코트로 쏟아졌다",
+                     "https://g.example.com/7"),
+            _article("남자농구 금메달 주역들의 소감", "https://h.example.com/8"),
+        ])
+        ev_b = ranker._evidence_articles_of(briefing)
+        ev_k = ranker._evidence_articles_of(basketball)
+        # 전제: 공유 근거가 전혀 없는 NO_SHARED 분기이고, 지지가 한 방향뿐이다.
+        shared_b, shared_k, _, _ = ranker._split_shared_evidence(ev_b, ev_k)
+        self.assertEqual((len(shared_b), len(shared_k)), (0, 0))
+        self.assertGreaterEqual(
+            ranker._cross_evidence_support(briefing, basketball, ev_b), 2
+        )
+        self.assertEqual(
+            ranker._cross_evidence_support(basketball, briefing, ev_k), 0
+        )
+        self.assertFalse(
+            ranker._has_multi_article_cross_evidence(briefing, basketball, ev_b, ev_k)
+        )
+        self.assertFalse(ranker._is_same_issue(briefing, basketball))
+        self.assertEqual(len(ranker.dedupe_and_merge([briefing, basketball])), 2)
+
+    def test_one_directional_bridge_does_not_collapse_transitive_chain(self):
+        """한 방향 bridge 가 transitive 연쇄로 component 를 키우지 못한다.
+
+        운영에서 무너진 모양 그대로다 — 브리핑 keyword 하나가 서로 무관한 사건들을
+        차례로 흡수해 gate 통과 다수가 한 그룹으로 접혔다. 각 사건은 자기 보도에서
+        브리핑 keyword 를 언급하지 않으므로 전부 분리된 채 남아야 한다.
+        """
+        briefing = self._ranked_with_articles("청와대 대변인 임명", 0.90, [
+            _article("靑 신임 대변인에 시사평론가 임명…소통 강화", "https://a.example.com/1"),
+            _article("청와대 대변인단 3인 체제 복원", "https://b.example.com/2"),
+            _article("대통령, 대변인 임명장 수여…남자농구 금메달 축하도",
+                     "https://c.example.com/3"),
+            _article("청와대 브리핑, 남자농구 금메달 격려·순방 일정·지지율 반등 질문 함께",
+                     "https://d.example.com/4"),
+            _article("대변인, 순방 일정 세부 조율 중이라고 설명", "https://n.example.com/14"),
+            _article("청와대, 지지율 반등 두고 \"국민 기대에 답할 것\"",
+                     "https://o.example.com/15"),
+        ])
+        basketball = self._ranked_with_articles("남자농구 금메달", 0.78, [
+            _article("남자농구, 결승서 일본 꺾고 금메달", "https://e.example.com/5"),
+            _article("남자농구 대표팀 금메달…12년 만의 정상", "https://f.example.com/6"),
+            _article("남자농구 금메달 주역들의 소감", "https://g.example.com/7"),
+        ])
+        tour = self._ranked_with_articles("순방 일정 확정", 0.70, [
+            _article("순방 일정 확정…경제사절단 동행 규모 공개", "https://h.example.com/8"),
+            _article("순방 일정, 현지 교민 간담회 포함", "https://i.example.com/9"),
+            _article("순방 일정 두고 야당 공방", "https://j.example.com/10"),
+        ])
+        approval = self._ranked_with_articles("지지율 반등", 0.65, [
+            _article("지지율 반등…전주 대비 3%p 올라", "https://k.example.com/11"),
+            _article("지지율 반등 배경에 추석 민생 대책", "https://l.example.com/12"),
+            _article("지지율 반등 조사, 표본 오차 범위 밖", "https://m.example.com/13"),
+        ])
+        merged = ranker.dedupe_and_merge([briefing, basketball, tour, approval])
+        self.assertEqual(len(merged), 4)
+        self.assertEqual([m["keyword"] for m in merged],
+                         ["청와대 대변인 임명", "남자농구 금메달", "순방 일정 확정", "지지율 반등"])
+
+    def test_bidirectional_cross_evidence_still_merges_at_zero_one_boundary(self):
+        """방향 조건의 경계 고정 — 약한 쪽이 **1건**이면 그대로 병합한다.
+
+        PR #33 이 SUBSET 분기에서 쓴 0 대 1 경계와 같다. 전건을 요구하면 매체별 표기
+        차이로 갈리는 진짜 중복까지 끊기므로, 요구치는 1 건이다.
+        """
+        big = self._ranked_with_articles("정몽규 경찰 조사", 0.9, [
+            _article("정몽규 전 회장, 12시간 동안 경찰 조사받았다", "https://j.example.com/j1"),
+            _article("조사 마친 정몽규…12시간 만에 귀가", "https://j.example.com/j2"),
+            _article("정몽규 조사에 홍명보 선임 의혹 광수대 수사", "https://j.example.com/j3"),
+        ])
+        small = self._ranked_with_articles("홍명보 선임 의혹", 0.8, [
+            _article("홍명보 선임 의혹, 정몽규 경찰 조사 12시간", "https://h.example.com/h1"),
+            _article("홍명보 감독 선임 개입 의혹 수사 확대…정몽규 조사",
+                     "https://h.example.com/h2"),
+        ])
+        ev_big = ranker._evidence_articles_of(big)
+        ev_small = ranker._evidence_articles_of(small)
+        self.assertEqual(ranker._cross_evidence_support(big, small, ev_big), 1)
+        self.assertEqual(ranker._cross_evidence_support(small, big, ev_small), 2)
+        self.assertTrue(
+            ranker._has_multi_article_cross_evidence(big, small, ev_big, ev_small)
+        )
+
+    def test_direction_guard_skipped_when_one_side_has_no_anchor(self):
+        """한쪽 anchor 가 비면 방향을 관측할 수 없다 — 기존 max 규칙을 유지한다.
+
+        관측 불가를 0 으로 접으면 근거 없이 merge 를 막게 된다(_cross_evidence_support
+        의 None 계약). 이 fail-open 은 방향 조건 도입 전후로 동일하다.
+        """
+        generic = self._ranked_with_articles("신임", 0.9, [
+            _article("신임 사무총장 내부 인사 발탁, 조직 개편 예고",
+                     "https://a.example.com/1"),
+            _article("신임 사무총장 임명 뒤 첫 간부회의", "https://b.example.com/2"),
+        ])
+        named = self._ranked_with_articles("한국증권 사무총장", 0.8, [
+            _article("한국증권 사무총장 신임 인사 발표", "https://c.example.com/3"),
+            _article("한국증권 사무총장 교체, 조직 개편 함께", "https://d.example.com/4"),
+        ])
+        ev_g = ranker._evidence_articles_of(generic)
+        ev_n = ranker._evidence_articles_of(named)
+        # 전제: generic 쪽 anchor 가 비어 한 방향만 관측된다.
+        self.assertIsNone(ranker._cross_evidence_support(named, generic, ev_n))
+        self.assertIsNotNone(ranker._cross_evidence_support(generic, named, ev_g))
+        self.assertTrue(
+            ranker._has_multi_article_cross_evidence(generic, named, ev_g, ev_n)
         )
 
     def test_sparse_same_event_split_is_the_accepted_tradeoff(self):
@@ -2600,7 +2736,7 @@ class TestSameIssueMerge(unittest.TestCase):
 
     def test_broad_location_alone_does_not_bridge_unrelated_events(self):
         """넓은 지명 하나 + filler 만 공통이면 서로 다른 사건은 merge 되지 않는다."""
-        a = self._ranked_with_articles("행사A 개막", 0.9, [
+        a = self._ranked_with_articles("서울 행사A 개막", 0.9, [
             _article("행사A 서울에서 개막", "https://a.example.com/1", "5일 오후 서울 행사A가 열렸다"),
             _article("서울 행사A 인파", "https://a.example.com/2", "5일 오후 서울 행사A에 인파가 몰렸다"),
             _article("행사A 안전 대책", "https://a.example.com/3", "5일 오후 서울 행사A 대책이 나왔다"),
@@ -2621,6 +2757,11 @@ class TestSameIssueMerge(unittest.TestCase):
         # 격리: Jaccard 경로가 아니라 DF/anchor 경로여야 한다.
         self.assertLess(ranker._pairwise_evidence_overlap(ev_a, ev_b),
                         ranker.MERGE_ARTICLE_OVERLAP_THRESHOLD)
+        # 격리: 교차 근거 가드(강도·방향)는 통과해야 한다 — 그래야 판정이 지명 규칙에서
+        # 갈린다. 여기서 막히면 _BROAD_LOCATION_TOKENS 를 지워도 테스트가 통과해버린다.
+        self.assertTrue(
+            ranker._has_multi_article_cross_evidence(a, b, ev_a, ev_b)
+        )
         self.assertFalse(ranker._is_same_issue(a, b))
         self.assertEqual(len(ranker.dedupe_and_merge([a, b])), 2)
 

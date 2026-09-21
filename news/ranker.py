@@ -1215,6 +1215,14 @@ def _corroborated_by_independent_reports(
 # 0.000~0.077 로 이 조건과 무관하고, 실제 동일 이슈 pair 는 2/2·2/3 로 통과한다.
 _MERGE_MIN_CROSS_EVIDENCE_ARTICLES = 2
 
+# 교차 근거가 **양방향**임을 확인할 최소 지지 기사 수. 한쪽이 복수 기사로 상대 사건을
+# 다뤄도, 상대 보도가 이쪽 사건을 **단 한 번도** 언급하지 않으면 같은 사건의 양방향
+# 보도가 아니라 한쪽이 여러 사건을 나열/브리핑한 것이다. PR #33 이 SUBSET 분기에서
+# 쓴 것과 같은 **0 대 1 경계**다(_distinguishing_anchor_attested: "서로 다른 사건이면
+# 고유 anchor 가 0건 등장한다"). 전건이 아니라 1건만 요구하므로 매체별 표기 차이로
+# 갈리는 진짜 중복은 그대로 통과한다.
+_MERGE_MIN_CROSS_EVIDENCE_ATTESTATION = 1
+
 
 def _cross_evidence_support(item_self: Dict, item_other: Dict, articles: List[Dict]):
     """상대 keyword 의 merge anchor 가 등장하는 내 근거 기사 수. anchor 가 없으면 None.
@@ -1236,13 +1244,19 @@ def _cross_evidence_support(item_self: Dict, item_other: Dict, articles: List[Di
 def _has_multi_article_cross_evidence(
     item_a: Dict, item_b: Dict, ev_a: List[Dict], ev_b: List[Dict]
 ) -> bool:
-    """양쪽 모두 단 1건의 기사로만 교차 연결되는(=roundup bridge 의심) pair 인지 판정.
+    """교차 근거가 roundup/브리핑 bridge 가 아닌지 판정한다(두 조건).
 
-    참이면 교차 근거가 충분하다는 뜻이라 기존 판정을 그대로 살린다. 거짓이면 양쪽 다
-    지지 기사가 1건 이하 — 서로 다른 사건을 나열한 기사 한 건이 유일한 접점이므로
-    merge 하지 않는다. 근거가 원래 1건뿐인 keyword(singleton)는 이 조건을 만족시킬
-    수 없으므로 판정 대상에서 제외한다(기존 동작 보존 — 여기서 막으면 정상 소규모
-    이슈까지 못 붙는다).
+    1. **강도**: 한쪽 이상이 복수 기사(>= _MERGE_MIN_CROSS_EVIDENCE_ARTICLES)로 상대
+       사건을 지지해야 한다. 양쪽 다 1건 이하면 서로 다른 사건을 나열한 기사 한 건이
+       유일한 접점이므로 merge 하지 않는다.
+    2. **방향**: 양쪽 지지를 모두 관측할 수 있으면 약한 쪽도 최소
+       _MERGE_MIN_CROSS_EVIDENCE_ATTESTATION 건은 상대 사건을 언급해야 한다. 한 방향
+       지지만으로 merge 하면, 여러 사건을 함께 언급하는 브리핑/나열 보도를 다수 가진
+       keyword 가 자기 쪽 지지만으로 무관한 사건을 끌어온다(2026-09-21 운영 붕괴).
+       한쪽 anchor 가 비어 방향을 물을 수 없으면 기존 max 규칙 그대로 둔다.
+
+    근거가 원래 1건뿐인 keyword(singleton)는 조건 1을 원리상 만족시킬 수 없으므로
+    판정 대상에서 제외한다(기존 동작 보존 — 여기서 막으면 정상 소규모 이슈까지 못 붙는다).
 
     **의도적 fail-closed trade-off(known risk).** 진짜 같은 사건이라도 양쪽 근거가
     2건뿐이고 접점이 1:1 이면 분리될 수 있다. 두 방향의 비용이 대칭이 아니라서 이쪽을
@@ -1254,6 +1268,16 @@ def _has_multi_article_cross_evidence(
     를 낮추지 말 것** — 그건 06:48 붕괴를 그대로 되돌린다. 대신 near-dup 탐지(공유 근거
     승격) 쪽을 개선해 가드를 우회하지 않고 정상 경로로 merge 시켜야 한다.
     회귀 고정: tests/test_news_ranking.py::test_sparse_same_event_split_is_the_accepted_tradeoff
+
+    조건 2 는 조건 1 의 완화가 아니라 **추가 제약**이다. 비대칭 지지(1 대 2)는 그대로
+    통과하므로 `test_cross_evidence_guard_needs_only_one_side_corroborated` 계약은
+    유지된다 — 끊기는 것은 약한 쪽이 **0 건**인 경우뿐이다.
+
+    **조건 2 의 known risk.** `_tokens` 에 형태소 분석이 없어 표기가 다르면 같은 대상도
+    다른 토큰이다(`홍수`≠`대홍수`, `이재명`≠`李대통령`). 그래서 진짜 같은 사건인데 한쪽
+    보도가 상대 anchor 를 **다른 표기로만** 쓰면 0 건으로 관측돼 분리될 수 있다. 이 위험이
+    운영에서 관측되면 임계(1)를 0 으로 되돌리지 말고 **표기 변형을 흡수하는 매칭**을
+    먼저 넣을 것 — 임계를 되돌리면 2026-09-21 붕괴가 그대로 재발한다.
     """
     if len(ev_a) < _MERGE_MIN_CROSS_EVIDENCE_ARTICLES or len(ev_b) < _MERGE_MIN_CROSS_EVIDENCE_ARTICLES:
         return True
@@ -1263,7 +1287,17 @@ def _has_multi_article_cross_evidence(
     if not observed:
         # 양쪽 다 anchor 가 비어 신호를 관측할 수 없다 — 기존 판정에 맡긴다(fail-open).
         return True
-    return max(observed) >= _MERGE_MIN_CROSS_EVIDENCE_ARTICLES
+    if max(observed) < _MERGE_MIN_CROSS_EVIDENCE_ARTICLES:
+        return False
+    if len(observed) < 2:
+        # 한쪽만 관측 가능하면 방향성을 물을 수 없다 — 기존 max 규칙 그대로(fail-open).
+        return True
+    # 양쪽 다 관측 가능하면 **약한 쪽도 최소 1건**은 상대 사건을 실제로 언급해야 한다.
+    # max 규칙만 쓰면 한 방향 지지만으로 merge 가 성립해, 여러 사건을 함께 언급하는
+    # 브리핑/나열 보도를 다수 가진 keyword 가 자기 쪽 지지만으로 무관한 사건을 끌어온다
+    # (2026-09-21 12:19 운영 run 917dd122: gate 통과 28개가 merge 후 10개로 붕괴,
+    # 한 component 14개에 농구·순방·지지율·걸그룹 재결합이 함께 접혔다).
+    return min(observed) >= _MERGE_MIN_CROSS_EVIDENCE_ATTESTATION
 
 
 # roundup bridge 로 의심할 기사쌍 유사도의 상한(미만). 이 값 이상이면 "부분적으로 겹치는
