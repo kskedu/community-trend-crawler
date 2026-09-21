@@ -1662,11 +1662,20 @@ class TestSameIssueMerge(unittest.TestCase):
     def test_one_directional_cross_evidence_does_not_bridge(self):
         """한 방향 지지만 있는 pair 는 공유 근거가 없으면 merge 하지 않는다.
 
-        운영 재현(2026-09-21 12:19, run 917dd122): 청와대 대변인 임명 보도군은 같은 날
-        대통령 일정을 함께 언급하는 브리핑성 기사를 여러 건 갖는다. 그래서 상대 사건의
-        anchor 가 **내 기사 여러 건**에 등장해 support_a >= 2 가 되지만, 상대(농구) 보도는
-        청와대/대변인을 **단 한 번도** 언급하지 않아 support_b == 0 이다. max 규칙만으로는
-        이 한 방향 지지가 merge 를 성립시켰다.
+        **운영 패턴을 본뜬 synthetic regression fixture 다.** 2026-09-21 12:19 KST
+        (run 917dd122) 에서 관측된 붕괴의 *형태* — 여러 사건을 함께 언급하는 브리핑성
+        보도를 다수 가진 keyword 가 무관한 사건을 끌어오는 구조 — 를 재구성한 것이고,
+        그 run 의 특정 edge 를 byte/metric 단위로 재현한 것이 **아니다**.
+
+        아래 fixture 의 support_a >= 2 / support_b == 0 은 이 **구조적 결함을 검증하기
+        위해 구성한 테스트 조건**이지 대상 run 의 실측값이 아니다. 그 run 에서 확정된
+        것은 "거대 component 의 최초 false edge 가 NO_SHARED 분기였다"까지이고, 상대
+        keyword 와 실제 support 값은 흡수된 후보의 근거 기사(loser evidence)가 진단에
+        보존되지 않아 **복원 불가**다.
+
+        검증 대상 계약: 공유 근거가 0 인 pair 에서 지지가 한 방향뿐이면(강한 쪽 2+,
+        약한 쪽 0) merge 하지 않는다. max 규칙만으로는 이 한 방향 지지가 merge 를
+        성립시켰다.
         """
         briefing = self._ranked_with_articles("청와대 대변인 임명", 0.90, [
             _article("靑 신임 대변인에 시사평론가 임명…\"겸허한 자세로 소통\"",
