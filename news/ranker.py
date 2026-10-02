@@ -2133,12 +2133,25 @@ def _build_display_keyword(members: List[Dict]) -> str:
     #    같은 엔티티의 조사 결합 표기다. 이를 residual로 취급하면 "한은서 윤종훈 결혼
     #    연하 한은서와"처럼 같은 이름이 두 번 나오는 display가 만들어진다. 판정 기준은
     #    _word_contains_token(기존 조사/alias/복합 계약)으로, 새 규칙을 만들지 않는다.
+    #    비교 대상 base 는 best 의 **어절**이다(2026-10-02): _tokens 는 정규식
+    #    [가-힣A-Za-z0-9]{2,} 라 1글자 엔티티("탑", "미")를 아예 버린다. base 를
+    #    _tokens(best) 로만 잡으면 best="탑 나나 열애" 의 "탑" 이 비교 집합에 없어
+    #    second 의 조사 결합형 "탑과"가 "새 정보"로 통과하고, 같은 엔티티가 두 번 나오는
+    #    "탑 나나 열애 탑과"가 만들어진다(운영 2026-10-02 12:48 rank 1). 어절만으로
+    #    바꾸지 않고 **합집합**을 쓰는 이유: best.split() 은 구두점을 떼지 않아
+    #    ("탑·나나") _tokens 가 뽑는 base("나나")를 잃을 수 있고, 그러면 기존 되풀이
+    #    판정이 거꾸로 약해진다. 합집합은 _tokens 결과의 상위집합이고 추가분은 1글자
+    #    어절·구두점 포함 어절뿐이라, 기존 판정은 그대로 유지된다. 비교 집합만 넓히고
+    #    판정 규칙 자체는 여전히 _word_contains_token 하나뿐이다(새 어휘 규칙 없음).
+    #    되풀이 판정은 **배제** 필터라 base 를 더해도 잔여 토큰이 새로 생기지는 않는다.
     best_word_set = set(_tokens(best))
+    best_surface_words = best_word_set | {w for w in best.split() if w}
 
     def _is_repeat_of_best(tok: str) -> bool:
         return any(
-            _word_contains_token(tok, b, best_word_set) or _word_contains_token(b, tok, best_word_set)
-            for b in best_word_set
+            _word_contains_token(tok, b, best_surface_words)
+            or _word_contains_token(b, tok, best_surface_words)
+            for b in best_surface_words
         )
 
     residual = [t for t in _tokens(second) if not _is_repeat_of_best(t)]

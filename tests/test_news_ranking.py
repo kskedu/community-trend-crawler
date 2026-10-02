@@ -4154,6 +4154,152 @@ class TestEventCompleteDisplayCompletion(unittest.TestCase):
         self.assertEqual(merged[0]["display_keyword"], "한별 단독 콘서트")
 
 
+class TestOneCharEntityJosaRepeat(unittest.TestCase):
+    """1글자 엔티티의 조사 결합형이 display 말미에 되풀이되는 문제
+    (2026-10-02 12:48 KST 운영 run 884e5b9f rank 1).
+
+    운영 관측: canonical "탑 나나 열애"(정상)에 second 후보 "나나 탑과"의 잔여 토큰
+    "탑과"가 붙어 display 가 "탑 나나 열애 탑과"로 나갔다. "탑과"는 새 정보가 아니라
+    이미 display 앞머리에 있는 엔티티 "탑"의 조사 결합 표기다.
+
+    2026-09-08 의 되풀이 판정 계약(_word_contains_token 으로 조사 결합 변이까지
+    되풀이로 본다)은 옳았지만, 비교 대상 base 를 summarizer._tokens 로 뽑은 탓에
+    정규식 ``[가-힣A-Za-z0-9]{2,}`` 에 걸려 **1글자 엔티티가 비교 집합에서 통째로
+    빠져** 있었다. 그래서 "탑"을 모르는 상태로 "탑과"를 판정해 통과시켰다.
+
+    아래 fixture 는 **운영 구조를 본뜬 synthetic** 이다 — 조사 결합형 "탑과"가
+    기사 과반(3/4)에 등장해 coverage 게이트를 통과하고 실제로 되풀이 판정까지
+    도달하는 운영 분포를 재현한다.
+    """
+
+    def _rk(self, kw, score, articles, sources=None):
+        return {
+            "keyword": kw, "score": score,
+            "source_breakdown": {"news": score}, "rank_reason": "",
+            "news_meta": {"articles": articles}, "used_signals": ["news"],
+            "sources": sources if sources is not None else {"daum": 1},
+        }
+
+    def _rel(self, title, url, snippet=""):
+        a = _article(title, url, snippet)
+        a["relevance_reason"] = "keyword_main_topic"
+        return a
+
+    def _romance_articles(self):
+        # 4건 중 3건이 엔티티를 조사 결합형 "탑과"로 쓴다(운영과 같은 분포).
+        return [
+            self._rel("나나, 탑과 열애 인정 심경", "https://a.com/1"),
+            self._rel("나나, 탑과 열애 공식 인정", "https://b.com/2"),
+            self._rel("나나 탑과 열애 인정 후 첫 심경", "https://c.com/3"),
+            self._rel("탑 나나 열애 인정", "https://d.com/4"),
+        ]
+
+    def test_one_char_entity_josa_not_appended(self):
+        arts = self._romance_articles()
+        best = self._rk("탑 나나 열애", 0.90, arts)
+        second = self._rk("나나 탑과", 0.89, arts)
+        # 전제: second 는 coverage 게이트를 통과해 실제로 되풀이 판정까지 도달한다
+        # (도달 못 하면 이 테스트가 공허해진다).
+        group_articles = ranker._display_group_articles([best, second])
+        self.assertGreaterEqual(
+            ranker._keyword_coverage(second, group_articles),
+            ranker.DISPLAY_TOKEN_MIN_COVERAGE,
+        )
+        merged = ranker.dedupe_and_merge([best, second])
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["display_keyword"], "탑 나나 열애")
+        # canonical 은 display-only 수정이라 그대로다.
+        self.assertEqual(merged[0]["keyword"], "탑 나나 열애")
+
+    def test_same_entity_never_appears_twice_in_display(self):
+        arts = self._romance_articles()
+        merged = ranker.dedupe_and_merge(
+            [self._rk("탑 나나 열애", 0.90, arts), self._rk("나나 탑과", 0.89, arts)]
+        )
+        display = merged[0]["display_keyword"]
+        words = display.split()
+        # "탑"과 "탑과"가 한 display 안에 같이 나오면 같은 말이 두 번 나온 것이다.
+        bases = [w[:-1] for w in words if len(w) >= 2 and w[-1] in ranker._ONE_CHAR_JOSA_EOMI]
+        for base in bases:
+            self.assertNotIn(base, words, f"{display!r}: base+조사형 중복")
+
+    def test_relation_expression_preserved(self):
+        # "A와 B" 같은 **관계 표현**은 되풀이가 아니다 — base 가 best 에 없으므로
+        # 그대로 보완 표기로 남아야 한다(과확장 방지).
+        arts = [
+            self._rel("한국, 일본과 정상회담 개최", "https://a.com/1"),
+            self._rel("한국 일본과 정상회담 합의", "https://b.com/2"),
+            self._rel("한국 일본과 정상회담 일정 확정", "https://c.com/3"),
+        ]
+        best = self._rk("한국 정상회담", 0.90, arts)
+        second = self._rk("일본과 정상회담", 0.89, arts)
+        merged = ranker.dedupe_and_merge([best, second])
+        self.assertEqual(len(merged), 1)
+        # "일본과"는 best 에 base "일본"이 없으니 새 정보다 → 보존.
+        self.assertIn("일본과", merged[0]["display_keyword"])
+
+    def test_multi_char_entity_josa_repeat_still_blocked(self):
+        # 2026-09-08 계약(다글자 엔티티의 조사 결합형)은 그대로 유지된다.
+        arts = [
+            self._rel("한은서 윤종훈 결혼 발표", "https://a.com/1"),
+            self._rel("윤종훈 연하 한은서와 결혼", "https://b.com/2"),
+            self._rel("한은서와 윤종훈 결혼식", "https://c.com/3"),
+        ]
+        merged = ranker.dedupe_and_merge(
+            [self._rk("한은서 윤종훈 결혼", 0.90, arts), self._rk("윤종훈 한은서와", 0.89, arts)]
+        )
+        self.assertEqual(len(merged), 1)
+        self.assertNotIn("한은서와", merged[0]["display_keyword"])
+
+    def test_complete_event_candidate_still_wins(self):
+        # 사건어를 더 담은 완결 후보(PR #49 계약)는 이 수정에 영향받지 않는다.
+        self.assertTrue(ranker._second_completes_best("한별 다온 공개", "한별 다온 공개 저격"))
+
+    def test_one_char_word_does_not_absorb_unrelated_token(self):
+        # 1글자 어절이 비교 집합에 들어가도, 조사 결합 관계가 아닌 토큰은 흡수하지
+        # 않는다("내" 가 "내년"을 삼키면 안 된다).
+        self.assertFalse(
+            ranker._word_contains_token("내년", "내", {"내", "연애", "남은"})
+        )
+        self.assertTrue(
+            ranker._word_contains_token("탑과", "탑", {"탑", "나나", "열애"})
+        )
+
+    def test_punctuated_best_still_keeps_tokenized_base(self):
+        # 비교 집합은 어절만으로 바꿔선 안 되고 _tokens 결과와의 **합집합**이어야
+        # 한다: best.split() 은 구두점을 떼지 않으므로 best="탑·나나 열애" 에서
+        # _tokens 가 뽑는 base "나나"를 잃고, second 의 "나나"가 새 정보로 통과해
+        # "탑·나나 열애 나나 소속사"처럼 같은 이름이 두 번 나온다.
+        arts = [
+            self._rel("탑·나나 열애 인정, 나나 소속사 공식 입장", "https://a.com/1"),
+            self._rel("탑·나나 열애 나나 소속사 입장 발표", "https://b.com/2"),
+            self._rel("나나 소속사 탑·나나 열애 인정", "https://c.com/3"),
+            self._rel("탑·나나 열애 인정 나나 소속사 확인", "https://d.com/4"),
+        ]
+        best = self._rk("탑·나나 열애", 0.90, arts)
+        second = self._rk("나나 소속사", 0.89, arts)
+        # 전제: second 가 coverage 게이트를 통과해 되풀이 판정까지 도달한다.
+        group_articles = ranker._display_group_articles([best, second])
+        self.assertGreaterEqual(
+            ranker._keyword_coverage(second, group_articles),
+            ranker.DISPLAY_TOKEN_MIN_COVERAGE,
+        )
+        display = ranker._build_display_keyword([best, second])
+        # "나나"는 best 의 "탑·나나" 안에 이미 있으므로 되풀이다 → 한 번만 나온다.
+        self.assertEqual(display.split().count("나나"), 0, display)
+        self.assertEqual(display, "탑·나나 열애 소속사")
+
+    def test_singleton_display_passthrough_unchanged(self):
+        # merge 가 아예 없는 단독 후보는 이 경로를 타지 않는다(display = keyword).
+        arts = [
+            self._rel("한별 단독 콘서트 개최", "https://f.com/1"),
+            self._rel("한별 단독 콘서트 매진", "https://f.com/2"),
+        ]
+        merged = ranker.dedupe_and_merge([self._rk("한별 단독 콘서트", 0.8, arts)])
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["display_keyword"], "한별 단독 콘서트")
+
+
 class TestGenericSingletonGuard(unittest.TestCase):
     """generic singleton 방어(2026-07-03 운영 관찰: canonical=display="수사" 단독 노출).
 
