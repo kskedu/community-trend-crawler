@@ -1,0 +1,4 @@
+# 테스트 전용 의존성. 운영 workflow(crawl.yml 등)는 requirements.txt 만 설치한다.
+# 설치: pip install -r requirements-dev.txt
+-r requirements.txt
+PyYAML==6.0.3

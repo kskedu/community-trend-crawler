@@ -14,7 +14,7 @@ curl / gh 가 fixture 응답을 돌려주고 호출 인자만 기록한다.
 - Telegram 알림 조건(down 또는 force_alert)과 KST 표기 유지
 - schedule(매시 23분)·workflow_dispatch(force_alert) 트리거 유지
 
-PyYAML 이 필요하다(.venv 에 설치돼 있음).
+PyYAML 이 필요하다: pip install -r requirements-dev.txt (운영 requirements.txt 에는 넣지 않는다).
 """
 import json
 import os
