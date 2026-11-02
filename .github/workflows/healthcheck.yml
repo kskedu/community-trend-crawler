@@ -30,7 +30,9 @@ jobs:
           # 최신 저장 시각은 collected_at 으로 본다. upsert_posts() 가 매 upsert 에 UTC now 를
           # 명시 주입하는 컬럼이고, 기존 idx_community_posts_collected_at(collected_at DESC)
           # 인덱스로 LIMIT 1 이 끝난다(created_at 은 인덱스가 없어 전체 스캔+정렬).
-          RES=$(curl -s "${SUPABASE_URL}/rest/v1/community_posts?select=collected_at&order=collected_at.desc&limit=1" \
+          # DESC 는 NULLS FIRST 라 NULL 행이 있으면 최신값을 가린다 → not.is.null 로 제외한다
+          # (IS NOT NULL 은 같은 인덱스의 조건으로 처리돼 인덱스 사용이 유지된다).
+          RES=$(curl -s "${SUPABASE_URL}/rest/v1/community_posts?select=collected_at&collected_at=not.is.null&order=collected_at.desc&limit=1" \
             -H "apikey: ${SUPABASE_KEY}" \
             -H "Authorization: Bearer ${SUPABASE_KEY}")
           echo "Response: $RES"
@@ -49,6 +51,14 @@ jobs:
           print(int((now - last).total_seconds() // 60))
           ")
           echo "마지막 수집: $LAST_AT (${ELAPSED_MIN}분 전)"
+
+          # 미래 시각 방어: collected_at 은 크롤러 runner 의 UTC 시계로 기록되고 이 runner 시계와
+          # 비교한다. 두 시계 모두 NTP 동기라 정상 오차는 초 단위이므로 5분을 허용 한계로 둔다.
+          # 그보다 미래면 시계·데이터 이상이므로 ok 로 판정하지 않고 실패시킨다(장애 은폐 방지).
+          if [ "$ELAPSED_MIN" -lt -5 ]; then
+            echo "❌ 최신 collected_at 이 현재보다 ${ELAPSED_MIN#-}분 미래 — 판정 불가, fail"
+            exit 1
+          fi
           echo "elapsed_min=$ELAPSED_MIN" >> $GITHUB_OUTPUT
           echo "last_at=$LAST_AT" >> $GITHUB_OUTPUT
 

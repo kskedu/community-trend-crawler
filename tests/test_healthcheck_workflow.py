@@ -6,6 +6,7 @@ curl / gh 가 fixture 응답을 돌려주고 호출 인자만 기록한다.
 
 검증 항목:
 - 최신 수집 시각 조회가 collected_at 기존 인덱스(collected_at DESC)를 타는 형태인지
+- NULL 행을 not.is.null 로 제외하는지, 5분 넘게 미래인 최신값을 ok 로 두지 않고 실패시키는지
 - ok / stale / down 분류와 120·240분 경계
 - 게시물 0건 · NULL · 키 누락 · 형식 오류 · tz 없는 값 · 오류 응답 → step 실패(출력 없음)
 - UTC(Z / +00:00) 와 KST(+09:00) 표기가 같은 경과 시간으로 판정되는지
@@ -139,6 +140,14 @@ class _Sandbox:
         self.tmp.cleanup()
 
 
+def _ahead(seconds, fmt="utc"):
+    """현재로부터 seconds 초 뒤(미래) 시각."""
+    t = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+    if fmt == "kst":
+        return t.astimezone(timezone(timedelta(hours=9))).isoformat()
+    return t.isoformat()
+
+
 def _ago(minutes, fmt="z"):
     """현재로부터 minutes 분 30초 전(분 경계에서 떨어뜨려 실행 지연에 견고)."""
     t = datetime.now(timezone.utc) - timedelta(minutes=minutes, seconds=30)
@@ -171,7 +180,8 @@ class TestCheckStep(_Base):
         self.assertEqual(r.returncode, 0, r.stderr)
         log = self.sb.read(self.sb.curl_log)
         self.assertIn(
-            "https://fake.invalid/rest/v1/community_posts?select=collected_at&order=collected_at.desc&limit=1",
+            "https://fake.invalid/rest/v1/community_posts"
+            "?select=collected_at&collected_at=not.is.null&order=collected_at.desc&limit=1",
             log,
         )
         self.assertNotIn("created_at", log)
@@ -233,6 +243,25 @@ class TestCheckStep(_Base):
         self.assertEqual(results["z"], ("130", "stale"))
         self.assertEqual(results["utc"], results["z"])
         self.assertEqual(results["kst"], results["z"])
+
+    def test_small_future_skew_is_tolerated(self):
+        # 4분 30초 미래 = 허용 한계(5분) 안 → 시계 오차로 보고 ok
+        r = self._check(self._row(_ahead(270)))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.sb.outputs()["status"], "ok")
+
+    def test_future_beyond_tolerance_fails_without_outputs(self):
+        for name, value in (("utc_6m", _ahead(360)), ("kst_6m", _ahead(360, "kst")),
+                            ("naive_kst_as_utc_9h", _ahead(9 * 3600))):
+            with self.subTest(case=name):
+                sb = _Sandbox()
+                try:
+                    r = sb.run(CHECK["run"], body=self._row(value))
+                    self.assertNotEqual(r.returncode, 0, f"{name} 가 성공 처리됨: {r.stdout}")
+                    self.assertEqual(sb.outputs(), {})
+                    self.assertIn("미래", r.stdout)
+                finally:
+                    sb.close()
 
     def test_bad_responses_fail_without_outputs(self):
         cases = {
