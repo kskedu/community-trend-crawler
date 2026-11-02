@@ -30,7 +30,7 @@ cron-job.org 와 동일 :17/:47·동일 모드로 **이중 트리거**되어 new
   - **Body 계약(중요)**: **`:17` 호출 → `{"ref":"main","inputs":{"mode":"full"}}` / `:47` 호출 → `{"ref":"main","inputs":{"mode":"news_top_only"}}`**.
     - crawl.yml 은 `inputs.mode` 로만 모드를 판정한다(schedule 제거로 `github.event.schedule` 분기 소멸). mode 를 생략(`{"ref":"main"}`)하면 crawl.yml 이 안전하게 `full` 로 정규화하지만, 그러면 :47 의 news_top_only 갱신 cadence 가 사라지므로 **두 job 이 각각 올바른 mode 를 전달해야 한다.**
     - ⚠️ cron-job.org 실제 설정은 이 저장소로 확인할 수 없다 → 아래 "외부 확인 게이트" 참조.
-- **보조 실행원 = healthcheck.yml (stale 복구 전용)**: 매시 :23, `community_posts` stale(≥120m)/down 시에만 crawl.yml 을 workflow_dispatch. **dispatch 전 crawl.yml 의 queued/in_progress run 을 확인**해 이미 실행 중이면 생략한다(중복 완화, check-then-act·비원자적). run 조회 실패 시 **fail-closed**(dispatch 생략). 텔레그램 알림 유지.
+- **보조 실행원 = healthcheck.yml (stale 복구 전용)**: 매시 :23, `community_posts` 의 최신 `collected_at`(기존 `idx_community_posts_collected_at` 인덱스로 LIMIT 1 조회 — `created_at` 은 인덱스가 없어 전체 스캔+정렬이 됐다. `collected_at=not.is.null` 로 NULL 행을 제외하고, 최신값이 runner 시각보다 5분 넘게 미래면 판정하지 않고 step 을 실패시킨다) 기준 stale(≥120m)/down 시에만 crawl.yml 을 workflow_dispatch. **dispatch 전 crawl.yml 의 queued/in_progress run 을 확인**해 이미 실행 중이면 생략한다(중복 완화, check-then-act·비원자적). run 조회 실패 시 **fail-closed**(dispatch 생략). 텔레그램 알림 유지.
 - **수동 실행 = 비상·검증 전용**: crawl.yml workflow_dispatch(UI 또는 `gh workflow run`, mode 선택, default full).
 
 ### 장애 시 복구 절차
@@ -144,7 +144,7 @@ community-trend-crawler/
 | views | integer | 조회 수 |
 | score | double precision | 계산된 인기 점수 (processor/scorer.py) |
 | img_hash | text | 이미지 해시 (중복 판별용) |
-| created_at | timestamptz | DB insert 시각 |
+| created_at | timestamptz | 스크래퍼의 수집 시각(`datetime.now()`, tz 없음). upsert 마다 덮어써져 최초 insert 시각이 아니다 |
 | collected_at | timestamptz | 크롤링 수집 시각 |
 | click_count | integer | 프론트 클릭 수 |
 | fav_count | integer | 프론트 즐겨찾기 수 |
