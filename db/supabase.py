@@ -16,8 +16,14 @@ def get_client() -> Client:
     return _client
 
 
-def upsert_posts(posts: List[Post]) -> int:
-    """posts 테이블에 upsert. 성공 건수 반환."""
+def upsert_posts(posts: List[Post]) -> Optional[int]:
+    """posts 테이블에 upsert. 성공 건수 반환, 저장 실패면 None.
+
+    0 과 None 은 다른 상태다. 빈 입력·정상 응답의 빈 data 는 0(정상), API 호출이
+    예외로 끝나면 None(저장 실패)이다. postgrest 는 2xx 가 아니면 APIError 를, 통신
+    오류는 httpx 예외를 던지므로 "예외 = 실패" 로 판정한다. 호출 밖(행 변환 등)의
+    개발 오류는 잡지 않고 그대로 올린다.
+    """
     if not posts:
         return 0
 
@@ -50,7 +56,7 @@ def upsert_posts(posts: List[Post]) -> int:
         return count
     except Exception as e:
         logger.error(f"upsert 실패: {e}")
-        return 0
+        return None
 
 
 def upsert_keywords(source: str, keywords: List[Dict[str, str]]) -> bool:

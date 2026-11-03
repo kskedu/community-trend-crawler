@@ -162,9 +162,14 @@ def run():
     # 점수 계산
     all_posts = score_all(all_posts)
 
-    # DB 저장
+    # DB 저장 — None 은 저장 실패(0건 정상과 구분). 후속 키워드·뉴스는 그대로 진행하고,
+    # 실패 여부만 반환해 프로세스 종료 코드에 반영한다(장애를 success 로 숨기지 않기 위함).
     saved = upsert_posts(all_posts)
-    logger.info(f"저장 완료: {saved}건")
+    post_save_failed = saved is None
+    if post_save_failed:
+        logger.error(f"커뮤니티 게시물 저장 실패: {len(all_posts)}건 미저장 — 후속 작업 후 exit 1")
+    else:
+        logger.info(f"저장 완료: {saved}건")
 
     # 검색엔진 키워드 수집(포털·서비스별 keyword_cache 갱신)
     _collect_keyword_caches(source_status)
@@ -181,6 +186,8 @@ def run():
 
     # 실시간 이슈 브리핑 (P0-2) — 실패해도 위 커뮤니티/키워드 수집 결과에 영향 없도록 격리
     run_news_briefing()
+
+    return not post_save_failed
 
 
 def _collect_keyword_caches(source_status):
@@ -1149,6 +1156,22 @@ def run_news_briefing(run_type="full"):
         _finalize_diagnostics(run_diag)
 
 
+def _main(mode):
+    """실행 모드를 분기하고 프로세스 종료 코드를 반환한다.
+
+    full 은 커뮤니티 게시물 저장이 실패(upsert_posts → None)했을 때만 1 이다. 키워드·뉴스
+    등 선택 기능의 실패는 종료 코드에 반영하지 않는다(기존 격리 정책 유지).
+    """
+    if mode == "full":
+        return 0 if run() else 1
+    if mode == "news_top_only":
+        logger.info("[mode] news_top_only — 커뮤니티 수집 생략, 포털 키워드+news_top 갱신")
+        _collect_keyword_caches({})
+        run_news_briefing(run_type="news_top_only")
+        return 0
+    raise SystemExit(f"Unknown mode: {mode!r} (allowed: full, news_top_only)")
+
+
 if __name__ == "__main__":
     # 실행 모드 분기 (cron 분리용):
     #   full           : 커뮤니티 + 포털·서비스별 keyword_cache + news_top (매시 17분)
@@ -1158,11 +1181,4 @@ if __name__ == "__main__":
     #     "포털 키워드 수집 → keyword_cache upsert → news_top 생성" 순서를 동일하게 맞춘다.
     # 기본값 full. 알 수 없는 모드는 fallback 없이 즉시 실패.
     mode = sys.argv[1] if len(sys.argv) > 1 else "full"
-    if mode == "full":
-        run()
-    elif mode == "news_top_only":
-        logger.info("[mode] news_top_only — 커뮤니티 수집 생략, 포털 키워드+news_top 갱신")
-        _collect_keyword_caches({})
-        run_news_briefing(run_type="news_top_only")
-    else:
-        raise SystemExit(f"Unknown mode: {mode!r} (allowed: full, news_top_only)")
+    sys.exit(_main(mode))
