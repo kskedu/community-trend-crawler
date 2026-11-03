@@ -176,7 +176,7 @@ class TestRunPropagatesPostSaveFailure(unittest.TestCase):
         ok, calls, log = self._run(_posts(3), saved=None)
         self.assertIs(ok, False)
         self.assertEqual(calls, [("posts", 3), ("keyword", "daum"), ("briefing", "full")])
-        self.assertIn("커뮤니티 게시물 저장 실패: 3건 미저장", log)
+        self.assertIn("커뮤니티 게시물 저장 실패(또는 결과 미확인): 3건", log)
         # "정상 저장 0건" 으로 오해할 로그를 남기지 않는다.
         self.assertNotIn("저장 완료", log)
 
@@ -194,13 +194,19 @@ class TestRunPropagatesPostSaveFailure(unittest.TestCase):
         self.assertIs(ok, True)
         self.assertIn("[daum] 키워드 저장 실패", log)
 
-    def test_failure_log_does_not_expose_secret_or_payload(self):
-        # 시나리오 I: 새로 추가한 실패 로그는 건수만 남긴다(키·제목·URL 없음).
-        with patch.dict(os.environ, {"SUPABASE_KEY": _SECRET}):
-            ok, calls, log = self._run(_posts(2), saved=None)
+    def test_new_failure_log_carries_count_only(self):
+        # 시나리오 I: 실제 upsert_posts 가 키·payload 가 담긴 예외를 받아도, 이번에 새로 추가한
+        # main 실패 로그(main 로거)는 건수만 남긴다. db.supabase 의 기존 "upsert 실패: {e}"
+        # 로그는 이번 변경 대상이 아니라 검사 범위 밖이다.
+        exc = APIError({"message": f"bad key {_SECRET}", "code": "401",
+                        "hint": "https://example.test/post/0", "details": None})
+        with patch.object(db_supabase, "get_client", return_value=_FakeClient(exc=exc)):
+            ok, calls, log = self._run(_posts(2), saved=db_supabase.upsert_posts)
         self.assertIs(ok, False)
+        failure_lines = [l for l in log.splitlines() if "저장 실패" in l]
+        self.assertEqual(len(failure_lines), 1)
         for leaked in (_SECRET, "example.test", "제목 0"):
-            self.assertNotIn(leaked, log)
+            self.assertNotIn(leaked, failure_lines[0])
 
 
 class TestRealNewsBriefingIsolationKeepsSuccess(unittest.TestCase):

@@ -167,7 +167,7 @@ def run():
     saved = upsert_posts(all_posts)
     post_save_failed = saved is None
     if post_save_failed:
-        logger.error(f"커뮤니티 게시물 저장 실패: {len(all_posts)}건 미저장 — 후속 작업 후 exit 1")
+        logger.error(f"커뮤니티 게시물 저장 실패(또는 결과 미확인): {len(all_posts)}건 — 후속 작업 후 exit 1")
     else:
         logger.info(f"저장 완료: {saved}건")
 
