@@ -10,9 +10,11 @@ Supabase Dashboard 의 Healthy 표시는 쓰지 않는다 — 실제 저장 성�
   → 한 번만. 실패 1회 뒤 정상은 알리지 않는다.
 - 직전 실행은 '완료 순서'로 본다. 겹친 실행(큐 지연·healthcheck dispatch)에서 늦게 끝난 쪽이
   먼저 끝난 실패를 보고 판정하므로 장애 알림이 빠지지 않는다. 한계: 실행은 알림 단계가 끝난
-  뒤에야 completed 가 되므로, 두 실패 실행의 알림 단계가 같은 수십 초 안에 겹치면 서로를
-  진행 중으로 보고 둘 다 첫 실패로 판정해 장애 알림이 빠질 수 있다(중복 알림은 생기지 않는다).
-- 복구는 이번 실행의 실제 저장 성공(saves_ok > 0, 필수 저장 실패 0)이 있을 때만 인정한다.
+  뒤에야 completed 가 되므로, 알림 단계가 같은 수십 초 안에 겹친 실행들은 서로를 진행 중으로
+  보고 같은 이력으로 판정한다. 그래서 장애·복구 알림이 빠지거나(둘 다 첫 실패로 판정) 2번 갈 수
+  있다(둘 다 2회째로 판정). 재실행(re-run) 중인 실행도 진행 중이라 그동안 이력에서 빠진다.
+- 복구는 이번 실행의 실제 필수 저장 성공(required_saves_ok > 0, 필수 저장 실패 0)이 있을 때만
+  인정한다. google_trends 같은 선택 저장만 성공한 실행은 복구 근거가 아니다.
 - 판단 불가(결과 파일 누락·손상, 저장 근거 없음, 직전 기록 조회 실패, 실행 취소)는 알리지
   않는다 — 특히 복구는 근거 없이 선언하지 않는다(fail-closed).
 - main 브랜치 실행만 알린다(기능 브랜치 수동 실행이 운영 알림을 보내지 않게).
@@ -20,12 +22,18 @@ Supabase Dashboard 의 Healthy 표시는 쓰지 않는다 — 실제 저장 성�
   실행이 취소되면(cancelled) 판정하지 않고, 이력에서도 빠진다. job 자체가 시작되지 않는 경우
   (cron-job.org 정지·Actions 장애)는 이 단계가 돌지 않으므로 healthcheck.yml(데이터 경과 시간)
   이 담당한다. 알림 실패·판정 불가는 Actions 주석(::warning)으로 run 화면에 남긴다.
+  checkout 이 실패하면 이 모듈이 없어 단계가 실패하고 continue-on-error 로 가려진다(그 실행은
+  이력에 failure 로 남는다). step timeout 때 steps.<id>.outcome 이 failure 인지는 실측하지 않았다
+  — cancelled 로 보고되면 판정하지 않는다.
+- Telegram 전송은 실패하면 5초 뒤 1회만 다시 시도한다(유일한 장애 알림이 일시 오류로 사라지지
+  않게). 그래도 실패하면 이후 실행은 '이미 알림'으로 보므로 run 주석만 남는다.
 - 자동 재실행·DB 재시작은 하지 않는다. 이 스크립트는 항상 종료 코드 0 이다(실행 결론을
   바꾸면 다음 실행의 이력 판단이 틀어진다).
 - 토큰·키는 출력하지 않는다. 예외는 타입명만 남긴다.
 
 표준 라이브러리만 쓴다.
 """
+import http.client
 import json
 import logging
 import os
@@ -78,7 +86,7 @@ def current_state(outcome, step_outcome):
     if step_outcome in ("failure", "skipped"):
         return "FAILED_UNKNOWN"
     if (outcome is not None and step_outcome == "success"
-            and (outcome.get("saves_ok") or 0) > 0 and not outcome.get("required_save_failed")):
+            and (outcome.get("required_saves_ok") or 0) > 0 and not outcome.get("required_save_failed")):
         return "OK"
     return "UNKNOWN"
 
@@ -193,7 +201,7 @@ def fetch_runs(api_url, repo, workflow, token, branch=""):
     try:
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as r:
             data = json.loads(r.read().decode("utf-8"))
-    except (urllib.error.URLError, OSError, ValueError) as e:
+    except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as e:
         raise HistoryError(type(e).__name__) from None
     runs = data.get("workflow_runs") if isinstance(data, dict) else None
     if not isinstance(runs, list):
@@ -213,6 +221,8 @@ def auth_health(supabase_url, key):
             return f"HTTP {r.status} ({time.monotonic() - t0:.1f}s)"
     except urllib.error.HTTPError as e:
         return f"HTTP {e.code}"
+    except http.client.HTTPException:
+        return "응답 이상"
     except (urllib.error.URLError, OSError) as e:
         reason = getattr(e, "reason", e)
         if isinstance(reason, TimeoutError) or isinstance(e, TimeoutError):
@@ -220,7 +230,22 @@ def auth_health(supabase_url, key):
         return "연결 실패"
 
 
+TELEGRAM_RETRY_DELAY_SECONDS = 5
+
+
 def send_telegram(token, chat_id, text):
+    """전송 1회 + 실패 시 1회 재시도. 성공 여부를 반환한다."""
+    if not token or not chat_id:
+        logger.warning("[crawl-alert] Telegram 설정 없음 → 전송 생략")
+        return False
+    if _send_telegram_once(token, chat_id, text):
+        return True
+    time.sleep(TELEGRAM_RETRY_DELAY_SECONDS)
+    logger.info("[crawl-alert] Telegram 1회 재시도")
+    return _send_telegram_once(token, chat_id, text)
+
+
+def _send_telegram_once(token, chat_id, text):
     if not token or not chat_id:
         logger.warning("[crawl-alert] Telegram 설정 없음 → 전송 생략")
         return False
@@ -233,7 +258,7 @@ def send_telegram(token, chat_id, text):
     except urllib.error.HTTPError as e:
         logger.warning("[crawl-alert] Telegram 전송 실패 HTTP %s", e.code)
         return False
-    except (urllib.error.URLError, OSError) as e:
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
         logger.warning("[crawl-alert] Telegram 전송 실패 %s", type(e).__name__)
         return False
     if not ok:

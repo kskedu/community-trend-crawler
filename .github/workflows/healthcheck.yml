@@ -87,6 +87,35 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          # 크롤러가 '돌고 있는데 저장에 실패하는 중'이면(main 브랜치 직전 완료 실행이 failure 이고
+          # 60분 안에 끝남) 재촉발하지 않고 healthcheck 알림도 보내지 않는다 — DB 장애 중 재실행은
+          # 같은 실패만 늘리고, 장애 알림은 crawl.yml 알림 단계가 1회 보낸다(중복 방지).
+          # 직전 실패가 60분보다 오래됐으면 크롤러가 멈춘 것(cron-job.org 정지 등)으로 보고 아래 정상
+          # 경로(재촉발·알림)로 간다 — 그렇지 않으면 실패 1회 뒤 멈춘 크롤러를 아무도 알리지 않는다.
+          # 이 판정을 실행 중 확인보다 먼저 해, 실행 중(skipped_active)일 때의 중복 알림도 막는다.
+          # 조회 실패는 fail-closed(dispatch 생략).
+          if ! LAST="$(gh run list --repo "${{ github.repository }}" \
+                --workflow crawl.yml --branch main --status completed --limit 1 \
+                --json conclusion,updatedAt --jq '.[0] | "\(.conclusion) \(.updatedAt)"' 2>/dev/null)"; then
+            echo "⚠️ crawl.yml 직전 결과 조회 실패 → fail-closed: dispatch 생략(다음 주기 복구)"
+            echo "result=skipped_lookup_failed" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          LAST_CONCLUSION="${LAST%% *}"
+          LAST_AGE_MIN=$(python3 -c "
+          import sys
+          from datetime import datetime, timezone
+          try:
+              t = datetime.fromisoformat(sys.argv[1].replace('Z', '+00:00'))
+              print(int((datetime.now(timezone.utc) - t).total_seconds() // 60))
+          except Exception:
+              print(99999)
+          " "${LAST#* }")
+          if [ "$LAST_CONCLUSION" = "failure" ] && [ "$LAST_AGE_MIN" -le 60 ]; then
+            echo "⏭️ crawl.yml 이 ${LAST_AGE_MIN}분 전 실패로 끝남 → 저장 장애로 보고 dispatch·알림 생략(crawl 알림이 담당)"
+            echo "result=skipped_crawler_failing" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           # 중복 dispatch 완화(check-then-act): 이미 crawl.yml 이 queued/in_progress 면
           # 재촉발하지 않는다. stale 로 보이는 건 실행 지연일 수 있어, 이미 도는 run 을
           # 기다리는 편이 이중 실행보다 안전하다. cron-job.org 정기 dispatch 와도 겹칠 수
@@ -120,21 +149,6 @@ jobs:
           if [ "$ACTIVE" != "0" ]; then
             echo "⏭️ crawl.yml 이 이미 실행 중/대기 중(queued=${QUEUED} in_progress=${RUNNING}) → dispatch 생략(중복 방지)"
             echo "result=skipped_active" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          # 크롤러는 돌고 있는데 저장에 실패하는 중이면(직전 완료 실행 failure) 재촉발하지 않는다 —
-          # DB 장애 중 재실행은 같은 실패만 늘린다. 이 경우 장애 알림은 crawl.yml 알림 단계가
-          # 1회 보낸다(중복 방지). 조회 실패는 위와 같이 fail-closed.
-          if ! LAST="$(gh run list --repo "${{ github.repository }}" \
-                --workflow crawl.yml --status completed --limit 1 \
-                --json conclusion --jq '.[0].conclusion // ""' 2>/dev/null)"; then
-            echo "⚠️ crawl.yml 직전 결과 조회 실패 → fail-closed: dispatch 생략(다음 주기 복구)"
-            echo "result=skipped_lookup_failed" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if [ "$LAST" = "failure" ]; then
-            echo "⏭️ crawl.yml 직전 실행이 실패 → 저장 장애로 보고 dispatch 생략(crawl 알림이 담당)"
-            echo "result=skipped_crawler_failing" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           echo "🔄 크롤러 재실행 트리거 (status=${{ steps.check.outputs.status }}, active=0)"
@@ -172,9 +186,11 @@ jobs:
           MINS=$((ELAPSED % 60))
           LAST_AT_KST=$(python3 -c "
           from datetime import datetime, timedelta, timezone
-          last = datetime.fromisoformat('${{ steps.check.outputs.last_at }}'.replace('Z','+00:00'))
-          kst = last.astimezone(timezone(timedelta(hours=9)))
-          print(kst.strftime('%Y-%m-%d %H:%M KST'))
+          try:
+              last = datetime.fromisoformat('${{ steps.check.outputs.last_at }}'.replace('Z','+00:00'))
+              print(last.astimezone(timezone(timedelta(hours=9))).strftime('%Y-%m-%d %H:%M KST'))
+          except ValueError:
+              print('확인 불가')
           ")
           MESSAGE="🚨 [StartHub] 크롤러 이상 감지
 

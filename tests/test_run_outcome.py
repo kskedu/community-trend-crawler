@@ -237,6 +237,14 @@ class TestSummarize(unittest.TestCase):
                    [("keyword_cache", "daum", "ok", None)], False)
         self.assertEqual((r["status"], r["fetch_failed"]), ("PARTIAL", ["todayhumor"]))
 
+    def test_required_saves_ok_excludes_optional(self):
+        r = self.S("full", {}, "skipped",
+                   [("keyword_cache", "google_trends", "ok", None), ("keyword_cache", "daum", "ok", None),
+                    ("community_posts", "posts", "ok", None)], False)
+        self.assertEqual((r["saves_ok"], r["required_saves_ok"]), (3, 2))
+        r = self.S("full", {}, "skipped", [("keyword_cache", "google_trends", "ok", None)], False)
+        self.assertEqual((r["saves_ok"], r["required_saves_ok"]), (1, 0))
+
     def test_optional_save_failure_is_partial(self):
         r = self.S("full", {}, "saved", [("keyword_cache", "google_trends", "failed", "http_400")], False)
         self.assertEqual(r["status"], "PARTIAL")

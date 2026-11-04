@@ -365,13 +365,21 @@ class TestDispatchResult(_Base):
         return r, sb.outputs().get("result"), sb.read(sb.gh_log)
 
     def test_results(self):
+        recent_fail = "failure " + _ago(20)
+        old_fail = "failure " + _ago(180)
         cases = [
             ({}, 0, "dispatched", True),
             ({"FAKE_GH_QUEUED": 1}, 0, "skipped_active", False),
             ({"FAKE_GH_FAIL": 1}, 0, "skipped_lookup_failed", False),
             ({"FAKE_GH_FAIL_STATUS": "completed"}, 0, "skipped_lookup_failed", False),
-            ({"FAKE_GH_LAST": "failure"}, 0, "skipped_crawler_failing", False),
-            ({"FAKE_GH_LAST": "cancelled"}, 0, "dispatched", True),
+            # 돌고 있는데 저장 실패 중(60분 안의 실패) → 재촉발·알림 생략
+            ({"FAKE_GH_LAST": recent_fail}, 0, "skipped_crawler_failing", False),
+            # 실행 중이어도 저장 실패 판정이 먼저 — healthcheck 중복 알림 방지(재리뷰 P2)
+            ({"FAKE_GH_LAST": recent_fail, "FAKE_GH_RUNNING": 1}, 0, "skipped_crawler_failing", False),
+            # 실패 뒤 크롤러가 멈춤(마지막 실패가 3시간 전) → 정상 경로로 재촉발(재리뷰 P1)
+            ({"FAKE_GH_LAST": old_fail}, 0, "dispatched", True),
+            ({"FAKE_GH_LAST": "failure not-a-time"}, 0, "dispatched", True),
+            ({"FAKE_GH_LAST": "cancelled " + _ago(5)}, 0, "dispatched", True),
             ({"FAKE_GH_DISPATCH_FAIL": 1}, 1, "dispatch_failed", True),
         ]
         for env, code, result, dispatched in cases:
@@ -382,6 +390,8 @@ class TestDispatchResult(_Base):
                     self.assertEqual(r.returncode, code, r.stdout + r.stderr)
                     self.assertEqual(got, result)
                     self.assertEqual("workflow run" in log, dispatched)
+                    if "FAKE_GH_FAIL" not in env:
+                        self.assertIn("--workflow crawl.yml --branch main --status completed", log)
                 finally:
                     sb.close()
 
@@ -429,6 +439,18 @@ class TestAlertMessageMatchesAction(_Base):
                     self.assertNotIn("FAKE_SECRET", r.stdout + r.stderr)
                 finally:
                     sb.close()
+
+    def test_force_alert_without_check_outputs_does_not_crash(self):
+        sb = _Sandbox()
+        try:
+            script = _render(ALERT["run"], outputs={})
+            env = {k: _render(str(v)) for k, v in ALERT["env"].items()}
+            env["FAKE_CURL_OUT"] = "200"
+            r = sb.run(script, env_extra=env)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("마지막 수집: 확인 불가", sb.read(sb.curl_log))
+        finally:
+            sb.close()
 
     def test_telegram_curl_has_timeout(self):
         sb = _Sandbox()

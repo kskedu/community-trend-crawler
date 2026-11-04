@@ -90,12 +90,16 @@ class _FakeNet:
 
 class _Base(unittest.TestCase):
     def setUp(self):
+        p = patch.object(ca.time, "sleep")
+        self.sleep = p.start()
+        self.addCleanup(p.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.outcome_path = os.path.join(self.tmp.name, "outcome.json")
 
     def write_outcome(self, status, **kw):
         data = {"mode": "news_top_only", "status": status, "saves_ok": 0 if status == "FAILED" else 5,
+                "required_saves_ok": 0 if status == "FAILED" else 5,
                 "required_save_failed": ["keyword_cache:daum"] if status == "FAILED" else [],
                 "failure_kinds": {"http_522": 7} if status == "FAILED" else {},
                 "db_unavailable": status == "FAILED", "fetch_failed": [], "news_top": "saved"}
@@ -295,11 +299,44 @@ class TestRunEndToEnd(_Base):
 
     def test_recovery_requires_real_saves(self):
         # 독립 리뷰 P2-2: 저장 0건(수집 전부 비고 DB 읽기 실패)인 PARTIAL·exit 0 은 복구가 아니다.
-        self.write_outcome("PARTIAL", saves_ok=0)
+        self.write_outcome("PARTIAL", saves_ok=0, required_saves_ok=0)
         net = _FakeNet(runs=_hist("failure", "failure"))
         r, _ = self.go(net, self.env(step="success"))
         self.assertEqual((r["state"], r["decision"]), ("UNKNOWN", "NONE"))
         self.assertEqual(net.telegram(), [])
+
+    def test_optional_save_only_is_not_recovery(self):
+        # 재리뷰 P3: google_trends 만 저장된 PARTIAL(saves_ok=1, required_saves_ok=0)은 복구가 아니다.
+        self.write_outcome("PARTIAL", saves_ok=1, required_saves_ok=0)
+        r, _ = self.go(_FakeNet(runs=_hist("failure", "failure")), self.env(step="success"))
+        self.assertEqual((r["state"], r["decision"]), ("UNKNOWN", "NONE"))
+
+    def test_telegram_retries_once(self):
+        self.write_outcome("FAILED")
+
+        class _Flaky(_FakeNet):
+            def __call__(self, req, timeout=None):
+                if "api.telegram.org" in req.full_url and not self.telegram():
+                    self.calls.append((req.full_url, req.data, {}, timeout))
+                    raise urllib.error.URLError("blip")
+                return super().__call__(req, timeout)
+
+        net = _Flaky(runs=_hist("failure", "success"))
+        r, _ = self.go(net, self.env())
+        self.assertEqual((r["decision"], r["sent"]), ("DOWN", True))
+        self.assertEqual(len(net.telegram()), 2)
+        self.sleep.assert_called_once_with(ca.TELEGRAM_RETRY_DELAY_SECONDS)
+
+    def test_http_client_exceptions_are_handled(self):
+        import http.client
+        self.write_outcome("FAILED")
+        r, _ = self.go(_FakeNet(gh_exc=http.client.IncompleteRead(b"")), self.env())
+        self.assertIn("history_unavailable", r["reason"])
+        net = _FakeNet(runs=_hist("failure", "success"), tg_exc=http.client.BadStatusLine("x"),
+                       auth_exc=http.client.RemoteDisconnected("x"))
+        r, log = self.go(net, self.env())
+        self.assertEqual((r["decision"], r["sent"]), ("DOWN", False))
+        self.assertIn("Telegram 전송 실패", log)
 
     def test_non_main_branch_never_alerts_or_calls_api(self):
         self.write_outcome("FAILED")
@@ -346,6 +383,7 @@ class TestRunEndToEnd(_Base):
                 r, log = self.go(net, self.env())
                 self.assertEqual((r["decision"], r["sent"]), ("DOWN", False))
                 self.assertIn("Telegram 전송 실패", log)
+                self.assertEqual(len(net.telegram()), 2)  # 1회 + 재시도 1회, 그 이상 없음
 
     def test_undelivered_alert_is_annotated(self):
         # continue-on-error 로 step 이 초록이어도 알림 실패는 run 화면 주석으로 남는다.
