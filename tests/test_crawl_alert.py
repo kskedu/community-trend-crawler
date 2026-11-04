@@ -30,9 +30,10 @@ GH_TOKEN = "ghs_GH_TOKEN_TEST_ONLY"
 SB_KEY = "sb_secret_SB_KEY_TEST_ONLY"
 
 
-def _run(id_, conclusion="success", status="completed", created="2026-11-04T12:00:00Z", branch="main"):
+def _run(id_, conclusion="success", status="completed", created="2026-11-04T12:00:00Z", branch="main",
+         updated=None):
     return {"id": id_, "status": status, "conclusion": conclusion if status == "completed" else None,
-            "created_at": created, "head_branch": branch}
+            "created_at": created, "updated_at": updated or created, "head_branch": branch}
 
 
 def _hist(*items):
@@ -94,7 +95,7 @@ class _Base(unittest.TestCase):
         self.outcome_path = os.path.join(self.tmp.name, "outcome.json")
 
     def write_outcome(self, status, **kw):
-        data = {"mode": "news_top_only", "status": status, "saves_ok": 0,
+        data = {"mode": "news_top_only", "status": status, "saves_ok": 0 if status == "FAILED" else 5,
                 "required_save_failed": ["keyword_cache:daum"] if status == "FAILED" else [],
                 "failure_kinds": {"http_522": 7} if status == "FAILED" else {},
                 "db_unavailable": status == "FAILED", "fetch_failed": [], "news_top": "saved"}
@@ -104,7 +105,8 @@ class _Base(unittest.TestCase):
 
     def env(self, step="failure", **kw):
         e = {"CRAWL_OUTCOME_PATH": self.outcome_path, "CRAWL_STEP_OUTCOME": step,
-             "GITHUB_RUN_ID": "100", "GITHUB_REPOSITORY": "kskedu/community-trend-crawler",
+             "GITHUB_RUN_ID": "100", "GITHUB_REF_NAME": "main",
+             "GITHUB_REPOSITORY": "kskedu/community-trend-crawler",
              "GITHUB_API_URL": "https://api.github.com", "GITHUB_SERVER_URL": "https://github.com",
              "GITHUB_TOKEN": GH_TOKEN, "TELEGRAM_BOT_TOKEN": TG_TOKEN, "TELEGRAM_CHAT_ID": "42",
              "SUPABASE_URL": "https://fake.invalid", "SUPABASE_KEY": SB_KEY}
@@ -178,22 +180,25 @@ class TestDecide(unittest.TestCase):
             with self.subTest(state=state, hist=hist):
                 self.assertEqual(ca.decide(state, self.H(*hist), False)[0], want)
 
-    def test_earlier_active_defers(self):
-        self.assertEqual(ca.decide("FAILED", self.H("failure", "success"), True), ("NONE", "earlier_run_active"))
+    def test_earlier_active_does_not_suppress(self):
+        # 독립 리뷰 P2-1: 진행 중 실행이 있다고 보류하면 겹친 실행에서 장애 알림이 영영 빠진다.
+        self.assertEqual(ca.decide("FAILED", self.H("failure", "success"), True)[0], "DOWN")
 
 
 class TestSplitHistory(unittest.TestCase):
-    def test_filters_other_branch_later_and_cancelled(self):
+    def test_completion_order_branch_and_cancelled(self):
         runs = [
-            _run(101, conclusion="failure", created="2026-11-04T13:05:00Z"),   # 현재보다 나중 생성 → 제외
+            # 현재보다 나중에 생성됐지만 이미 완료 → 이전으로 본다(완료 순)
+            _run(101, conclusion="failure", created="2026-11-04T13:05:00Z", updated="2026-11-04T13:20:00Z"),
             _run(100, status="in_progress", created="2026-11-04T13:00:00Z"),  # 현재
             _run(99, conclusion="failure", created="2026-11-04T12:50:00Z", branch="test"),  # 다른 브랜치
             _run(98, conclusion="cancelled", created="2026-11-04T12:40:00Z"),
-            _run(97, conclusion="failure", created="2026-11-04T12:30:00Z"),
-            _run(96, conclusion="success", created="2026-11-04T12:00:00Z"),
+            _run(97, conclusion="success", created="2026-11-04T12:30:00Z", updated="2026-11-04T12:45:00Z"),
+            # 먼저 생성됐지만 늦게 끝남 → 완료 순으로 97 보다 앞
+            _run(96, conclusion="failure", created="2026-11-04T12:00:00Z", updated="2026-11-04T12:55:00Z"),
         ]
         hist, active = ca.split_history(runs, 100)
-        self.assertEqual([c for c, _ in hist], ["failure", "success"])
+        self.assertEqual([c for c, _ in hist], ["failure", "failure", "success"])
         self.assertFalse(active)
 
     def test_earlier_in_progress_flags_active(self):
@@ -205,6 +210,28 @@ class TestSplitHistory(unittest.TestCase):
     def test_current_not_found(self):
         with self.assertRaises(ca.HistoryError):
             ca.split_history([_run(1)], 100)
+
+
+class TestOverlapScenario(_Base):
+    """독립 리뷰 P2-1 재현: N-1 이 느려 N 이 먼저 끝나도 장애 알림이 정확히 1번 나간다."""
+
+    def _decide(self, runs, current):
+        hist, active = ca.split_history(runs, current)
+        return ca.decide("FAILED", hist, active)[0]
+
+    def test_slow_previous_run(self):
+        n2 = _run(1, "success", created="2026-11-04T12:00:00Z", updated="2026-11-04T12:03:00Z")
+        n1_running = _run(2, status="in_progress", created="2026-11-04T12:30:00Z")
+        n_running = _run(3, status="in_progress", created="2026-11-04T13:00:00Z")
+        # N 이 먼저 끝남(N-1 진행 중)
+        first = self._decide([n_running, n1_running, n2], 3)
+        n_done = _run(3, "failure", created="2026-11-04T13:00:00Z", updated="2026-11-04T13:04:00Z")
+        # N-1 이 나중에 끝남 — N 의 실패를 완료 순으로 본다
+        second = self._decide([n_done, _run(2, status="in_progress", created="2026-11-04T12:30:00Z"), n2], 2)
+        n1_done = _run(2, "failure", created="2026-11-04T12:30:00Z", updated="2026-11-04T13:10:00Z")
+        n_plus = _run(4, status="in_progress", created="2026-11-04T13:30:00Z")
+        third = self._decide([n_plus, n_done, n1_done, n2], 4)
+        self.assertEqual([first, second, third], ["NONE", "DOWN", "NONE"])
 
 
 class TestRunEndToEnd(_Base):
@@ -234,6 +261,8 @@ class TestRunEndToEnd(_Base):
             ca.run(self.env())
         msg = st.call_args[0][2]
         self.assertIn("2회 연속 실패", msg)
+        self.assertIn("이번 실행: 필수 DB 저장 실패", msg)
+        self.assertIn("DB 외 실패일 수 있음", msg)
         self.assertIn("http_522 7건", msg)
         self.assertIn("DB 응답 없음 판정: 예", msg)
         self.assertIn("Auth health: 응답 없음(10초 초과)", msg)
@@ -263,6 +292,27 @@ class TestRunEndToEnd(_Base):
         net = _FakeNet(runs=_hist("failure", "failure"))
         r, _ = self.go(net, self.env(step="success"))
         self.assertEqual((r["state"], r["decision"]), ("UNKNOWN", "NONE"))
+
+    def test_recovery_requires_real_saves(self):
+        # 독립 리뷰 P2-2: 저장 0건(수집 전부 비고 DB 읽기 실패)인 PARTIAL·exit 0 은 복구가 아니다.
+        self.write_outcome("PARTIAL", saves_ok=0)
+        net = _FakeNet(runs=_hist("failure", "failure"))
+        r, _ = self.go(net, self.env(step="success"))
+        self.assertEqual((r["state"], r["decision"]), ("UNKNOWN", "NONE"))
+        self.assertEqual(net.telegram(), [])
+
+    def test_non_main_branch_never_alerts_or_calls_api(self):
+        self.write_outcome("FAILED")
+        net = _FakeNet(runs=_hist("failure", "success"))
+        r, _ = self.go(net, self.env(GITHUB_REF_NAME="fix/test"))
+        self.assertEqual((r["decision"], r["reason"]), ("NONE", "branch_not_alerted:fix/test"))
+        self.assertEqual(net.calls, [])
+
+    def test_history_query_is_branch_scoped(self):
+        self.write_outcome("FAILED")
+        net = _FakeNet(runs=_hist("success"))
+        self.go(net, self.env())
+        self.assertIn("&branch=main", net.calls[0][0])
 
     def test_github_api_errors_send_nothing(self):
         self.write_outcome("FAILED")

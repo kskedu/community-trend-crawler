@@ -8,8 +8,13 @@ Supabase Dashboard 의 Healthy 표시는 쓰지 않는다 — 실제 저장 성�
   → 연속 2회째에 한 번만. 3회째부터는 보내지 않는다.
 - 복구 알림(RECOVERED): 이번 실행 정상 + 직전 2회 연속 실패(= 장애 알림을 보낸 상태)
   → 한 번만. 실패 1회 뒤 정상은 알리지 않는다.
-- 판단 불가(결과 파일 누락·손상인데 실행 성공, 직전 기록 조회 실패, 앞선 실행이 아직 진행 중,
-  실행 취소)는 알리지 않는다 — 특히 복구는 근거 없이 선언하지 않는다(fail-closed).
+- 직전 실행은 '완료 순서'로 본다. 겹친 실행(큐 지연·healthcheck dispatch)에서 늦게 끝난 쪽이
+  먼저 끝난 실패를 보고 판정하므로 장애 알림이 빠지지 않는다. 거의 동시에 끝난 두 실행이 같은
+  이력을 보면 알림이 2번 갈 수 있다(누락보다 중복을 택한다).
+- 복구는 이번 실행의 실제 저장 성공(saves_ok > 0, 필수 저장 실패 0)이 있을 때만 인정한다.
+- 판단 불가(결과 파일 누락·손상, 저장 근거 없음, 직전 기록 조회 실패, 실행 취소)는 알리지
+  않는다 — 특히 복구는 근거 없이 선언하지 않는다(fail-closed).
+- main 브랜치 실행만 알린다(기능 브랜치 수동 실행이 운영 알림을 보내지 않게).
 - 자동 재실행·DB 재시작은 하지 않는다. 이 스크립트는 항상 종료 코드 0 이다(실행 결론을
   바꾸면 다음 실행의 이력 판단이 틀어진다).
 - 토큰·키는 출력하지 않는다. 예외는 타입명만 남긴다.
@@ -67,7 +72,8 @@ def current_state(outcome, step_outcome):
         return "FAILED"
     if step_outcome in ("failure", "skipped"):
         return "FAILED_UNKNOWN"
-    if outcome is not None and step_outcome == "success":
+    if (outcome is not None and step_outcome == "success"
+            and (outcome.get("saves_ok") or 0) > 0 and not outcome.get("required_save_failed")):
         return "OK"
     return "UNKNOWN"
 
@@ -75,11 +81,10 @@ def current_state(outcome, step_outcome):
 def decide(state, history, earlier_active):
     """(decision, reason). decision: DOWN · RECOVERED · NONE.
 
-    history: 이번 실행보다 먼저 만들어져 완료된 같은 workflow·같은 브랜치 실행의
-    [(conclusion, created_at)] 최신순, conclusion 은 success·failure 만(취소 등 제외).
+    history: 이번 실행 전에 완료된 같은 workflow·같은 브랜치 실행의 [(conclusion, created_at)]
+    완료 순 최신순, conclusion 은 success·failure 만(취소 등 제외).
+    earlier_active 는 기록용이다(판정에 쓰지 않는다 — 쓰면 겹친 실행에서 알림이 빠진다).
     """
-    if earlier_active:
-        return "NONE", "earlier_run_active"
     concl = [c for c, _ in history]
     if state in ("FAILED", "FAILED_UNKNOWN"):
         if concl[:1] == ["failure"] and (len(concl) < 2 or concl[1] == "success"):
@@ -95,23 +100,29 @@ def decide(state, history, earlier_active):
 
 
 def split_history(runs, current_run_id):
-    """GitHub runs 목록(최신순)에서 현재 실행보다 앞선 것만 골라 (history, earlier_active)."""
-    ids = [r.get("id") for r in runs]
-    if current_run_id not in ids:
+    """GitHub runs 목록에서 현재 실행을 뺀 같은 브랜치 완료 실행을 완료 순 최신순으로.
+
+    반환 (history, earlier_active). 현재 실행은 지금 완료되는 중이므로, 이미 완료된 다른 실행은
+    생성 시각과 무관하게 모두 '이전'이다. 완료 시각은 updated_at 으로 본다.
+    """
+    by_id = {r.get("id"): r for r in runs}
+    if current_run_id not in by_id:
         raise HistoryError("current_run_not_found")
-    current = runs[ids.index(current_run_id)]
+    current = by_id[current_run_id]
     branch = current.get("head_branch")
     started = current.get("created_at") or ""
-    history, earlier_active = [], False
-    for r in runs[ids.index(current_run_id) + 1:]:
-        if r.get("head_branch") != branch or (r.get("created_at") or "") > started:
+    done, earlier_active = [], False
+    for r in runs:
+        if r.get("id") == current_run_id or r.get("head_branch") != branch:
             continue
         if r.get("status") != "completed":
-            earlier_active = True
+            if (r.get("created_at") or "") <= started:
+                earlier_active = True
             continue
         if r.get("conclusion") in ("success", "failure"):
-            history.append((r["conclusion"], r.get("created_at")))
-    return history, earlier_active
+            done.append(r)
+    done.sort(key=lambda r: r.get("updated_at") or r.get("created_at") or "", reverse=True)
+    return [(r["conclusion"], r.get("created_at")) for r in done], earlier_active
 
 
 def _kst(iso):
@@ -133,9 +144,10 @@ def build_message(decision, state, outcome, history, auth, run_url):
             failed = str(len(outcome.get("required_save_failed") or []))
             db_down = "예" if outcome.get("db_unavailable") else "아니오"
         lines = [
-            "🚨 [StartHub] 크롤러 DB 저장 2회 연속 실패",
+            "🚨 [StartHub] 크롤러 2회 연속 실패",
             "",
-            f"이번 실행: {'필수 저장 실패' if state == 'FAILED' else '실패(원인 미상·결과 파일 없음)'}",
+            f"이번 실행: {'필수 DB 저장 실패' if state == 'FAILED' else '실패(원인 미상·결과 파일 없음)'}",
+            "직전 실행: 실패(원인은 해당 실행 로그에서 확인 — DB 외 실패일 수 있음)",
             f"실패 저장: {failed}건 · 분류: {kinds}",
             f"DB 응답 없음 판정: {db_down}",
             f"Auth health: {auth}",
@@ -163,9 +175,11 @@ def build_message(decision, state, outcome, history, auth, run_url):
 # ── 외부 호출(테스트에서 urlopen 을 대체한다) ──────────────────────────────
 
 
-def fetch_runs(api_url, repo, workflow, token):
+def fetch_runs(api_url, repo, workflow, token, branch=""):
     url = (f"{api_url}/repos/{repo}/actions/workflows/{urllib.parse.quote(workflow)}/runs"
            f"?per_page={HISTORY_PAGE}")
+    if branch:
+        url += f"&branch={urllib.parse.quote(branch)}"
     req = urllib.request.Request(url, headers={
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
@@ -229,15 +243,24 @@ def run(env):
     outcome = read_outcome(env.get("CRAWL_OUTCOME_PATH"))
     state = current_state(outcome, env.get("CRAWL_STEP_OUTCOME", ""))
     history, decision, reason = [], "NONE", ""
+    branch = env.get("GITHUB_REF_NAME", "")
+    alert_branch = env.get("CRAWL_ALERT_BRANCH", "main")
     try:
+        if branch != alert_branch:
+            raise HistoryError(f"branch_not_alerted:{branch or '-'}")
         run_id = int(env.get("GITHUB_RUN_ID", ""))
         runs = fetch_runs(env.get("GITHUB_API_URL", "https://api.github.com"),
                           env.get("GITHUB_REPOSITORY", ""), env.get("CRAWL_WORKFLOW_FILE", "crawl.yml"),
-                          env.get("GITHUB_TOKEN", ""))
+                          env.get("GITHUB_TOKEN", ""), branch)
         history, earlier_active = split_history(runs, run_id)
         decision, reason = decide(state, history, earlier_active)
+        if earlier_active:
+            reason += ",earlier_run_active"
     except (HistoryError, ValueError) as e:
-        reason = f"history_unavailable:{e}" if isinstance(e, HistoryError) else "history_unavailable:run_id"
+        if isinstance(e, HistoryError) and str(e).startswith("branch_not_alerted"):
+            reason = str(e)
+        else:
+            reason = f"history_unavailable:{e}" if isinstance(e, HistoryError) else "history_unavailable:run_id"
     sent = None
     if decision != "NONE":
         auth = auth_health(env.get("SUPABASE_URL", ""), env.get("SUPABASE_KEY", ""))
