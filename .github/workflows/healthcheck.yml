@@ -32,10 +32,17 @@ jobs:
           # 인덱스로 LIMIT 1 이 끝난다(created_at 은 인덱스가 없어 전체 스캔+정렬).
           # DESC 는 NULLS FIRST 라 NULL 행이 있으면 최신값을 가린다 → not.is.null 로 제외한다
           # (IS NOT NULL 은 같은 인덱스의 조건으로 처리돼 인덱스 사용이 유지된다).
-          RES=$(curl -s "${SUPABASE_URL}/rest/v1/community_posts?select=collected_at&collected_at=not.is.null&order=collected_at.desc&limit=1" \
+          # -m 20: DB 가 응답하지 않으면(2026-11-04 장애) 무한정 기다리지 않는다. 응답 없음·오류
+          # 응답은 판정 불가로 step 을 실패시킨다 — 이 경우 크롤러 재촉발도 Telegram 도 하지 않는다
+          # (DB 장애 중 재실행은 의미가 없고, 장애 알림은 crawl.yml 알림 단계가 1회만 보낸다).
+          # 응답 원문(Cloudflare 오류 HTML 등)은 로그에 남기지 않고 길이만 남긴다.
+          if ! RES=$(curl -s -m 20 "${SUPABASE_URL}/rest/v1/community_posts?select=collected_at&collected_at=not.is.null&order=collected_at.desc&limit=1" \
             -H "apikey: ${SUPABASE_KEY}" \
-            -H "Authorization: Bearer ${SUPABASE_KEY}")
-          echo "Response: $RES"
+            -H "Authorization: Bearer ${SUPABASE_KEY}"); then
+            echo "❌ Supabase 응답 없음(20초 초과 또는 연결 실패) — 판정 불가, fail"
+            exit 1
+          fi
+          echo "Response bytes: ${#RES}"
 
           LAST_AT=$(echo "$RES" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data[0]['collected_at'] if data else '')")
           if [ -z "$LAST_AT" ]; then

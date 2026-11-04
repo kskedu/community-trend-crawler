@@ -18,6 +18,7 @@ on:
 
 permissions:
   contents: read
+  actions: read   # 알림 단계가 같은 workflow 의 직전 실행 결론을 조회한다(쓰기 권한 없음)
 
 jobs:
   crawl:
@@ -48,8 +49,13 @@ jobs:
           fi
           echo "RUN_MODE=$MODE" >> "$GITHUB_OUTPUT"
 
+      # timeout: 정상 실행은 2~3분, 2026-11-04 DB 장애 때도 13분이었다. 이보다 길면 멈춘 것으로
+      # 보고 step 을 실패시킨다(기본 360분 동안 runner 를 붙잡지 않는다).
       - name: Run crawler
+        id: crawl
+        timeout-minutes: 20
         env:
+          CRAWL_OUTCOME_PATH: ${{ runner.temp }}/crawl-outcome.json
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
@@ -59,3 +65,21 @@ jobs:
           NEWS_DIAG_COMPACT_FIELDS: ${{ vars.NEWS_DIAG_COMPACT_FIELDS || '' }}
           NEWS_DIAG_GROUNDING_REASON: ${{ vars.NEWS_DIAG_GROUNDING_REASON || '' }}
         run: python main.py "${{ steps.mode.outputs.RUN_MODE }}"
+
+      # DB 저장 실패 연속 알림(ops/crawl_alert.py). 크롤러가 실패해도 돌아야 하므로 always(),
+      # 알림 단계 자체의 실패가 실행 결론을 바꾸지 않도록 continue-on-error(스크립트도 항상 0).
+      # 2회 연속 필수 저장 실패에 1회, 그 뒤 첫 정상 저장에 1회만 보낸다. 재실행·재시작 없음.
+      - name: Alert on repeated DB save failure
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 3
+        env:
+          CRAWL_OUTCOME_PATH: ${{ runner.temp }}/crawl-outcome.json
+          CRAWL_STEP_OUTCOME: ${{ steps.crawl.outcome }}
+          CRAWL_WORKFLOW_FILE: crawl.yml
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python -m ops.crawl_alert

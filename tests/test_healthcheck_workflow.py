@@ -83,7 +83,7 @@ class _Sandbox:
         # 가짜 curl: 인자를 한 줄씩 기록하고 FAKE_CURL_BODY 파일 내용을 출력한다.
         self._tool("curl", 'for a in "$@"; do printf "%s\\n" "$a"; done >> "$CURL_LOG"; '
                            'printf -- "---\\n" >> "$CURL_LOG"; '
-                           '[ -n "${FAKE_CURL_BODY:-}" ] && cat "$FAKE_CURL_BODY"; exit 0')
+                           '[ -n "${FAKE_CURL_BODY:-}" ] && cat "$FAKE_CURL_BODY"; exit ${FAKE_CURL_EXIT:-0}')
         # 가짜 gh: 인자를 기록하고 FAKE_GH_<status> 값으로 응답, FAKE_GH_FAIL=1 이면 실패.
         self._tool("gh", 'printf "%s\\n" "$*" >> "$GH_LOG"; '
                          '[ "${FAKE_GH_FAIL:-0}" = "1" ] && exit 1; '
@@ -282,6 +282,31 @@ class TestCheckStep(_Base):
                     self.assertNotIn("status", sb.outputs())
                 finally:
                     sb.close()
+
+
+class TestCheckStepTimeout(_Base):
+    """2026-11-04 장애 후속: 무응답 DB 를 무한정 기다리지 않고, 원문을 로그에 남기지 않는다."""
+
+    def test_curl_has_bounded_timeout(self):
+        r = self.sb.run(CHECK["run"], body=json.dumps([{"collected_at": _ago(5)}]))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        args = self.sb.read(self.sb.curl_log).splitlines()
+        self.assertIn("-m", args)
+        self.assertEqual(args[args.index("-m") + 1], "20")
+
+    def test_curl_timeout_fails_without_outputs(self):
+        r = self.sb.run(CHECK["run"], body="", env_extra={"FAKE_CURL_EXIT": "28"})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("응답 없음", r.stdout)
+        self.assertNotIn("status", self.sb.outputs())
+
+    def test_raw_error_body_not_logged(self):
+        html = "<!DOCTYPE html><title>522: Connection timed out</title>Error code 522"
+        r = self.sb.run(CHECK["run"], body=html)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertNotIn("DOCTYPE", r.stdout + r.stderr)
+        self.assertNotIn("Error code", r.stdout + r.stderr)
+        self.assertNotIn("status", self.sb.outputs())
 
 
 class TestDispatchStep(_Base):
