@@ -71,6 +71,14 @@ def _api_error_522():
 
 class TestUpsertPostsContract(unittest.TestCase):
 
+    def setUp(self):
+        # 저장 장부는 실행(프로세스) 단위 상태라 _main 이 매번 초기화한다. upsert 를 직접 부르는
+        # 테스트는 앞 테스트의 일시 장애 누적이 남지 않게 직접 초기화하고, 재시도 대기는 없앤다.
+        db_supabase.ledger.reset()
+        p = patch.object(db_supabase.time, "sleep")
+        p.start()
+        self.addCleanup(p.stop)
+
     def _upsert(self, client, posts):
         with patch.object(db_supabase, "get_client", return_value=client):
             return db_supabase.upsert_posts(posts)

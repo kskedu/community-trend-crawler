@@ -78,7 +78,8 @@ def load_filters_from_db() -> bool:
         logger.info("필터 DB 로드 완료: 키워드 %d개, 패턴 %d개", len(keywords), len(patterns))
         return True
     except Exception as e:
-        logger.warning("필터 DB 로드 실패, fallback 사용: %s", e)
+        from db.supabase import classify_db_error
+        logger.warning("필터 DB 로드 실패, fallback 사용 kind=%s", classify_db_error(e))
         return False
 
 

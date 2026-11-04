@@ -91,7 +91,7 @@ def fetch_daum_seed(limit: int = SEED_MAX) -> Tuple[List[str], bool]:
             )
         return keywords, is_fresh
     except Exception as e:
-        logger.warning("[news] seed: keyword_cache(daum) 조회 실패 → 빈 seed: %s", e)
+        logger.warning("[news] seed: keyword_cache(daum) 조회 실패 → 빈 seed kind=%s", _db_error_kind(e))
         return [], False
 
 
@@ -159,7 +159,7 @@ def fetch_ranked_seed_status(source: str, limit: int = CANDIDATE_SEED_MAX):
         is_fresh = _is_fresh(data.get("updated_at"))
         return ranked, is_fresh, ("ok" if is_fresh else "stale")
     except Exception as e:
-        logger.warning("[news] candidates: keyword_cache(%s) 조회 실패: %s", source, e)
+        logger.warning("[news] candidates: keyword_cache(%s) 조회 실패 kind=%s", source, _db_error_kind(e))
         return [], False, "fetch_failed"
 
 
@@ -178,3 +178,9 @@ def ranked_seed_from_fixture(fixture: dict, limit: int = CANDIDATE_SEED_MAX) -> 
     if not isinstance(fixture, dict):
         return []
     return _extract_ranked(fixture.get("keywords"), limit)
+
+
+def _db_error_kind(e):
+    """조회 실패 로그용 분류명. 예외 원문(응답 HTML·요청 URL)은 남기지 않는다."""
+    from db.supabase import classify_db_error
+    return classify_db_error(e)
