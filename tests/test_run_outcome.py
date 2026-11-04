@@ -163,6 +163,36 @@ class TestGuardedWrite(_Base):
         self.assertEqual([e[2] for e in db_supabase.ledger.entries], ["failed", "ok", "failed", "ok"])
         self.assertEqual(c.executes, 6)
 
+    def test_request_build_errors_are_save_failures_not_crashes(self):
+        # 독립 리뷰 P1: 짝 없는 서로게이트 제목 → httpx JSON 인코딩에서 UnicodeEncodeError.
+        # 기존 except Exception 계약대로 저장 실패(None/False)로 끝나야 한다(run 중단 금지).
+        for exc in (UnicodeEncodeError("utf-8", "a\ud83db", 1, 2, "surrogates not allowed"),
+                    ValueError("Out of range float values are not JSON compliant")):
+            with self.subTest(exc=type(exc).__name__):
+                db_supabase.ledger.reset()
+                c = self.with_client(_FakeClient([exc]))
+                from tests.test_post_save_failure import _posts
+                self.assertIsNone(db_supabase.upsert_posts(_posts(1)))
+                self.assertFalse(db_supabase.upsert_keywords("daum", [{"keyword": "a", "url": "u"}]))
+                self.assertFalse(db_supabase.upsert_news_issues({"keywords": [1]}))
+                self.assertEqual(c.executes, 3)  # 재시도 없음
+                self.assertEqual([e[2:] for e in db_supabase.ledger.entries], [("failed", "unknown")] * 3)
+                self.assertFalse(db_supabase.ledger.db_unavailable)
+
+    def test_real_surrogate_title_through_httpx_is_save_failure(self):
+        # 실제 supabase/httpx 경로(가짜 client 없이)에서 요청 조립 예외가 저장 실패로 끝나는지.
+        # 인코딩 단계에서 실패하므로 네트워크 전송은 일어나지 않는다(127.0.0.1:9 는 쓰이지 않음).
+        from datetime import datetime
+        from models import Post
+        real = db_supabase.create_client(
+            "http://127.0.0.1:9", "aaa.bbb.ccc",
+            options=db_supabase.SyncClientOptions(postgrest_client_timeout=1))
+        self.with_client(real)
+        post = Post(title="a\ud83db", source_url="https://x.test/1", source_site="clien",
+                    created_at=datetime(2026, 11, 5))
+        self.assertIsNone(db_supabase.upsert_posts([post]))
+        self.assertEqual(db_supabase.ledger.entries, [("community_posts", "posts", "failed", "unknown")])
+
     def test_posts_contract_kept(self):
         self.with_client(_FakeClient([_api_error(522)]))
         from tests.test_post_save_failure import _posts
@@ -316,6 +346,17 @@ class TestFullModeKeywordSaveFailure(_Base):
             self.with_client(_FakeClient([_api_error(400)]))
             self.assertEqual(main_module._main("full"), 1)
         self.assertEqual(calls, ["briefing"])
+
+
+class TestNonHttpSaveErrorStillFails(_Base):
+    def test_keyword_encode_error_is_failed_not_partial(self):
+        exc = UnicodeEncodeError("utf-8", "x", 0, 1, "surrogates not allowed")
+        self.with_client(_FakeClient([exc]))
+        with patch.object(main_module, "KEYWORD_SCRAPERS", [_KS("daum")]), \
+             patch.object(main_module, "run_news_briefing"), \
+             self.assertLogs(level="INFO") as logs:
+            self.assertEqual(main_module._main("news_top_only"), 1)
+        self.assertIn("status=FAILED", "\n".join(logs.output))
 
 
 class TestNaverPressWriteFailure(_Base):

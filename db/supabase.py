@@ -110,6 +110,14 @@ def _guarded_write(target: str, source: str, thunk: Callable, retry: bool = True
                 time.sleep(TRANSIENT_RETRY_DELAY_SECONDS)
                 continue
             break
+        except Exception as e:  # noqa: BLE001 — 요청 조립 단계 예외(UnicodeEncodeError·NaN 등)
+            # 기존 upsert_* 는 except Exception 으로 모든 호출 예외를 저장 실패로 바꿨다. 여기서
+            # 놓치면 run() 전체가 중단돼 키워드·뉴스 갱신과 실행 요약이 사라진다. 재시도해도 같은
+            # 결과라 1회로 끝내고, DB 응답 여부와 무관하므로 차단기 집계에도 넣지 않는다.
+            kind = "unknown"
+            logger.error("[%s] %s 저장 실패 kind=unknown(%s)", source, target, type(e).__name__)
+            ledger.record(target, source, "failed", kind)
+            return False, None
     if is_transient(kind):
         ledger.transient_failures += 1
     logger.error("[%s] %s 저장 실패 kind=%s", source, target, kind)
