@@ -5609,7 +5609,8 @@ class TestCollectKeywordCaches(unittest.TestCase):
         with patch.object(main_module, "KEYWORD_SCRAPERS", [fake]), \
              patch.object(main_module, "upsert_keywords", return_value=False):
             main_module._collect_keyword_caches(status)
-        self.assertEqual(status["msn"], "failed")
+        # 수집은 됐는데 DB 저장이 실패한 경우 — 수집 실패("failed")와 구분한다(2026-11-04 장애 후속).
+        self.assertEqual(status["msn"], "save_failed")
 
     def test_scrape_exception_isolated_per_source(self):
         # 한 source의 scrape() 예외가 다른 source 수집을 막지 않아야 한다(기존 run() 동작 유지).

@@ -33,9 +33,11 @@ from keywords.msn import MsnKeywordScraper
 from processor.dedup import dedup
 from processor.filter import filter_notices
 from processor.scorer import score_all
+import json
+
 from db.supabase import (
     upsert_posts, upsert_keywords, upsert_news_issues, fetch_news_issues,
-    record_news_diagnostics,
+    record_news_diagnostics, ledger as save_ledger, classify_db_error,
 )
 from news.movement import apply_movement
 from news.thumbnail import enrich_issue_thumbnails
@@ -131,9 +133,12 @@ KEYWORD_SCRAPERS = [
 ]
 
 
-def run():
+def run(source_status=None):
     all_posts = []
-    source_status = {}  # site_id/source -> "ok" | "failed" | "skipped"
+    # site_id/source -> "ok" | "failed"(수집 실패) | "save_failed"(DB 저장 실패) | "skipped"
+    # caller(_main)가 넘기면 실행 요약에 쓴다.
+    if source_status is None:
+        source_status = {}
 
     for scraper in SCRAPERS:
         logger.info(f"[{scraper.site_id}] 크롤링 시작")
@@ -178,10 +183,11 @@ def run():
     # active(ok/failed)와 skipped를 분리 표시. 판단 자체는 개별 except에서 이미 격리됨.
     ok = [s for s, v in source_status.items() if v == "ok"]
     failed = [s for s, v in source_status.items() if v == "failed"]
+    save_failed = [s for s, v in source_status.items() if v == "save_failed"]
     skipped = [s for s, v in source_status.items() if v == "skipped"]
     logger.info(
-        f"[source 상태] ok={len(ok)} failed={len(failed)} skipped={len(skipped)} "
-        f"| failed={failed} skipped={skipped}"
+        f"[source 상태] ok={len(ok)} failed={len(failed)} save_failed={len(save_failed)} "
+        f"skipped={len(skipped)} | failed={failed} save_failed={save_failed} skipped={skipped}"
     )
 
     # 실시간 이슈 브리핑 (P0-2) — 실패해도 위 커뮤니티/키워드 수집 결과에 영향 없도록 격리
@@ -212,7 +218,9 @@ def _collect_keyword_caches(source_status):
                 source_status[ks.source] = "ok"
             else:
                 logger.warning(f"[{ks.source}] 키워드 저장 실패")
-                source_status[ks.source] = "failed"
+                # 빈 결과(수집 실패)와 DB 저장 실패를 구분한다 — 저장 실패는 실행 요약에서
+                # 필수 저장 실패로 집계된다. 빈 결과는 upsert 를 부르지 않으므로 장부에 없다.
+                source_status[ks.source] = "save_failed" if items else "failed"
         except Exception as e:
             logger.error(f"[{ks.source}] 키워드 실패: {e}")
             source_status[ks.source] = "failed"
@@ -951,6 +959,10 @@ def run_news_briefing(run_type="full"):
     - recent_guard_failed(Top10 중 최근 기사 보유 키워드 < MIN_RECENT_KEYWORDS) → skip
     실패해도 커뮤니티/키워드 수집 결과엔 영향 없도록 격리.
     """
+    # 실행 요약용 news_top 결과. 저장·저장 실패·오래된 실행 생략·예외만 명시하고, 그 밖의
+    # 가드 생략(후보 없음·출처 부족 등)은 기본값 skipped 로 남는다.
+    global _news_top_outcome
+    _news_top_outcome = "skipped"
     # 진단 수집기(순수 관찰). 어떤 오류도 아래 랭킹 흐름에 영향을 주지 않는다.
     run_diag = None
     try:
@@ -1122,6 +1134,7 @@ def run_news_briefing(run_type="full"):
             # 진단: 발행 성공(success)이 아니라 skipped 로 남긴다(Admin 성공 집계에서 제외).
             # skip_reason 은 배포 SQL CHECK 에 등록된 STALE_WRITE_SKIPPED(단일 권위 상수).
             # candidates/decisions/selection_diagnostics 는 이미 위에서 확정돼 보존된다.
+            _news_top_outcome = "skipped_stale"
             _safe_diag(run_diag, lambda: run_diag.mark_skipped(
                 diagnostics.SKIP_REASON_STALE_WRITE))
             # 추적 근거를 thresholds JSONB 의 별도 최상위 namespace 로 적재(selection_
@@ -1139,15 +1152,20 @@ def run_news_briefing(run_type="full"):
         # upsert_news_issues는 예외가 아니라 False를 반환한다(db/supabase.py) —
         # False를 성공으로 기록하지 않는다.
         elif upsert_news_issues(issues, source="news_top"):
+            _news_top_outcome = "saved"
             logger.info(
                 "[news] news_top 저장 완료 (%d개, sources=%s)",
                 len(issues["keywords"]), data_sources,
             )
         else:
             logger.warning("[news] news_top 저장 실패")
+            _news_top_outcome = "save_failed"
             _safe_diag(run_diag, lambda: run_diag.mark_failed("NEWS_TOP_UPSERT_FAILED"))
     except Exception as e:
-        logger.error(f"[news] 실시간 이슈 브리핑 실패(커뮤니티/키워드 수집에는 영향 없음): {e}")
+        _news_top_outcome = "error"
+        # 예외 원문은 남기지 않는다(DB 응답 HTML·요청 URL 이 실릴 수 있다). 타입·분류명만.
+        logger.error("[news] 실시간 이슈 브리핑 실패(커뮤니티/키워드 수집에는 영향 없음): %s kind=%s",
+                     type(e).__name__, classify_db_error(e))
         # skip_reason CHECK에 실행 예외용 값이 없다(배포 스키마) → status=failed만 남기고
         # 사유는 error_summary(예외 타입명)로 기록한다. 새 코드를 임의로 만들지 않는다.
         _safe_diag(run_diag, lambda: run_diag.mark_failed(None, e))
@@ -1156,20 +1174,107 @@ def run_news_briefing(run_type="full"):
         _finalize_diagnostics(run_diag)
 
 
+# run_news_briefing 이 마지막 실행 결과를 남긴다. None = 이번 실행에서 호출되지 않음.
+_news_top_outcome = None
+
+# 실패하면 사용자 화면의 데이터가 갱신되지 않는 저장. google_trends(출처별 보기 보조)와
+# 진단 RPC 는 선택 기능이라 넣지 않는다.
+REQUIRED_SAVE_TARGETS = {"community_posts", "keyword_cache", "news_issue_cache"}
+OPTIONAL_SAVE_SOURCES = {"google_trends"}
+
+
+def summarize_run(mode, source_status, news_outcome, entries, db_unavailable):
+    """실행 결과를 OK / PARTIAL / FAILED 로 판정한다(순수 함수).
+
+    - FAILED: 필수 DB 저장이 1건이라도 실패했다. DB 무응답으로 news_top 이 저장 없이 끝난
+      경우(가드 생략으로 보이더라도 원인이 DB 장애)도 FAILED 다.
+    - PARTIAL: 저장은 모두 됐지만 외부 사이트 수집 실패·선택 저장 실패·뉴스 예외가 있었다.
+    - OK: 그 밖. 비활성 소스·의도된 news_top 가드 생략(last good 유지)은 정상이다.
+    """
+    required_failed = []
+    optional_failed = []
+    kinds = {}
+    for target, source, status, kind in entries:
+        if status == "ok":
+            continue
+        kinds[kind] = kinds.get(kind, 0) + 1
+        if target in REQUIRED_SAVE_TARGETS and source not in OPTIONAL_SAVE_SOURCES:
+            required_failed.append(f"{target}:{source}")
+        else:
+            optional_failed.append(f"{target}:{source}")
+    news = news_outcome
+    if news in ("skipped", "error") and db_unavailable:
+        news = "failed_db_unavailable"
+        required_failed.append("news_issue_cache:news_top(db_unavailable)")
+    fetch_failed = sorted(s for s, v in (source_status or {}).items() if v == "failed")
+    if required_failed:
+        status = "FAILED"
+    elif fetch_failed or optional_failed or news == "error":
+        status = "PARTIAL"
+    else:
+        status = "OK"
+    return {
+        "mode": mode,
+        "status": status,
+        "saves_ok": sum(1 for e in entries if e[2] == "ok"),
+        "required_save_failed": required_failed,
+        "optional_save_failed": optional_failed,
+        "failure_kinds": kinds,
+        "db_unavailable": bool(db_unavailable),
+        "fetch_failed": fetch_failed,
+        "news_top": news,
+    }
+
+
+def _emit_run_summary(summary):
+    """요약을 로그 1줄 + (있으면) GitHub step summary·결과 파일로 남긴다. 비밀·원문 없음."""
+    kinds = ",".join(f"{k}:{v}" for k, v in sorted(summary["failure_kinds"].items())) or "-"
+    line = (
+        f"[run-summary] mode={summary['mode']} status={summary['status']} "
+        f"saves_ok={summary['saves_ok']} required_save_failed={len(summary['required_save_failed'])} "
+        f"kinds={kinds} db_unavailable={str(summary['db_unavailable']).lower()} "
+        f"fetch_failed={len(summary['fetch_failed'])} news_top={summary['news_top']}"
+    )
+    (logger.error if summary["status"] == "FAILED" else logger.info)(line)
+    if summary["status"] == "FAILED":
+        # GitHub Actions 주석 — run 화면 상단에 실패 이유가 보인다.
+        print(f"::error title=crawler save failed::{line}")
+    for env_name, payload in (("GITHUB_STEP_SUMMARY", line + "\n"),
+                              ("CRAWL_OUTCOME_PATH", json.dumps(summary, ensure_ascii=False))):
+        path = os.getenv(env_name)
+        if not path:
+            continue
+        try:
+            with open(path, "a" if env_name == "GITHUB_STEP_SUMMARY" else "w", encoding="utf-8") as f:
+                f.write(payload)
+        except OSError as e:
+            logger.warning("[run-summary] %s 기록 실패: %s", env_name, type(e).__name__)
+
+
 def _main(mode):
     """실행 모드를 분기하고 프로세스 종료 코드를 반환한다.
 
-    full 은 커뮤니티 게시물 저장이 실패(upsert_posts → None)했을 때만 1 이다. 키워드·뉴스
-    등 선택 기능의 실패는 종료 코드에 반영하지 않는다(기존 격리 정책 유지).
+    종료 코드 1 = 필수 DB 저장 실패(community_posts·포털 keyword_cache·news_top) 또는 full 의
+    커뮤니티 게시물 저장 실패. 저장 실패가 있어도 다른 수집·저장은 끝까지 수행한 뒤 판정한다.
+    외부 사이트 수집 실패·선택 기능(google_trends 캐시·진단) 실패·의도된 가드 생략은 0 이다.
     """
+    global _news_top_outcome
+    save_ledger.reset()
+    _news_top_outcome = None
+    source_status = {}
     if mode == "full":
-        return 0 if run() else 1
-    if mode == "news_top_only":
+        run_ok = run(source_status)
+    elif mode == "news_top_only":
         logger.info("[mode] news_top_only — 커뮤니티 수집 생략, 포털 키워드+news_top 갱신")
-        _collect_keyword_caches({})
+        _collect_keyword_caches(source_status)
         run_news_briefing(run_type="news_top_only")
-        return 0
-    raise SystemExit(f"Unknown mode: {mode!r} (allowed: full, news_top_only)")
+        run_ok = True
+    else:
+        raise SystemExit(f"Unknown mode: {mode!r} (allowed: full, news_top_only)")
+    summary = summarize_run(mode, source_status, _news_top_outcome,
+                            list(save_ledger.entries), save_ledger.db_unavailable)
+    _emit_run_summary(summary)
+    return 0 if run_ok and summary["status"] != "FAILED" else 1
 
 
 if __name__ == "__main__":

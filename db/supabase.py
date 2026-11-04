@@ -1,18 +1,127 @@
 import logging
+import time
 from datetime import datetime, timezone
-from typing import List, Dict, Optional
+from typing import Callable, List, Dict, Optional
 from supabase import create_client, Client
+from supabase.lib.client_options import SyncClientOptions
+import httpx
+from postgrest.exceptions import APIError
 from models import Post
 from config import SUPABASE_URL, SUPABASE_KEY
 
 logger = logging.getLogger(__name__)
 _client: Client = None
 
+# DB 요청 1건의 상한(초). 라이브러리 기본 120초는 2026-11-04 장애 때 키워드 저장마다
+# 응답 없이 묶여 news_top_only 1회가 13분 걸렸다. 정상 upsert 는 1초 안팎이다.
+DB_REQUEST_TIMEOUT_SECONDS = 30
+# 멱등 upsert 의 일시 장애 재시도: 1회만, 짧게 쉰 뒤. 무제한 재시도는 하지 않는다.
+TRANSIENT_RETRY_DELAY_SECONDS = 3
+# 한 실행 안에서 일시 장애로 끝난 DB 호출이 이 횟수에 이르면 DB 를 '사용 불가'로 보고
+# 이후 저장은 호출 없이 실패 처리한다(장애 중 실행이 길게 묶이는 것 방지). 실행마다 초기화.
+DB_UNAVAILABLE_AFTER = 2
+
+# 일시 장애로 보는 HTTP 상태: Cloudflare 520~524(오리진 무응답·연결 실패·timeout),
+# 게이트웨이 502~504. 4xx·PostgREST JSON 오류(PGRST·SQLSTATE)는 재시도해도 같으므로 제외.
+_TRANSIENT_HTTP = {502, 503, 504, 520, 521, 522, 523, 524}
+
+
+def classify_db_error(exc: BaseException) -> str:
+    """DB 예외를 로그·집계용 짧은 분류명으로 바꾼다. 예외 메시지·응답 본문은 보지 않는다.
+
+    반환: http_<상태>(예: http_522) · timeout · network · api_error(PostgREST JSON 오류) · unknown.
+    postgrest 는 JSON 이 아닌 오류 응답(Cloudflare HTML 등)을 code=<HTTP 상태 int>,
+    details=<응답 원문> 인 APIError 로 던진다 — 원문은 로그에 남기지 않는다.
+    """
+    if isinstance(exc, APIError):
+        code = getattr(exc, "code", None)
+        if isinstance(code, int) or (isinstance(code, str) and code.isdigit() and len(code) == 3):
+            return f"http_{int(code)}"
+        return "api_error"
+    if isinstance(exc, httpx.TimeoutException):
+        return "timeout"
+    if isinstance(exc, httpx.TransportError):
+        return "network"
+    return "unknown"
+
+
+def is_transient(kind: str) -> bool:
+    if kind in ("timeout", "network"):
+        return True
+    if kind.startswith("http_"):
+        try:
+            return int(kind[5:]) in _TRANSIENT_HTTP
+        except ValueError:
+            return False
+    return False
+
+
+class SaveLedger:
+    """한 실행의 DB 저장 결과 장부. 실행 요약·종료 코드 판정의 근거다.
+
+    entries: (target, source, status, kind) — status 는 ok | failed | skipped_db_unavailable.
+    """
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.entries = []
+        self.transient_failures = 0
+
+    @property
+    def db_unavailable(self) -> bool:
+        return self.transient_failures >= DB_UNAVAILABLE_AFTER
+
+    def record(self, target, source, status, kind=None):
+        self.entries.append((target, source, status, kind))
+
+
+ledger = SaveLedger()
+
+
+def _guarded_write(target: str, source: str, thunk: Callable, retry: bool = True):
+    """DB 쓰기 1건을 실행하고 장부에 남긴다. (ok, result) 반환.
+
+    - DB 가 이미 사용 불가로 판정됐으면 호출하지 않는다(skipped_db_unavailable).
+    - 일시 장애(522·timeout 등)면 retry=True 일 때 1회만 재시도한다. thunk 는 같은 행을
+      다시 보내는 멱등 upsert 여야 한다(행 값은 호출 전에 확정해 둔다).
+    - 로그에는 대상·source·분류명만 남긴다(예외 원문·응답 HTML·payload·키 금지).
+    """
+    if ledger.db_unavailable:
+        logger.error("[%s] %s 저장 생략 kind=db_unavailable (이번 실행에서 DB 응답 없음 판정)",
+                     source, target)
+        ledger.record(target, source, "skipped_db_unavailable", "db_unavailable")
+        return False, None
+    attempts = 2 if retry else 1
+    kind = None
+    for attempt in range(1, attempts + 1):
+        try:
+            result = thunk()
+            ledger.record(target, source, "ok")
+            return True, result
+        except (APIError, httpx.HTTPError) as e:
+            kind = classify_db_error(e)
+            if attempt < attempts and is_transient(kind):
+                logger.warning("[%s] %s 일시 오류 kind=%s → %d초 후 1회 재시도",
+                               source, target, kind, TRANSIENT_RETRY_DELAY_SECONDS)
+                time.sleep(TRANSIENT_RETRY_DELAY_SECONDS)
+                continue
+            break
+    if is_transient(kind):
+        ledger.transient_failures += 1
+    logger.error("[%s] %s 저장 실패 kind=%s", source, target, kind)
+    ledger.record(target, source, "failed", kind)
+    return False, None
+
 
 def get_client() -> Client:
     global _client
     if _client is None:
-        _client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        _client = create_client(
+            SUPABASE_URL, SUPABASE_KEY,
+            options=SyncClientOptions(postgrest_client_timeout=DB_REQUEST_TIMEOUT_SECONDS),
+        )
     return _client
 
 
@@ -45,35 +154,32 @@ def upsert_posts(posts: List[Post]) -> Optional[int]:
             "collected_at": now_iso,
         })
 
-    try:
-        res = (
-            client.table("community_posts")
-            .upsert(rows, on_conflict="source_url")
-            .execute()
-        )
-        count = len(res.data) if res.data else 0
-        logger.info(f"upsert 완료: {count}건")
-        return count
-    except Exception as e:
-        logger.error(f"upsert 실패: {e}")
+    ok, res = _guarded_write(
+        "community_posts", "posts",
+        lambda: client.table("community_posts").upsert(rows, on_conflict="source_url").execute(),
+    )
+    if not ok:
         return None
+    count = len(res.data) if res.data else 0
+    logger.info(f"upsert 완료: {count}건")
+    return count
 
 
 def upsert_keywords(source: str, keywords: List[Dict[str, str]]) -> bool:
-    """keyword_cache 테이블에 upsert."""
+    """keyword_cache 테이블에 upsert. 빈 입력은 저장하지 않는다(last-good 보존)."""
     if not keywords:
         return False
     client = get_client()
-    try:
-        client.table("keyword_cache").upsert({
-            "source": source,
-            "keywords": keywords,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }, on_conflict="source").execute()
-        return True
-    except Exception as e:
-        logger.error(f"[{source}] keyword upsert 실패: {e}")
-        return False
+    row = {
+        "source": source,
+        "keywords": keywords,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    ok, _ = _guarded_write(
+        "keyword_cache", source,
+        lambda: client.table("keyword_cache").upsert(row, on_conflict="source").execute(),
+    )
+    return ok
 
 
 def fetch_news_issues(source: str = "news_top") -> Optional[Dict]:
@@ -98,29 +204,29 @@ def fetch_news_issues(source: str = "news_top") -> Optional[Dict]:
         row = data[0] if isinstance(data, list) else data
         return row.get("issues") if isinstance(row, dict) else None
     except Exception as e:
-        logger.warning(f"[{source}] news issues read 실패(movement 비교 생략): {e}")
+        logger.warning("[%s] news issues read 실패(movement 비교 생략) kind=%s",
+                       source, classify_db_error(e))
         return None
 
 
 def upsert_news_issues(issues: Dict, source: str = "news_top") -> bool:
     """news_issue_cache 테이블에 upsert (실시간 이슈 브리핑).
 
-    ⚠️ P0-1에서는 호출하지 않는다(정의만). 실제 write는 P0-2에서 service_role로 수행.
     on_conflict='source'(PK)로 단일 행 운영.
     """
     if not issues or not issues.get("keywords"):
         return False
     client = get_client()
-    try:
-        client.table("news_issue_cache").upsert({
-            "source": source,
-            "issues": issues,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }, on_conflict="source").execute()
-        return True
-    except Exception as e:
-        logger.error(f"[{source}] news issues upsert 실패: {e}")
-        return False
+    row = {
+        "source": source,
+        "issues": issues,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    ok, _ = _guarded_write(
+        "news_issue_cache", source,
+        lambda: client.table("news_issue_cache").upsert(row, on_conflict="source").execute(),
+    )
+    return ok
 
 
 def upsert_generic_snapshot(source: str, payload: Dict) -> bool:
@@ -133,16 +239,16 @@ def upsert_generic_snapshot(source: str, payload: Dict) -> bool:
     if not source or not isinstance(payload, dict) or not payload:
         return False
     client = get_client()
-    try:
-        client.table("news_issue_cache").upsert({
-            "source": source,
-            "issues": payload,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }, on_conflict="source").execute()
-        return True
-    except Exception as e:
-        logger.error(f"[{source}] generic snapshot upsert 실패: {e}")
-        return False
+    row = {
+        "source": source,
+        "issues": payload,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    ok, _ = _guarded_write(
+        "news_issue_cache", source,
+        lambda: client.table("news_issue_cache").upsert(row, on_conflict="source").execute(),
+    )
+    return ok
 
 
 def record_news_diagnostics(run: Dict, decisions: list) -> bool:
@@ -151,10 +257,15 @@ def record_news_diagnostics(run: Dict, decisions: list) -> bool:
     - 테이블 직접 write 금지 — service_role은 이 RPC EXECUTE 권한만 갖는다.
     - 멱등: 동일 run_key면 기존 run_id를 반환하고 decisions를 추가하지 않는다(RPC 계약).
     - 실패해도 news_top 결과를 되돌리거나 실패시키지 않는다 → bool만 반환한다.
+      관찰용이라 저장 장부(ledger)·종료 코드에는 넣지 않고, 재시도도 하지 않는다.
+      이번 실행에서 DB 가 이미 응답 없음으로 판정됐으면 호출하지 않는다.
     - 로그에 예외 메시지를 남기지 않는다: postgrest/httpx 예외 메시지에는 요청 payload와
-      Authorization 헤더가 실릴 수 있다(사용자 확정 §10-1). 타입명만 남긴다.
+      Authorization 헤더가 실릴 수 있다(사용자 확정 §10-1). 분류명만 남긴다.
     """
     if not run:
+        return False
+    if ledger.db_unavailable:
+        logger.warning("[news-diag] 진단 적재 생략 kind=db_unavailable(랭킹 영향 없음)")
         return False
     client = get_client()
     try:
@@ -164,5 +275,6 @@ def record_news_diagnostics(run: Dict, decisions: list) -> bool:
         }).execute()
         return True
     except Exception as e:
-        logger.warning("[news-diag] 진단 적재 실패(랭킹 영향 없음): %s", type(e).__name__)
+        logger.warning("[news-diag] 진단 적재 실패(랭킹 영향 없음): %s kind=%s",
+                       type(e).__name__, classify_db_error(e))
         return False
