@@ -78,7 +78,10 @@ jobs:
             echo "status=down" >> $GITHUB_OUTPUT
           fi
 
+      # 결과는 steps.dispatch.outputs.result 로 남겨 알림 문구가 실제 조치를 그대로 쓴다:
+      #   dispatched · skipped_active · skipped_lookup_failed · skipped_crawler_failing · dispatch_failed
       - name: Trigger crawler (stale or down)
+        id: dispatch
         if: steps.check.outputs.status != 'ok'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -103,30 +106,68 @@ jobs:
                 --workflow crawl.yml --status queued \
                 --json databaseId --jq 'length' 2>/dev/null)"; then
             echo "⚠️ crawl.yml queued 조회 실패 → fail-closed: dispatch 생략(다음 주기 복구)"
+            echo "result=skipped_lookup_failed" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if ! RUNNING="$(gh run list --repo "${{ github.repository }}" \
                 --workflow crawl.yml --status in_progress \
                 --json databaseId --jq 'length' 2>/dev/null)"; then
             echo "⚠️ crawl.yml in_progress 조회 실패 → fail-closed: dispatch 생략(다음 주기 복구)"
+            echo "result=skipped_lookup_failed" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           ACTIVE=$(( ${QUEUED:-0} + ${RUNNING:-0} ))
           if [ "$ACTIVE" != "0" ]; then
             echo "⏭️ crawl.yml 이 이미 실행 중/대기 중(queued=${QUEUED} in_progress=${RUNNING}) → dispatch 생략(중복 방지)"
+            echo "result=skipped_active" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # 크롤러는 돌고 있는데 저장에 실패하는 중이면(직전 완료 실행 failure) 재촉발하지 않는다 —
+          # DB 장애 중 재실행은 같은 실패만 늘린다. 이 경우 장애 알림은 crawl.yml 알림 단계가
+          # 1회 보낸다(중복 방지). 조회 실패는 위와 같이 fail-closed.
+          if ! LAST="$(gh run list --repo "${{ github.repository }}" \
+                --workflow crawl.yml --status completed --limit 1 \
+                --json conclusion --jq '.[0].conclusion // ""' 2>/dev/null)"; then
+            echo "⚠️ crawl.yml 직전 결과 조회 실패 → fail-closed: dispatch 생략(다음 주기 복구)"
+            echo "result=skipped_lookup_failed" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$LAST" = "failure" ]; then
+            echo "⏭️ crawl.yml 직전 실행이 실패 → 저장 장애로 보고 dispatch 생략(crawl 알림이 담당)"
+            echo "result=skipped_crawler_failing" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           echo "🔄 크롤러 재실행 트리거 (status=${{ steps.check.outputs.status }}, active=0)"
-          gh workflow run "Community Trend Crawler" --ref main \
-            --repo ${{ github.repository }}
+          if gh workflow run "Community Trend Crawler" --ref main \
+            --repo ${{ github.repository }}; then
+            echo "result=dispatched" >> "$GITHUB_OUTPUT"
+          else
+            # 요청 실패를 '재실행됨'으로 알리지 않는다. 결과를 남기고 step 은 실패로 드러낸다.
+            echo "result=dispatch_failed" >> "$GITHUB_OUTPUT"
+            echo "::error title=crawler dispatch failed::크롤러 재실행 요청 실패"
+            exit 1
+          fi
 
       - name: Send Telegram alert (down only)
-        if: steps.check.outputs.status == 'down' || inputs.force_alert == true
+        # always(): 재실행 요청이 실패해도 알림은 나간다. 크롤러가 저장 실패 중이면(crawl.yml 알림이
+        # 담당) 보내지 않는다 — 같은 장애를 두 번 알리지 않기 위해서다. force_alert 는 그대로.
+        if: always() && (inputs.force_alert == true || (steps.check.outputs.status == 'down' && steps.dispatch.outputs.result != 'skipped_crawler_failing'))
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DISPATCH_RESULT: ${{ steps.dispatch.outputs.result }}
         run: |
           ELAPSED=${{ steps.check.outputs.elapsed_min }}
+          ELAPSED=${ELAPSED:-0}
+          # 조치 문구는 재실행 단계의 실제 결과만 쓴다. 요청 전송은 '완료'가 아니다.
+          case "${DISPATCH_RESULT:-}" in
+            dispatched) ACTION="크롤러 재실행 요청 전송(실행 결과는 미확인)";;
+            skipped_active) ACTION="크롤러가 이미 실행/대기 중이라 재실행 요청 생략";;
+            skipped_lookup_failed) ACTION="실행 목록 조회 실패로 재실행 요청 생략";;
+            skipped_crawler_failing) ACTION="크롤러 저장 실패 중이라 재실행 요청 생략";;
+            dispatch_failed) ACTION="크롤러 재실행 요청 실패 — 수동 확인 필요";;
+            *) ACTION="재실행 요청 없음";;
+          esac
           HOURS=$((ELAPSED / 60))
           MINS=$((ELAPSED % 60))
           LAST_AT_KST=$(python3 -c "
@@ -139,13 +180,19 @@ jobs:
 
           마지막 수집: ${LAST_AT_KST}
           경과 시간: ${HOURS}시간 ${MINS}분
-          조치: 크롤러 자동 재실행 트리거됨
+          조치: ${ACTION}
 
           GitHub: https://github.com/${{ github.repository }}/actions"
 
-          curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+          # 전송 결과를 확인한다(실패를 '전송 완료'로 쓰지 않는다). 응답 본문·URL 은 출력하지 않는다.
+          CODE=$(curl -s -m 10 -o /dev/null -w "%{http_code}" \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id=${TELEGRAM_CHAT_ID} \
             -d text="${MESSAGE}" \
-            -d disable_web_page_preview=true
-          echo ""
-          echo "텔레그램 알림 전송 완료"
+            -d disable_web_page_preview=true) || CODE="000"
+          if [ "${CODE:0:1}" = "2" ]; then
+            echo "텔레그램 알림 전송 완료 (HTTP ${CODE})"
+          else
+            echo "::error title=telegram alert failed::텔레그램 알림 전송 실패 (HTTP ${CODE})"
+            exit 1
+          fi

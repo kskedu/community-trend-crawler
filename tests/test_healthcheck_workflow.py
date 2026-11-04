@@ -55,7 +55,7 @@ def _render(script, outputs=None, inputs=None):
 
     def sub(m):
         expr = m.group(1).strip()
-        if expr.startswith("steps.check.outputs."):
+        if expr.startswith("steps.check.outputs.") or expr.startswith("steps.dispatch.outputs."):
             return str(outputs.get(expr.rsplit(".", 1)[1], ""))
         if expr.startswith("inputs."):
             return str(inputs.get(expr.split(".", 1)[1], ""))
@@ -83,13 +83,16 @@ class _Sandbox:
         # 가짜 curl: 인자를 한 줄씩 기록하고 FAKE_CURL_BODY 파일 내용을 출력한다.
         self._tool("curl", 'for a in "$@"; do printf "%s\\n" "$a"; done >> "$CURL_LOG"; '
                            'printf -- "---\\n" >> "$CURL_LOG"; '
-                           '[ -n "${FAKE_CURL_BODY:-}" ] && cat "$FAKE_CURL_BODY"; exit ${FAKE_CURL_EXIT:-0}')
+                           '[ -n "${FAKE_CURL_BODY:-}" ] && cat "$FAKE_CURL_BODY"; '
+                           '[ -n "${FAKE_CURL_OUT:-}" ] && printf "%s" "$FAKE_CURL_OUT"; exit ${FAKE_CURL_EXIT:-0}')
         # 가짜 gh: 인자를 기록하고 FAKE_GH_<status> 값으로 응답, FAKE_GH_FAIL=1 이면 실패.
         self._tool("gh", 'printf "%s\\n" "$*" >> "$GH_LOG"; '
                          '[ "${FAKE_GH_FAIL:-0}" = "1" ] && exit 1; '
                          '[ -n "${FAKE_GH_FAIL_STATUS:-}" ] && case "$*" in '
                          '*"--status ${FAKE_GH_FAIL_STATUS}"*) exit 1;; esac; '
                          'case "$*" in '
+                         '"workflow run"*) [ "${FAKE_GH_DISPATCH_FAIL:-0}" = "1" ] && exit 1;; '
+                         '*"--status completed"*) echo "${FAKE_GH_LAST:-success}";; '
                          '*"--status queued"*) echo "${FAKE_GH_QUEUED:-0}";; '
                          '*"--status in_progress"*) echo "${FAKE_GH_RUNNING:-0}";; '
                          'esac; exit 0')
@@ -353,11 +356,96 @@ class TestDispatchStep(_Base):
                     sb.close()
 
 
+class TestDispatchResult(_Base):
+    """재실행 단계가 실제 결과를 남기고, 저장 실패 중인 크롤러는 재촉발하지 않는다(2026-11-04 후속)."""
+
+    def _go(self, sb, **env):
+        script = _render(DISPATCH["run"], outputs={"status": "down"})
+        r = sb.run(script, env_extra={k: str(v) for k, v in env.items()})
+        return r, sb.outputs().get("result"), sb.read(sb.gh_log)
+
+    def test_results(self):
+        cases = [
+            ({}, 0, "dispatched", True),
+            ({"FAKE_GH_QUEUED": 1}, 0, "skipped_active", False),
+            ({"FAKE_GH_FAIL": 1}, 0, "skipped_lookup_failed", False),
+            ({"FAKE_GH_FAIL_STATUS": "completed"}, 0, "skipped_lookup_failed", False),
+            ({"FAKE_GH_LAST": "failure"}, 0, "skipped_crawler_failing", False),
+            ({"FAKE_GH_LAST": "cancelled"}, 0, "dispatched", True),
+            ({"FAKE_GH_DISPATCH_FAIL": 1}, 1, "dispatch_failed", True),
+        ]
+        for env, code, result, dispatched in cases:
+            with self.subTest(env=env):
+                sb = _Sandbox()
+                try:
+                    r, got, log = self._go(sb, **env)
+                    self.assertEqual(r.returncode, code, r.stdout + r.stderr)
+                    self.assertEqual(got, result)
+                    self.assertEqual("workflow run" in log, dispatched)
+                finally:
+                    sb.close()
+
+
+class TestAlertMessageMatchesAction(_Base):
+    """알림 문구는 실제 조치만 쓴다. '재실행 트리거됨/완료' 같은 확정 문구를 쓰지 않는다."""
+
+    def _alert(self, sb, result, curl_out="200", curl_exit="0"):
+        script = _render(ALERT["run"], outputs={"elapsed_min": "300", "last_at": "2026-11-04T12:00:00+00:00",
+                                                "result": result})
+        env = {k: _render(str(v), outputs={"result": result}) for k, v in ALERT["env"].items()}
+        env.update({"FAKE_CURL_OUT": curl_out, "FAKE_CURL_EXIT": curl_exit})
+        r = sb.run(script, env_extra=env)
+        return r, sb.read(sb.curl_log)
+
+    def test_action_text_per_result(self):
+        expect = {
+            "dispatched": "조치: 크롤러 재실행 요청 전송(실행 결과는 미확인)",
+            "skipped_active": "조치: 크롤러가 이미 실행/대기 중이라 재실행 요청 생략",
+            "skipped_lookup_failed": "조치: 실행 목록 조회 실패로 재실행 요청 생략",
+            "dispatch_failed": "조치: 크롤러 재실행 요청 실패 — 수동 확인 필요",
+            "": "조치: 재실행 요청 없음",
+        }
+        for result, text in expect.items():
+            with self.subTest(result=result):
+                sb = _Sandbox()
+                try:
+                    r, log = self._alert(sb, result)
+                    self.assertEqual(r.returncode, 0, r.stderr)
+                    self.assertIn(text, log)
+                    self.assertNotIn("트리거됨", log)
+                    self.assertNotIn("재실행 완료", log)
+                finally:
+                    sb.close()
+
+    def test_telegram_failure_is_not_reported_as_sent(self):
+        for out, ex in (("401", "0"), ("", "28"), ("500", "0")):
+            with self.subTest(out=out, ex=ex):
+                sb = _Sandbox()
+                try:
+                    r, _ = self._alert(sb, "dispatched", curl_out=out, curl_exit=ex)
+                    self.assertNotEqual(r.returncode, 0)
+                    self.assertNotIn("전송 완료", r.stdout)
+                    self.assertIn("전송 실패", r.stdout)
+                    self.assertNotIn("FAKE_SECRET", r.stdout + r.stderr)
+                finally:
+                    sb.close()
+
+    def test_telegram_curl_has_timeout(self):
+        sb = _Sandbox()
+        try:
+            self._alert(sb, "dispatched")
+            args = sb.read(sb.curl_log).splitlines()
+            self.assertEqual(args[args.index("-m") + 1], "10")
+        finally:
+            sb.close()
+
+
 class TestAlertStep(_Base):
     def test_condition_unchanged(self):
         self.assertEqual(
             ALERT["if"],
-            "steps.check.outputs.status == 'down' || inputs.force_alert == true",
+            "always() && (inputs.force_alert == true || (steps.check.outputs.status == 'down'"
+            " && steps.dispatch.outputs.result != 'skipped_crawler_failing'))",
         )
 
     def test_message_uses_last_at_in_kst(self):
@@ -366,6 +454,7 @@ class TestAlertStep(_Base):
             outputs={"elapsed_min": "305", "last_at": "2026-11-02T00:30:00.123+00:00"},
         )
         step_env = {k: _render(str(v)) for k, v in ALERT["env"].items()}
+        step_env["FAKE_CURL_OUT"] = "200"
         r = self.sb.run(script, env_extra=step_env)
         self.assertEqual(r.returncode, 0, r.stderr)
         log = self.sb.read(self.sb.curl_log)

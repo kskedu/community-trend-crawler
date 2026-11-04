@@ -347,6 +347,22 @@ class TestRunEndToEnd(_Base):
                 self.assertEqual((r["decision"], r["sent"]), ("DOWN", False))
                 self.assertIn("Telegram 전송 실패", log)
 
+    def test_undelivered_alert_is_annotated(self):
+        # continue-on-error 로 step 이 초록이어도 알림 실패는 run 화면 주석으로 남는다.
+        self.write_outcome("FAILED")
+        net = _FakeNet(runs=_hist("failure", "success"), tg_status=500)
+        with patch("builtins.print") as pr:
+            self.go(net, self.env())
+        self.assertTrue(any("::warning title=crawl alert not delivered::" in str(c.args[0])
+                            for c in pr.call_args_list))
+
+    def test_undecided_failure_is_annotated(self):
+        self.write_outcome("FAILED")
+        with patch("builtins.print") as pr:
+            self.go(_FakeNet(gh_exc=urllib.error.URLError("x")), self.env())
+        self.assertTrue(any("::warning title=crawl alert undecided::" in str(c.args[0])
+                            for c in pr.call_args_list))
+
     def test_missing_telegram_config(self):
         self.write_outcome("FAILED")
         net = _FakeNet(runs=_hist("failure", "success"))

@@ -16,6 +16,10 @@ Supabase Dashboard 의 Healthy 표시는 쓰지 않는다 — 실제 저장 성�
 - 판단 불가(결과 파일 누락·손상, 저장 근거 없음, 직전 기록 조회 실패, 실행 취소)는 알리지
   않는다 — 특히 복구는 근거 없이 선언하지 않는다(fail-closed).
 - main 브랜치 실행만 알린다(기능 브랜치 수동 실행이 운영 알림을 보내지 않게).
+- 감지 한계: 크롤러 step 이 timeout(20분)으로 끝나면 결과 파일이 없어 '원인 미상 실패'로 센다.
+  실행이 취소되면(cancelled) 판정하지 않고, 이력에서도 빠진다. job 자체가 시작되지 않는 경우
+  (cron-job.org 정지·Actions 장애)는 이 단계가 돌지 않으므로 healthcheck.yml(데이터 경과 시간)
+  이 담당한다. 알림 실패·판정 불가는 Actions 주석(::warning)으로 run 화면에 남긴다.
 - 자동 재실행·DB 재시작은 하지 않는다. 이 스크립트는 항상 종료 코드 0 이다(실행 결론을
   바꾸면 다음 실행의 이력 판단이 틀어진다).
 - 토큰·키는 출력하지 않는다. 예외는 타입명만 남긴다.
@@ -271,6 +275,12 @@ def run(env):
         msg = build_message(decision, state, outcome, history, auth, run_url)
         sent = send_telegram(env.get("TELEGRAM_BOT_TOKEN", ""), env.get("TELEGRAM_CHAT_ID", ""), msg)
         logger.info("[crawl-alert] auth_health=%s", auth)
+    # continue-on-error 로 step 이 실패 표시되지 않으므로, 알림을 못 보낸 경우는 Actions 주석으로
+    # run 화면에 드러낸다(알림 실패를 조용히 숨기지 않는다).
+    if sent is False:
+        print(f"::warning title=crawl alert not delivered::{decision} 알림 전송 실패 — Telegram 미전달")
+    elif state in ("FAILED", "FAILED_UNKNOWN") and reason.startswith("history_unavailable"):
+        print("::warning title=crawl alert undecided::직전 실행 기록 조회 실패로 연속 실패 판정 불가")
     line = (f"[crawl-alert] state={state} decision={decision} reason={reason} "
             f"history={','.join(c for c, _ in history[:3]) or '-'} "
             f"sent={'-' if sent is None else str(sent).lower()}")
