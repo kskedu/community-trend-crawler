@@ -152,6 +152,17 @@ class TestGuardedWrite(_Base):
         self.assertFalse(db_supabase.record_news_diagnostics({"run_key": "k"}, []))
         self.assertEqual(c.executes, 4)
 
+    def test_breaker_counts_consecutive_only(self):
+        # 일시 장애 1건 → 성공 → 일시 장애 1건: DB 는 응답하고 있으므로 차단하지 않는다.
+        ok = [{"source": "x"}]
+        t = _api_error(522)
+        c = self.with_client(_FakeClient([t, t, ok, t, t, ok]))
+        for src in ("danawa", "daum", "nate", "msn"):
+            db_supabase.upsert_keywords(src, [{"keyword": "a", "url": "u"}])
+        self.assertFalse(db_supabase.ledger.db_unavailable)
+        self.assertEqual([e[2] for e in db_supabase.ledger.entries], ["failed", "ok", "failed", "ok"])
+        self.assertEqual(c.executes, 6)
+
     def test_posts_contract_kept(self):
         self.with_client(_FakeClient([_api_error(522)]))
         from tests.test_post_save_failure import _posts

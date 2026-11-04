@@ -17,8 +17,9 @@ _client: Client = None
 DB_REQUEST_TIMEOUT_SECONDS = 30
 # 멱등 upsert 의 일시 장애 재시도: 1회만, 짧게 쉰 뒤. 무제한 재시도는 하지 않는다.
 TRANSIENT_RETRY_DELAY_SECONDS = 3
-# 한 실행 안에서 일시 장애로 끝난 DB 호출이 이 횟수에 이르면 DB 를 '사용 불가'로 보고
-# 이후 저장은 호출 없이 실패 처리한다(장애 중 실행이 길게 묶이는 것 방지). 실행마다 초기화.
+# 한 실행 안에서 일시 장애로 끝난 DB 호출이 '연속으로' 이 횟수에 이르면 DB 를 '사용 불가'로
+# 보고 이후 저장은 호출 없이 실패 처리한다(장애 중 실행이 길게 묶이는 것 방지). 중간에 저장이
+# 한 번이라도 성공하면 0 으로 돌아간다(일시 흔들림으로 정상 DB 의 저장을 막지 않는다). 실행마다 초기화.
 DB_UNAVAILABLE_AFTER = 2
 
 # 일시 장애로 보는 HTTP 상태: Cloudflare 520~524(오리진 무응답·연결 실패·timeout),
@@ -98,6 +99,7 @@ def _guarded_write(target: str, source: str, thunk: Callable, retry: bool = True
     for attempt in range(1, attempts + 1):
         try:
             result = thunk()
+            ledger.transient_failures = 0
             ledger.record(target, source, "ok")
             return True, result
         except (APIError, httpx.HTTPError) as e:
