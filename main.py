@@ -1217,6 +1217,10 @@ def summarize_run(mode, source_status, news_outcome, entries, db_unavailable):
         "mode": mode,
         "status": status,
         "saves_ok": sum(1 for e in entries if e[2] == "ok"),
+        # 복구 판정용: 필수 대상 저장 성공 수(google_trends 등 선택 저장 제외).
+        "required_saves_ok": sum(1 for t, src, st, _ in entries
+                                 if st == "ok" and t in REQUIRED_SAVE_TARGETS
+                                 and src not in OPTIONAL_SAVE_SOURCES),
         "required_save_failed": required_failed,
         "optional_save_failed": optional_failed,
         "failure_kinds": kinds,
