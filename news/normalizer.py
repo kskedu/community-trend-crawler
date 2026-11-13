@@ -11,6 +11,7 @@
 import html
 import logging
 import re
+import unicodedata
 from datetime import datetime, timezone
 from typing import Optional, Tuple
 from urllib.parse import urlparse
@@ -19,6 +20,17 @@ logger = logging.getLogger(__name__)
 
 SNIPPET_MAX = 150
 _TAG_RE = re.compile(r"<[^>]+>")
+
+# 기사 언어 안전장치. Naver News API에는 기사 언어 metadata가 없으므로 title과
+# description/snippet의 실제 문자 근거를 함께 본다. 한국어 기사에 영문 고유명사가 많은
+# 경우를 보존하기 위해 한글이 하나라도 있으면 이 gate에서는 차단하지 않는다. 반대로
+# 한글이 전혀 없는 짧은 브랜드명/약어도 근거 부족으로 허용한다. 두 필드가 모두 충분히
+# 길거나, 한 필드만 있어도 외국 문자 근거가 강할 때만 고신뢰 외국어로 판정한다.
+_LANG_FIELD_MIN_LETTERS = 10
+_LANG_COMBINED_MIN_LETTERS = 30
+_LANG_SINGLE_FIELD_MIN_LETTERS = 40
+_LANG_FOREIGN_SCRIPT_MIN_LETTERS = 12
+_LANG_ACCENTED_LATIN_MIN_LETTERS = 3
 
 # 검색/랭킹의 주제 근거가 될 수 없는 기사 섹션·편집 라벨. 원문 title은 그대로
 # 보존하고, relevance/phrase/grounding 판정용 view에서 선두 대괄호 prefix만 제거한다.
@@ -138,6 +150,79 @@ def strip_tags(text: Optional[str]) -> str:
     no_tags = _TAG_RE.sub("", text)
     unescaped = html.unescape(no_tags)
     return unescaped.strip()
+
+
+def _is_hangul_letter(ch: str) -> bool:
+    code = ord(ch)
+    return (
+        0xAC00 <= code <= 0xD7A3      # Hangul syllables
+        or 0x1100 <= code <= 0x11FF   # Hangul Jamo
+        or 0x3130 <= code <= 0x318F   # Compatibility Jamo
+        or 0xA960 <= code <= 0xA97F   # Jamo Extended-A
+        or 0xD7B0 <= code <= 0xD7FF   # Jamo Extended-B
+    )
+
+
+def _language_counts(text: Optional[str]) -> dict:
+    """언어 판정용 문자 수. 도메인/언론사명은 의도적으로 보지 않는다."""
+    value = unicodedata.normalize("NFC", strip_tags(text))
+    letters = hangul = foreign_script = accented_latin = 0
+    for ch in value:
+        if not unicodedata.category(ch).startswith("L"):
+            continue
+        letters += 1
+        if _is_hangul_letter(ch):
+            hangul += 1
+            continue
+        name = unicodedata.name(ch, "")
+        if "LATIN" in name:
+            if ord(ch) > 127:
+                accented_latin += 1
+        else:
+            # Han/Kana/Thai/Cyrillic 등. 한국 기사 제목의 '中' 같은 한 글자는 아래
+            # 최소 문자 수에 못 미쳐 차단 근거가 되지 않는다.
+            foreign_script += 1
+    return {
+        "letters": letters,
+        "hangul": hangul,
+        "foreign_script": foreign_script,
+        "accented_latin": accented_latin,
+    }
+
+
+def is_high_confidence_foreign_article(
+    title: Optional[str], description: Optional[str]
+) -> bool:
+    """title/description 근거가 충분한, 고신뢰 비한국어 기사만 True.
+
+    fail-open 조건:
+    - 어느 필드든 한글이 있으면 한국어/혼합 기사로 보존한다.
+    - 짧은 제목·약어·브랜드명 또는 설명 결측은 차단하지 않는다.
+
+    차단 조건(모두 한글 0 전제):
+    - title과 description이 각각 충분히 긴 외국어 텍스트이거나,
+    - 한 필드뿐이어도 긴 영문 문장, 다수의 비라틴 문자, 또는 베트남어처럼
+      accented Latin 근거가 반복되는 경우.
+    """
+    fields = [_language_counts(title), _language_counts(description)]
+    if any(field["hangul"] for field in fields):
+        return False
+
+    substantive = [f for f in fields if f["letters"] >= _LANG_FIELD_MIN_LETTERS]
+    total_letters = sum(f["letters"] for f in fields)
+    total_foreign_script = sum(f["foreign_script"] for f in fields)
+    total_accented_latin = sum(f["accented_latin"] for f in fields)
+
+    if len(substantive) >= 2 and total_letters >= _LANG_COMBINED_MIN_LETTERS:
+        return True
+    if total_foreign_script >= _LANG_FOREIGN_SCRIPT_MIN_LETTERS:
+        return True
+    if (
+        total_accented_latin >= _LANG_ACCENTED_LATIN_MIN_LETTERS
+        and total_letters >= _LANG_COMBINED_MIN_LETTERS
+    ):
+        return True
+    return total_letters >= _LANG_SINGLE_FIELD_MIN_LETTERS
 
 
 def safe_url(url: Optional[str]) -> Optional[str]:
@@ -262,6 +347,9 @@ def normalize_article(raw: dict) -> Optional[dict]:
         return None
 
     description_raw = raw.get("description") or raw.get("snippet")
+    if is_high_confidence_foreign_article(title, description_raw):
+        logger.debug("[news] 고신뢰 외국어 기사 제외: url=%s", url)
+        return None
     clean_desc, desc_quality, desc_drop_reason, desc_usable = clean_description(description_raw)
 
     return {
