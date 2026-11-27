@@ -214,16 +214,19 @@ def build_thumbnail_cache(previous_issues: Optional[dict]) -> Dict[str, str]:
     for kw in keywords:
         if not isinstance(kw, dict):
             continue
-        articles = kw.get("articles")
-        if not isinstance(articles, list):
-            continue
-        for art in articles:
-            if not isinstance(art, dict):
+        # 저장된 news_top 은 display_articles 가 있으면 중복 articles 를 저장하지 않는다(F7-NF-01 · news/publish.py) —
+        #   두 목록을 모두 읽어 이전 썸네일 재사용이 줄지 않게 한다(구 형식 행도 그대로 읽힌다).
+        for field in ("articles", "display_articles"):
+            articles = kw.get(field)
+            if not isinstance(articles, list):
                 continue
-            url = _norm_url(art.get("url"))
-            thumb = art.get("thumbnail")
-            if url and isinstance(thumb, str) and is_acceptable_thumbnail(thumb):
-                cache.setdefault(url, thumb)
+            for art in articles:
+                if not isinstance(art, dict):
+                    continue
+                url = _norm_url(art.get("url"))
+                thumb = art.get("thumbnail")
+                if url and isinstance(thumb, str) and is_acceptable_thumbnail(thumb):
+                    cache.setdefault(url, thumb)
     return cache
 
 

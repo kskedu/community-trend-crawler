@@ -8,6 +8,7 @@ import httpx
 from postgrest.exceptions import APIError
 from postgrest.types import CountMethod, ReturnMethod
 from models import Post
+from news import publish
 from config import SUPABASE_URL, SUPABASE_KEY
 
 logger = logging.getLogger(__name__)
@@ -231,10 +232,18 @@ def fetch_news_issues(source: str = "news_top") -> Optional[Dict]:
 def upsert_news_issues(issues: Dict, source: str = "news_top") -> bool:
     """news_issue_cache 테이블에 upsert (실시간 이슈 브리핑).
 
-    on_conflict='source'(PK)로 단일 행 운영.
+    on_conflict='source'(PK)로 단일 행 운영. source='news_top' 은 목록·상세 행과 함께 한 문장으로 게시한다
+    (B4 — upsert_news_top_bundle). 반환은 지금처럼 'news_top 이 저장됐는가' 하나다.
     """
     if not issues or not issues.get("keywords"):
         return False
+    if source == "news_top":
+        return upsert_news_top_bundle(issues) is not None
+    return _upsert_issue_row(issues, source)
+
+
+def _upsert_issue_row(issues: Dict, source: str) -> bool:
+    """news_issue_cache 한 행 저장(번들 이전의 news_top 저장 방식 그대로)."""
     client = get_client()
     row = {
         "source": source,
@@ -246,6 +255,48 @@ def upsert_news_issues(issues: Dict, source: str = "news_top") -> bool:
         lambda: client.table("news_issue_cache").upsert(row, on_conflict="source", **_WRITE_OPTS).execute(),
     )
     return ok
+
+
+def upsert_news_top_bundle(issues: Dict) -> Optional[str]:
+    """news_top(저장용) · news_top_list · news_top_detail_<rank> 를 **한 upsert 문장**으로 함께 저장한다(B4).
+
+    한 INSERT ... ON CONFLICT 문장이라 원자적이다 — 목록·상세가 일부만 게시되지 않는다.
+    반환: "bundle"(세 종류 저장) · "single"(번들이 일시 장애가 아닌 오류로 거부돼 news_top 만 기존 방식으로 저장) · None(실패).
+    번들 거부 대비(운영 표 제약을 저장소에서 확인할 수 없다): news_top 갱신이 멈추지 않게 기존 단일 행 저장으로 대신한다.
+    """
+    if not issues or not issues.get("keywords"):
+        return None
+    try:
+        stored = publish.storage_issues(issues)
+        list_payload = publish.build_list_payload(issues)
+        details = publish.build_detail_payloads(issues)
+    except Exception as e:  # noqa: BLE001 — 게시 형식 오류(개발 오류)가 news_top 갱신을 막지 않게
+        logger.warning("[news_top] 목록·상세 payload 생성 실패(%s) → news_top 단일 저장", type(e).__name__)
+        return "single" if _upsert_issue_row(issues, "news_top") else None
+    client = get_client()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    rows = [{"source": "news_top", "issues": stored, "updated_at": now_iso},
+            {"source": "news_top_list", "issues": list_payload, "updated_at": now_iso}]
+    rows += [{"source": src, "issues": payload, "updated_at": now_iso} for src, payload in details]
+    ok, _ = _guarded_write(
+        "news_issue_cache", "news_top_bundle",
+        lambda: client.table("news_issue_cache").upsert(rows, on_conflict="source", **_WRITE_OPTS).execute(),
+    )
+    if ok:
+        return "bundle"
+    # 장부의 번들 실패 항목은 선택 저장(main.OPTIONAL_SAVE_SOURCES 의 news_top_bundle)이다 — 대신 저장이 성공하면 PARTIAL,
+    #   대신 저장도 실패하면 그 news_top 항목이 필수 실패로 남아 FAILED.
+    #   대신 저장은 서버가 요청을 거부한 경우(PostgREST 오류·4xx — 예: 표 제약)만이다. 일시 장애·DB 사용 불가·요청 조립 오류
+    #   (같은 데이터라 다시 보내도 같다)는 대신 저장하지 않고, 장부 항목을 news_top 실패 1건으로 바꿔 둔다(기존 장부 계약 그대로).
+    last = ledger.entries[-1] if ledger.entries else None
+    kind = last[3] if last else None
+    rejected = bool(kind) and (kind == "api_error" or (kind.startswith("http_4")))
+    if not rejected:
+        if last and last[1] == "news_top_bundle":
+            ledger.entries[-1] = (last[0], "news_top", last[2], last[3])
+        return None
+    logger.warning("[news_top] 번들 저장 거부 kind=%s → news_top 단일 행으로 대신 저장(목록·상세 갱신 없음)", kind)
+    return "single" if _upsert_issue_row(issues, "news_top") else None
 
 
 def upsert_generic_snapshot(source: str, payload: Dict) -> bool:
