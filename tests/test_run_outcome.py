@@ -60,7 +60,8 @@ class _FakeClient:
     def rpc(self, name, params):
         return self
 
-    def upsert(self, row, on_conflict=None):
+    def upsert(self, row, on_conflict=None, **opts):
+        self.upsert_opts = getattr(self, 'upsert_opts', []) + [opts]
         return self
 
     def execute(self):
