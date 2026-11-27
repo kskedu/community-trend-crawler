@@ -6,6 +6,7 @@ from supabase import create_client, Client
 from supabase.lib.client_options import SyncClientOptions
 import httpx
 from postgrest.exceptions import APIError
+from postgrest.types import CountMethod, ReturnMethod
 from models import Post
 from config import SUPABASE_URL, SUPABASE_KEY
 
@@ -21,6 +22,11 @@ TRANSIENT_RETRY_DELAY_SECONDS = 3
 # 보고 이후 저장은 호출 없이 실패 처리한다(장애 중 실행이 길게 묶이는 것 방지). 중간에 저장이
 # 한 번이라도 성공하면 0 으로 돌아간다(일시 흔들림으로 정상 DB 의 저장을 막지 않는다). 실행마다 초기화.
 DB_UNAVAILABLE_AFTER = 2
+
+# 저장 응답에 저장한 행을 돌려받지 않는다(PRELAUNCH_SUPABASE_EFFICIENCY_V1 · B5). supabase-py 기본은 representation —
+#   커뮤니티 300행·news_top 원문 약 194KB 를 매 실행 그대로 다시 받았다(Egress). 성공·실패 판정은 그대로 '예외 = 실패'다.
+#   게시글 저장 건수는 서버가 Content-Range 로 주는 count=exact 를 쓴다(행 본문 없이 서버 확인 값).
+_WRITE_OPTS = {"returning": ReturnMethod.minimal}
 
 # 일시 장애로 보는 HTTP 상태: Cloudflare 520~524(오리진 무응답·연결 실패·timeout),
 # 게이트웨이 502~504. 4xx·PostgREST JSON 오류(PGRST·SQLSTATE)는 재시도해도 같으므로 제외.
@@ -166,11 +172,14 @@ def upsert_posts(posts: List[Post]) -> Optional[int]:
 
     ok, res = _guarded_write(
         "community_posts", "posts",
-        lambda: client.table("community_posts").upsert(rows, on_conflict="source_url").execute(),
+        lambda: client.table("community_posts").upsert(
+            rows, on_conflict="source_url", count=CountMethod.exact, **_WRITE_OPTS).execute(),
     )
     if not ok:
         return None
-    count = len(res.data) if res.data else 0
+    # 서버 count(Content-Range) 우선 — 없으면 응답 행 수(구 응답 형식 호환), 둘 다 없으면 0(정상 응답·실패 아님).
+    server_count = getattr(res, "count", None)
+    count = server_count if isinstance(server_count, int) else (len(res.data) if res.data else 0)
     logger.info(f"upsert 완료: {count}건")
     return count
 
@@ -187,7 +196,7 @@ def upsert_keywords(source: str, keywords: List[Dict[str, str]]) -> bool:
     }
     ok, _ = _guarded_write(
         "keyword_cache", source,
-        lambda: client.table("keyword_cache").upsert(row, on_conflict="source").execute(),
+        lambda: client.table("keyword_cache").upsert(row, on_conflict="source", **_WRITE_OPTS).execute(),
     )
     return ok
 
@@ -234,7 +243,7 @@ def upsert_news_issues(issues: Dict, source: str = "news_top") -> bool:
     }
     ok, _ = _guarded_write(
         "news_issue_cache", source,
-        lambda: client.table("news_issue_cache").upsert(row, on_conflict="source").execute(),
+        lambda: client.table("news_issue_cache").upsert(row, on_conflict="source", **_WRITE_OPTS).execute(),
     )
     return ok
 
@@ -256,7 +265,7 @@ def upsert_generic_snapshot(source: str, payload: Dict) -> bool:
     }
     ok, _ = _guarded_write(
         "news_issue_cache", source,
-        lambda: client.table("news_issue_cache").upsert(row, on_conflict="source").execute(),
+        lambda: client.table("news_issue_cache").upsert(row, on_conflict="source", **_WRITE_OPTS).execute(),
     )
     return ok
 

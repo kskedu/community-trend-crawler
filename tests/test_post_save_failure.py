@@ -38,30 +38,34 @@ def _posts(n=2):
 
 
 class _Resp:
-    def __init__(self, data):
+    def __init__(self, data, count=None):
         self.data = data
+        self.count = count
 
 
 class _FakeClient:
     """client.table(name).upsert(rows, on_conflict=...).execute() 만 흉내 낸다."""
 
-    def __init__(self, data=None, exc=None):
+    def __init__(self, data=None, exc=None, count=None):
         self._data = data
         self._exc = exc
+        self._count = count
         self.calls = []
+        self.opts = []
 
     def table(self, name):
         self.calls.append(("table", name))
         return self
 
-    def upsert(self, rows, on_conflict=None):
+    def upsert(self, rows, on_conflict=None, **opts):
         self.calls.append(("upsert", len(rows), on_conflict))
+        self.opts.append(opts)
         return self
 
     def execute(self):
         if self._exc is not None:
             raise self._exc
-        return _Resp(self._data)
+        return _Resp(self._data, self._count)
 
 
 def _api_error_522():
@@ -87,6 +91,14 @@ class TestUpsertPostsContract(unittest.TestCase):
         client = _FakeClient(data=[{"id": 1}, {"id": 2}])
         self.assertEqual(self._upsert(client, _posts(2)), 2)
         self.assertIn(("upsert", 2, "source_url"), client.calls)
+
+    def test_requests_no_row_body_and_server_count(self):
+        # B5(PRELAUNCH_SUPABASE_EFFICIENCY_V1): 저장한 행을 응답으로 돌려받지 않고(return=minimal),
+        #   저장 건수는 서버 count(Content-Range)로 받는다. 실패 판정('예외 = 실패')은 그대로다.
+        client = _FakeClient(data=[], count=3)
+        self.assertEqual(self._upsert(client, _posts(3)), 3)
+        self.assertEqual(client.opts[0].get("returning"), db_supabase.ReturnMethod.minimal)
+        self.assertEqual(client.opts[0].get("count"), db_supabase.CountMethod.exact)
 
     def test_empty_input_returns_zero_without_client(self):
         with patch.object(db_supabase, "get_client") as gc:
