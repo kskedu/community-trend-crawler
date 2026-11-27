@@ -1180,7 +1180,8 @@ _news_top_outcome = None
 # 실패하면 사용자 화면의 데이터가 갱신되지 않는 저장. google_trends(출처별 보기 보조)와
 # 진단 RPC 는 선택 기능이라 넣지 않는다.
 REQUIRED_SAVE_TARGETS = {"community_posts", "keyword_cache", "news_issue_cache"}
-OPTIONAL_SAVE_SOURCES = {"google_trends"}
+# news_top_bundle(B4 목록·상세 번들): 거부되면 news_top 단일 행으로 대신 저장한다 — news_top 자체 실패는 별도 필수 항목으로 남는다(db/supabase.py).
+OPTIONAL_SAVE_SOURCES = {"google_trends", "news_top_bundle"}
 
 
 def summarize_run(mode, source_status, news_outcome, entries, db_unavailable):
